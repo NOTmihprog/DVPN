@@ -1,5 +1,4 @@
 import socket
-import threading
 import time
 from datetime import datetime, timedelta
 import json
@@ -41,7 +40,7 @@ while True:
             if peer.last_update < datetime.now() - timedelta(seconds=50):
                 session.query(Peer).filter_by(id=peer.id).delete()
                 print(f"Peer {peer.id} deleted")
-    packet, addr = sock.recvfrom(10240)
+    packet, addr = sock.recvfrom(65507)
     try:
         packet = packet.decode("utf-8")
     except UnicodeError:
