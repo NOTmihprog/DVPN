@@ -12,7 +12,6 @@ __status__ = "Production"
 from TUN.tuntap import TunTap
 from ipaddress import IPv4Address
 from queue import Queue, Empty
-import select
 import threading
 import logging
 
@@ -57,13 +56,14 @@ class TUNControl:
     def __receiver(self):
         logging.info(f"{self.__class__.__name__} | Thread receiver - started")
         while self.__is_run:
-            ready, _, _ = select.select([self.tun.handle], [], [], 1)
-            if not ready:
-                continue
             try:
                 buf = self.tun.read()
             except OSError:
                 break
+
+            if buf is None:
+                continue
+
             if (buf[0] >> 4) == 4:
                 saddr = str(IPv4Address(buf[12:16]))
                 daddr = str(IPv4Address(buf[16:20]))
