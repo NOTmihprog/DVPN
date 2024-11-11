@@ -248,7 +248,7 @@ class PingUtils:
 
 
 class Peer:
-    def __init__(self, peer_id, peers, serv_addr, serv_port, local_addr=None, local_ports=None, input=None, output=None):
+    def __init__(self, peer_id, serv_addr, serv_port, local_addr=None, local_ports=None, input=None, output=None):
         if input is None:
             self.input = Queue()
         else:
@@ -268,8 +268,8 @@ class Peer:
         self.sock = None
         self.reload_socket(local_addr, random.randint(self.local_ports_range[0], self.local_ports_range[1]))
 
-        self.routeSearch = RouteSearch(serv_addr, serv_port, peer_id, peers, self.sock)
-        self.ping_utils = PingUtils(peer_id, peers, output=self.input)
+        self.__routeSearch = RouteSearch(serv_addr, serv_port, peer_id, self.sock)
+        self.__ping_utils = PingUtils(peer_id, output=self.input)
 
         self.__is_run = True
         self.__receiver_proc = threading.Thread(target=self.__receiver)
@@ -280,10 +280,6 @@ class Peer:
         self.__sender_proc.start()
         self.__port_control_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
-
-    def update_peers(self, peers):
-        self.routeSearch.update_peers(peers)
-        self.ping_utils.update_peers(peers)
 
     def reload_socket(self, local_addr=None, local_port=None):
         try:
@@ -297,7 +293,7 @@ class Peer:
         self.sock.settimeout(1)
 
         try:
-            self.routeSearch.update_socket(self.sock)
+            self.__routeSearch.update_socket(self.sock)
         except AttributeError:
             pass
 
@@ -325,16 +321,16 @@ class Peer:
             except OSError:
                 continue
             if addr[0] == self.server_addr and addr[1] == self.server_port:
-                self.routeSearch.input.put(packet)
+                self.__routeSearch.input.put(packet)
                 continue
 
-            peer_id = self.routeSearch.DADDR2ID.get(addr)
+            peer_id = self.__routeSearch.DADDR2ID.get(addr)
             if peer_id is None:
                 continue
 
             if packet[:4] == b"ping" or packet[:4] == b"pong":
                 if packet[4:] == self.peer_id.encode("utf-8"):
-                    self.ping_utils.input.put((packet[:4].decode("utf-8"), peer_id))
+                    self.__ping_utils.input.put((packet[:4].decode("utf-8"), peer_id))
                     continue
             self.output.put((packet, peer_id))
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
@@ -347,7 +343,7 @@ class Peer:
             except Empty:
                 continue
 
-            daddr = self.routeSearch.ID2DADDR.get(peer_id)
+            daddr = self.__routeSearch.ID2DADDR.get(peer_id)
             if daddr is None:
                 logging.debug(f"{self.__class__.__name__} | "
                               f"packet to {peer_id} destination addr not found")
@@ -360,11 +356,31 @@ class Peer:
                 continue
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
 
+    def add_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, is self: False
+        """
+        result = True
+        result = result and self.__routeSearch.add_peer(peer)
+        result = result and self.__ping_utils.add_peer(peer)
+        return result
+
+    def del_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, not found: False
+        """
+        result = True
+        result = result and self.__routeSearch.del_peer(peer)
+        result = result and self.__ping_utils.del_peer(peer)
+        return result
+
     def stop(self):
         self.__is_run = False
 
-        self.routeSearch.stop()
-        self.ping_utils.stop()
+        self.__routeSearch.stop()
+        self.__ping_utils.stop()
 
         self.__receiver_proc.join()
         self.__sender_proc.join()
@@ -373,13 +389,13 @@ class Peer:
         logging.info(f"{self.__class__.__name__} | Full - stopped")
 
     def get_ping(self, peer_id):
-        ping = self.ping_utils.peer_ping.get(peer_id)
+        ping = self.__ping_utils.peer_ping.get(peer_id)
         return ping if ping is not None else 0
 
     def is_online(self, peer_id):
         if peer_id == self.peer_id:
             return True
-        last_pong = self.ping_utils.peer_receive_time.get(peer_id)
+        last_pong = self.__ping_utils.peer_receive_time.get(peer_id)
         if last_pong is None:
             return None
         if (time.time_ns()-last_pong)/1000000000 > 45:
@@ -388,7 +404,7 @@ class Peer:
             return True
 
     def is_serv_online(self):
-        slrt = self.routeSearch.serv_last_recv_time
+        slrt = self.__routeSearch.serv_last_recv_time
         if slrt is None:
             return None
         if (time.time_ns()-slrt)/1000000000 > 45:
