@@ -8,7 +8,7 @@ import json
 
 
 class RouteSearch:
-    def __init__(self, serv_addr, serv_port, peer_id, peers, sock, input=None):
+    def __init__(self, serv_addr, serv_port, peer_id, sock, input=None):
         if input is None:
             self.input = Queue()
         else:
@@ -21,7 +21,6 @@ class RouteSearch:
         self.DADDR2ID = {}
         self.ID2DADDR = {}
         self.peer_list = []
-        self.update_peers(peers)
         self.peer_receive_time = {}
 
         self.serv_last_recv_time = None
@@ -37,9 +36,6 @@ class RouteSearch:
         self.__send_annonce_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
 
-    def update_peers(self, peers):
-        self.peer_list = list(peer.get("id") for peer in peers)
-
     def update_socket(self, sock):
         self.sock = sock
 
@@ -52,7 +48,7 @@ class RouteSearch:
 
                 last_packet = self.peer_receive_time.get(peer_id)
                 if last_packet is not None and (time.time_ns() - last_packet) / 1000000000 > 45:
-                    self.del_daddr(peer_id)
+                    self.__del_daddr(peer_id)
 
                 packet = json.dumps({"type": "get", "id": peer_id}).encode("utf-8")
                 try:
@@ -125,12 +121,37 @@ class RouteSearch:
             self.ID2DADDR[id] = (addr, port)
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
-    def del_daddr(self, peer_id):
+    def __del_daddr(self, peer_id):
         last_addr = self.ID2DADDR.get(peer_id)
         if last_addr is not None:
             del self.DADDR2ID[last_addr]
 
         self.ID2DADDR[peer_id] = None
+
+    def add_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, error: False
+        """
+        peer_id = peer.get("id")
+        if peer_id is not None:
+            self.peer_list.append(peer.get("id"))
+            return True
+        else:
+            return False
+
+    def del_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, error: False
+        """
+        peer_id = peer.get("id")
+        if peer_id is not None and peer_id in self.peer_list:
+            self.peer_list.remove(peer_id)
+            self.__del_daddr(peer_id)
+            return True
+        else:
+            return False
 
     def stop(self):
         self.__is_run = False
