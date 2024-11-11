@@ -134,7 +134,7 @@ class RouteSearch:
         :return: ok: True, error: False
         """
         peer_id = peer.get("id")
-        if peer_id is not None:
+        if peer_id is not None and peer_id != self.peer_id:
             self.peer_list.append(peer.get("id"))
             return True
         else:
@@ -143,7 +143,7 @@ class RouteSearch:
     def del_peer(self, peer) -> bool:
         """
         :param peer: {"id": "<peer_id>"}
-        :return: ok: True, error: False
+        :return: ok: True, not found: False
         """
         peer_id = peer.get("id")
         if peer_id is not None and peer_id in self.peer_list:
@@ -162,7 +162,7 @@ class RouteSearch:
 
 
 class PingUtils:
-    def __init__(self, peer_id, peers, input=None, output=None):
+    def __init__(self, peer_id, input=None, output=None):
         if input is None:
             self.input = Queue()
         else:
@@ -173,9 +173,7 @@ class PingUtils:
             self.output = output
 
         self.peer_id = peer_id
-
         self.peer_list = []
-        self.update_peers(peers)
 
         self.peer_send_time = {}
         self.peer_receive_time = {}
@@ -188,9 +186,6 @@ class PingUtils:
         self.__receiver_proc.start()
         self.__sender_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
-
-    def update_peers(self, peers):
-        self.peer_list = list(filter(lambda peer_id: peer_id != self.peer_id, list(peer.get("id") for peer in peers)))
 
     def __sender(self):
         logging.info(f"{self.__class__.__name__} | Thread sender - started")
@@ -221,6 +216,29 @@ class PingUtils:
                 self.peer_ping[peer_id] = ping
                 self.peer_receive_time[peer_id] = receive_time
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
+
+    def add_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, error: False
+        """
+        peer_id = peer.get("id")
+        if peer_id is not None and peer_id != self.peer_id:
+            self.peer_list.append(peer_id)
+            return True
+        else:
+            return False
+
+    def del_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, not found: False
+        """
+        peer_id = peer.get("id")
+        if peer_id is not None and peer_id in self.peer_list:
+            self.peer_list.remove(peer_id)
+        else:
+            return False
 
     def stop(self):
         self.__is_run = False
