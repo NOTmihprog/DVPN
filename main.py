@@ -32,16 +32,16 @@ class UAPI:
         self.log_queue = log_queue
         self.peers = self.conf.net_config.get("peers")
 
-        self.peer = Peer(self.conf.PEER_ID, self.peers, self.conf.SERVER_ADDR,
-                         self.conf.SERVER_PORT, self.conf.LOCAL_ADDR, self.conf.LOCAL_PORT_RANGE)
+        self.peer = Peer(peer_id=self.conf.PEER_ID, serv_addr=self.conf.SERVER_ADDR,
+                         serv_port=self.conf.SERVER_PORT, local_addr=self.conf.LOCAL_ADDR,
+                         local_ports=self.conf.LOCAL_PORT_RANGE)
 
-        self.crypto = SymmetricCrypto(peers=self.peers, peer_id=self.conf.PEER_ID,
+        self.crypto = SymmetricCrypto(peer_id=self.conf.PEER_ID,
                                       dec_in=self.peer.output, enc_out=self.peer.input)
 
         self.tun_control = TUNControl(tun_name=self.conf.TUN_NAME, addr=self.conf.PEER_ADDR,
                                       mask=self.conf.net_config.get("mask"),
-                                      input=self.crypto.dec_out, output=self.crypto.enc_in,
-                                      peers=self.peers)
+                                      input=self.crypto.dec_out, output=self.crypto.enc_in, peer_id=self.conf.PEER_ID)
 
     def stop(self):
         self.tun_control.stop()
@@ -79,10 +79,31 @@ class UAPI:
     def get_local_addr(self):
         return self.peer.sock.getsockname()
 
-    def update_peers(self, peers):
-        self.tun_control.update_peers(peers)
-        self.peer.update_peers(peers)
-        self.crypto.update_peers(peers)
+    def add_peer(self, peer):
+        """
+        :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
+        :return:None
+        """
+        self.tun_control.add_peer(peer)
+        self.peer.add_peer(peer)
+        self.crypto.add_peer(peer)
+
+    def del_peer(self, peer):
+        """
+        :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
+        :return:None
+        """
+        self.tun_control.del_peer(peer)
+        self.peer.del_peer(peer)
+        self.crypto.del_peer(peer)
+
+    def update_peer(self, peer):
+        """
+        :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
+        :return:None
+        """
+        self.tun_control.update_peer(peer)
+        self.crypto.update_peer(peer)
 
 
 if __name__ == "__main__":
