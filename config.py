@@ -1,11 +1,8 @@
 __author__ = "mihprog"
-__copyright__ = "Copyright 2024, Planet Earth"
-__credits__ = ["mihprog", "coffe"]
 
 __license__ = "GPL"
 __version__ = "1.1.4"
 
-__maintainer__ = "mihprog"
 __email__ = "mih@mihprog.com"
 __status__ = "Development"
 
@@ -97,13 +94,24 @@ except ValueError:
         logging.critical(f"Error, [Peer] BindPort in {CONFIG_FILE_NAME} invalid")
         sys.exit(1)
 try:
-    config_tun = config["TUN"]
+    config_tun = config["NET"]
 except KeyError:
-    logging.critical(f"Error, [TUN] not found in {CONFIG_FILE_NAME}")
+    logging.critical(f"Error, [NET] not found in {CONFIG_FILE_NAME}")
     sys.exit(1)
+
 TUN_NAME = config_tun.get("Name")
 if TUN_NAME is None:
-    logging.critical(f"Error, [TUN] Name not found in {CONFIG_FILE_NAME}")
+    logging.critical(f"Error, [NET] Name not found in {CONFIG_FILE_NAME}")
+    sys.exit(1)
+
+NET_ADDR = config_tun.get("Name")
+if TUN_NAME is None:
+    logging.critical(f"Error, [NET] Name not found in {CONFIG_FILE_NAME}")
+    sys.exit(1)
+
+NET_MASK = config_tun.get("Name")
+if TUN_NAME is None:
+    logging.critical(f"Error, [NET] Name not found in {CONFIG_FILE_NAME}")
     sys.exit(1)
 
 
