@@ -1,5 +1,15 @@
+__author__ = "mihprog"
+__copyright__ = "Copyright 2024, Planet Earth"
+__credits__ = ["mihprog", "coffe"]
+
+__license__ = "GPL"
+__version__ = "1.1.4"
+
+__maintainer__ = "mihprog"
+__email__ = "mih@mihprog.com"
+__status__ = "Development"
+
 import os
-import json
 import sys
 import logging
 from colorama import Fore, Style
@@ -22,6 +32,7 @@ LOG_FORMAT = (f"{Style.NORMAL + Fore.LIGHTGREEN_EX}|"
               f"{Fore.CYAN + Style.DIM}%(asctime)s{Style.NORMAL + Fore.LIGHTGREEN_EX}|{Style.RESET_ALL} "
               f"%(levelname)s {Fore.LIGHTGREEN_EX}|{Fore.LIGHTYELLOW_EX}->{Style.RESET_ALL} "
               f"{Style.NORMAL + Fore.LIGHTWHITE_EX}%(message)s{Style.RESET_ALL}")
+
 
 config = configparser.ConfigParser()
 config.read(os.path.join(ROOT_DIR, CONFIG_FILE_NAME))
