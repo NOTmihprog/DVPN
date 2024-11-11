@@ -29,6 +29,7 @@ class RouteSearch:
         self.DADDR2ID = {}
         self.ID2DADDR = {}
         self.peer_list = []
+        self.peer_list.append(peer_id)
         self.peer_receive_time = {}
 
         self.serv_last_recv_time = None
@@ -119,7 +120,6 @@ class RouteSearch:
                 logging.debug(f"{self.__class__.__name__} |"
                               f" Packet from {self.server_addr}:{self.server_port} peer id not in peer list")
                 continue
-
             self.peer_receive_time[id] = receive_time
             last_addr = self.ID2DADDR.get(id)
             if last_addr is not None:
@@ -143,7 +143,7 @@ class RouteSearch:
         """
         peer_id = peer.get("id")
         if peer_id is not None and peer_id != self.peer_id:
-            self.peer_list.append(peer.get("id"))
+            self.peer_list.append(peer_id)
             return True
         else:
             return False
