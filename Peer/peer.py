@@ -388,11 +388,11 @@ class Peer:
         self.sock.close()
         logging.info(f"{self.__class__.__name__} | Full - stopped")
 
-    def get_ping(self, peer_id):
+    def get_ping(self, peer_id: str) -> int:
         ping = self.__ping_utils.peer_ping.get(peer_id)
         return ping if ping is not None else 0
 
-    def is_online(self, peer_id):
+    def is_peer_online(self, peer_id: str) -> bool or None:
         if peer_id == self.peer_id:
             return True
         last_pong = self.__ping_utils.peer_receive_time.get(peer_id)
@@ -403,7 +403,7 @@ class Peer:
         else:
             return True
 
-    def is_serv_online(self):
+    def is_serv_online(self) -> bool or None:
         slrt = self.__routeSearch.serv_last_recv_time
         if slrt is None:
             return None
