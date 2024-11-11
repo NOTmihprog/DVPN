@@ -24,13 +24,13 @@ from Modules.crypto import SymmetricCrypto
 
 from UI.TextUI import TextApp
 from UI.TUI import TUIApp
+from PeerList.file import PeerListFromFile
 
 
 class UAPI:
     def __init__(self, conf, log_queue=None):
         self.conf = conf
         self.log_queue = log_queue
-        self.peers = self.conf.net_config.get("peers")
 
         self.peer = Peer(peer_id=self.conf.PEER_ID, serv_addr=self.conf.SERVER_ADDR,
                          serv_port=self.conf.SERVER_PORT, local_addr=self.conf.LOCAL_ADDR,
@@ -39,9 +39,12 @@ class UAPI:
         self.crypto = SymmetricCrypto(peer_id=self.conf.PEER_ID,
                                       dec_in=self.peer.output, enc_out=self.peer.input)
 
-        self.tun_control = TUNControl(tun_name=self.conf.TUN_NAME, addr=self.conf.PEER_ADDR,
-                                      mask=self.conf.net_config.get("mask"),
+        self.tun_control = TUNControl(tun_name=self.conf.TUN_NAME, addr=self.conf.NET_ADDR,
+                                      mask=self.conf.NET_MASK,
                                       input=self.crypto.dec_out, output=self.crypto.enc_in, peer_id=self.conf.PEER_ID)
+
+        self.peer_list = PeerListFromFile(config.PEER_FILE, add_peer=self.add_peer, del_peer=self.del_peer,
+                                          update_peer=self.update_peer)
 
     def stop(self):
         self.tun_control.stop()
@@ -49,7 +52,7 @@ class UAPI:
         self.crypto.stop()
 
     def get_peers(self):
-        return self.peers
+        return self.peer_list.peer_list
 
     def get_endpoint(self, peer_id):
         return self.peer.get_peer_endpoint(peer_id)
@@ -84,26 +87,34 @@ class UAPI:
         :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
         :return:None
         """
-        self.tun_control.add_peer(peer)
-        self.peer.add_peer(peer)
-        self.crypto.add_peer(peer)
+        if not self.tun_control.add_peer(peer):
+            logging.warning(f"Peer {peer} add to tun_control failed")
+        if not self.peer.add_peer(peer):
+            logging.warning(f"Peer {peer} add to peer failed")
+        if not self.crypto.add_peer(peer):
+            logging.warning(f"Peer {peer} add to crypto failed")
 
     def del_peer(self, peer):
         """
         :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
         :return:None
         """
-        self.tun_control.del_peer(peer)
-        self.peer.del_peer(peer)
-        self.crypto.del_peer(peer)
+        if not self.tun_control.del_peer(peer):
+            logging.warning(f"Peer {peer} del from tun_control failed")
+        if not self.peer.del_peer(peer):
+            logging.warning(f"Peer {peer} del from peer failed")
+        if not self.crypto.del_peer(peer):
+            logging.warning(f"Peer {peer} del from crypto failed")
 
     def update_peer(self, peer):
         """
         :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
         :return:None
         """
-        self.tun_control.update_peer(peer)
-        self.crypto.update_peer(peer)
+        if not self.tun_control.update_peer(peer):
+            logging.warning(f"Peer {peer} update to tun_control failed")
+        if not self.crypto.update_peer(peer):
+            logging.warning(f"Peer {peer} update to crypto failed")
 
 
 if __name__ == "__main__":

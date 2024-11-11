@@ -41,17 +41,17 @@ except KeyError:
 
 SERVER_ADDR = config_search_server.get("Addr")
 if SERVER_ADDR is None:
-    logging.critical(f"Error, [Addr] Addr not found in {CONFIG_FILE_NAME}")
+    logging.critical(f"Error, [SearchServer] Addr not found in {CONFIG_FILE_NAME}")
     sys.exit(1)
 
 SERVER_PORT = config_search_server.get("Port")
 if SERVER_PORT is None:
-    logging.critical(f"Error, [Addr] Port not found in {CONFIG_FILE_NAME}")
+    logging.critical(f"Error, [SearchServer] Port not found in {CONFIG_FILE_NAME}")
     sys.exit(1)
 try:
     SERVER_PORT = int(SERVER_PORT)
 except ValueError:
-    logging.critical(f"Error, [Addr] Port in {CONFIG_FILE_NAME} not int")
+    logging.critical(f"Error, [SearchServer] Port in {CONFIG_FILE_NAME} not int")
     sys.exit(1)
 
 try:
@@ -93,25 +93,39 @@ except ValueError:
     except ValueError:
         logging.critical(f"Error, [Peer] BindPort in {CONFIG_FILE_NAME} invalid")
         sys.exit(1)
+
+
+try:
+    config_peer_list = config["PeerList"]
+except KeyError:
+    logging.critical(f"Error, [config_peer_list] not found in {CONFIG_FILE_NAME}")
+    sys.exit(1)
+
+PEER_FILE = config_peer_list.get("File")
+if PEER_FILE is None:
+    logging.critical(f"Error, [PeerList] File not found in {CONFIG_FILE_NAME}")
+    sys.exit(1)
+PEER_FILE = os.path.join(ROOT_DIR, PEER_FILE)
+
 try:
     config_tun = config["NET"]
 except KeyError:
     logging.critical(f"Error, [NET] not found in {CONFIG_FILE_NAME}")
     sys.exit(1)
 
-TUN_NAME = config_tun.get("Name")
+TUN_NAME = config_tun.get("TunName")
 if TUN_NAME is None:
     logging.critical(f"Error, [NET] Name not found in {CONFIG_FILE_NAME}")
     sys.exit(1)
 
-NET_ADDR = config_tun.get("Name")
-if TUN_NAME is None:
-    logging.critical(f"Error, [NET] Name not found in {CONFIG_FILE_NAME}")
+NET_ADDR = config_tun.get("Addr")
+if NET_ADDR is None:
+    logging.critical(f"Error, [NET] Addr not found in {CONFIG_FILE_NAME}")
     sys.exit(1)
 
-NET_MASK = config_tun.get("Name")
-if TUN_NAME is None:
-    logging.critical(f"Error, [NET] Name not found in {CONFIG_FILE_NAME}")
+NET_MASK = config_tun.get("Mask")
+if NET_MASK is None:
+    logging.critical(f"Error, [NET] Mask not found in {CONFIG_FILE_NAME}")
     sys.exit(1)
 
 
