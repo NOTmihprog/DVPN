@@ -3,17 +3,17 @@ import logging
 from logging.handlers import QueueHandler
 from queue import Queue
 import colorama
+import config
 
 from Peer.peer import Peer
 from TUN.tun import TUNControl
 from Modules.crypto import SymmetricCrypto
-import config
 
 from UI.TextUI import TextApp
 from UI.TUI import TUIApp
 
 
-class UiAPI:
+class UAPI:
     def __init__(self, conf, log_queue=None):
         self.conf = conf
         self.log_queue = log_queue
@@ -39,10 +39,10 @@ class UiAPI:
         return self.peers
 
     def get_endpoint(self, peer_id):
-        return self.peer.routeSearch.ID2DADDR.get(peer_id)
+        return self.peer.get_peer_endpoint(peer_id)
 
     def get_peer_status(self, peer_id):
-        return self.peer.is_online(peer_id)
+        return self.peer.is_peer_online(peer_id)
 
     def get_peer_ping(self, peer_id):
         if self.get_peer_status(peer_id):
@@ -77,20 +77,20 @@ if __name__ == "__main__":
         colorama.init()
         logging.basicConfig(level=config.LOG_LEVEL, stream=sys.stdout, format=config.LOG_FORMAT)
         logging.info("Starting mode: log only")
-        app = TextApp(UiAPI(config))
+        app = TextApp(UAPI(config))
         app.run()
 
     elif config.UI_TYPE == "text":
         colorama.init()
         logging.basicConfig(level=config.LOG_LEVEL, stream=sys.stdout, format=config.LOG_FORMAT)
         logging.info("Starting mode: TextUI")
-        app = TextApp(UiAPI(config))
+        app = TextApp(UAPI(config))
         app.run()
 
     elif config.UI_TYPE == "tui":
         log_queue = Queue()
         logging.basicConfig(level=config.LOG_LEVEL, handlers=[QueueHandler(log_queue)], format=config.LOG_FORMAT)
-        app = TUIApp(UiAPI(conf=config, log_queue=log_queue))
+        app = TUIApp(UAPI(conf=config, log_queue=log_queue))
         logging.info("Starting mode: TextUI")
         app.run()
 

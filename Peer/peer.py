@@ -411,3 +411,6 @@ class Peer:
             return False
         else:
             return True
+
+    def get_peer_endpoint(self, peer_id) -> tuple or None:
+        return self.__routeSearch.ID2DADDR.get(peer_id)
