@@ -20,7 +20,7 @@ from cryptography.hazmat.backends import default_backend
 
 
 class SymmetricCrypto:
-    def __init__(self, peers, peer_id, dec_in=None, dec_out=None, enc_in=None, enc_out=None):
+    def __init__(self, peer_id, dec_in=None, dec_out=None, enc_in=None, enc_out=None):
         if dec_in is None:
             self.dec_in = Queue()
         else:
@@ -44,7 +44,6 @@ class SymmetricCrypto:
         self.backend = default_backend()
         self.crypto_by_peer = {}
         self.block_size = 128
-        self.update_peers(peers)
         self.peer_id = peer_id
 
         self.__is_run = True
@@ -55,22 +54,42 @@ class SymmetricCrypto:
         self.__decrypter_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
 
-    def update_peers(self, peers):
-        for peer in peers:
-            key = peer.get("key")
-            peer_id = peer.get("id")
-            if key is None:
-                logging.debug(f"{self.__class__.__name__} | Peer {peer_id} key not found")
-                continue
-            key = base64.urlsafe_b64decode(key)
-            if len(key) != 32:
-                logging.warning(f"{self.__class__.__name__} | peer {peer_id} key not loaded len != 32")
-                continue
-            try:
-                self.crypto_by_peer[peer_id] = Cipher(algorithms.AES(key), modes.ECB(), self.backend)
+    def add_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>", "key": "<crypto key>"}
+        :return: ok: True, error: False
+        """
+        key = peer.get("key")
+        peer_id = peer.get("id")
+        if peer_id is None or key is None:
+            return False
+        key = base64.urlsafe_b64decode(key)
+        if len(key) != 32:
+            logging.warning(f"{self.__class__.__name__} | peer {peer_id} key not loaded len != 32")
+            return False
+        try:
+            self.crypto_by_peer[peer_id] = Cipher(algorithms.AES(key), modes.ECB(), self.backend)
+            return True
+        except ValueError:
+            logging.warning(f"{self.__class__.__name__} | Peer {peer_id} key not loaded")
+            return False
 
-            except ValueError:
-                logging.warning(f"{self.__class__.__name__} | Peer {peer_id} key not loaded")
+    def del_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, error: False
+        """
+        peer_id = peer.get("id")
+        if peer_id is None or self.crypto_by_peer.get(peer_id) is None:
+            return False
+        self.crypto_by_peer[peer_id] = None
+
+    def update_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>", "key": "<crypto key>"}
+        :return: ok: True, error: False
+        """
+        return self.add_peer(peer)
 
     def __encrypter(self):
         logging.info(f"{self.__class__.__name__} | Thread encrypter - started")
