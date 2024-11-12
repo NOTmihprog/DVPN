@@ -38,6 +38,7 @@ def update_peer(peer):
     print('update_peer:', peer)
 
 
-peer_list = PeerListFromFile(config.PEER_FILE, add_peer=add_peer, del_peer=del_peer, update_peer=update_peer)
+peer_list = PeerListFromFile(config.PEER_FILE, config.PEER_ID, add_peer=add_peer, del_peer=del_peer,
+                             update_peer=update_peer)
 
 peer_list.load_file()
