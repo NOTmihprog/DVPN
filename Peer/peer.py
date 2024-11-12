@@ -161,11 +161,12 @@ class RouteSearch:
         else:
             return False
 
-    def stop(self):
+    def stop(self, join=False):
         self.__is_run = False
-        self.__receiver_proc.join()
-        self.__send_search_proc.join()
-        self.__send_annonce_proc.join()
+        if join:
+            self.__receiver_proc.join()
+            self.__send_search_proc.join()
+            self.__send_annonce_proc.join()
         logging.info(f"{self.__class__.__name__} | Full - stopped")
 
 
@@ -248,10 +249,11 @@ class PingUtils:
         else:
             return False
 
-    def stop(self):
+    def stop(self, join=False):
         self.__is_run = False
-        self.__receiver_proc.join()
-        self.__sender_proc.join()
+        if join:
+            self.__receiver_proc.join()
+            self.__sender_proc.join()
         logging.info(f"{self.__class__.__name__} | Full - stopped")
 
 
@@ -384,15 +386,15 @@ class Peer:
         result = result and self.__ping_utils.del_peer(peer)
         return result
 
-    def stop(self):
+    def stop(self, join=False):
         self.__is_run = False
 
-        self.__routeSearch.stop()
-        self.__ping_utils.stop()
-
-        self.__receiver_proc.join()
-        self.__sender_proc.join()
-        self.__port_control_proc.join()
+        self.__routeSearch.stop(join)
+        self.__ping_utils.stop(join)
+        if join:
+            self.__receiver_proc.join()
+            self.__sender_proc.join()
+            self.__port_control_proc.join()
         self.sock.close()
         logging.info(f"{self.__class__.__name__} | Full - stopped")
 

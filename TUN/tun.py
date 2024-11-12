@@ -131,10 +131,12 @@ class TUNControl:
                 logging.warning(f"{self.__class__.__name__} | Thread sender - tun dev write error")
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
 
-    def stop(self):
+    def stop(self, join=False):
         self.__is_run = False
+        if join:
+            self.__sender_proc.join()
+
         self.__receiver_proc.join()
-        self.__sender_proc.join()
         self.tun.close()
         logging.info(f"{self.__class__.__name__} | Full - stopped")
 

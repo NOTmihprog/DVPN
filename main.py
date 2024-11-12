@@ -43,8 +43,8 @@ class UAPI:
                                       mask=self.conf.NET_MASK,
                                       input=self.crypto.dec_out, output=self.crypto.enc_in, peer_id=self.conf.PEER_ID)
 
-        self.peer_list = PeerListFromFile(config.PEER_FILE, add_peer=self.add_peer, del_peer=self.del_peer,
-                                          update_peer=self.update_peer)
+        self.peer_list = PeerListFromFile(config.PEER_FILE, self.conf.PEER_ID, add_peer=self.add_peer,
+                                          del_peer=self.del_peer, update_peer=self.update_peer)
 
     def stop(self):
         self.tun_control.stop()

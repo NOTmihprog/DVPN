@@ -11,12 +11,14 @@ import json
 
 
 class PeerListFromFile:
-    def __init__(self, file_path, add_peer, del_peer, update_peer):
+    def __init__(self, file_path, peer_id, add_peer, del_peer, update_peer):
         self.file_path = file_path
 
         self.__add_peer = add_peer
         self.__del_peer = del_peer
         self.__update_peer = update_peer
+
+        self.peer_id = peer_id
 
         self.peer_id_list = []
         self.peer_list = []
@@ -35,7 +37,7 @@ class PeerListFromFile:
 
             if peer_id is None:
                 continue
-            elif len(peer_id) != 32:
+            elif len(peer_id) != 32 or peer_id == self.peer_id:
                 continue
             else:
                 peer_id = str(peer_id)
