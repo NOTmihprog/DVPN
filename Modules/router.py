@@ -62,7 +62,7 @@ class Router:
 
             output = self.route.get(packet[:4])
             if output is None:
-                logging.debug(f"{self.__class__.__name__} | Thread receiver - route not found, packet drop")
+                logging.debug(f"{self.__class__.__name__} | Thread receiver - route: {packet[:4]} not found, packet drop")
                 continue
 
             output.put((packet[4:], peer_id))
