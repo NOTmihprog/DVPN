@@ -21,6 +21,7 @@ import config
 from Peer.peer import Peer
 from TUN.tun import TUNControl
 from Modules.crypto import SymmetricCrypto
+from Modules.router import Router
 
 from UI.TextUI import TextApp
 from UI.TUI import TUIApp
@@ -39,9 +40,13 @@ class UAPI:
         self.crypto = SymmetricCrypto(peer_id=self.conf.PEER_ID,
                                       dec_in=self.peer.output, enc_out=self.peer.input)
 
+        self.router = Router(input=self.crypto.dec_out, output=self.crypto.enc_in)
+
+        net0_in, net0_out = self.router.register_rote(b"net0")
+
         self.tun_control = TUNControl(tun_name=self.conf.TUN_NAME, addr=self.conf.NET_ADDR,
                                       mask=self.conf.NET_MASK,
-                                      input=self.crypto.dec_out, output=self.crypto.enc_in, peer_id=self.conf.PEER_ID)
+                                      input=net0_in, output=net0_out, peer_id=self.conf.PEER_ID)
 
         self.peer_list = PeerListFromFile(config.PEER_FILE, self.conf.PEER_ID, add_peer=self.add_peer,
                                           del_peer=self.del_peer, update_peer=self.update_peer)
