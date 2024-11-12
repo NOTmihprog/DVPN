@@ -55,6 +55,7 @@ class UAPI:
         self.tun_control.stop()
         self.peer.stop()
         self.crypto.stop()
+        self.router.stop()
 
     def get_peers(self):
         return self.peer_list.peer_list
