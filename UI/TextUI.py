@@ -1,3 +1,11 @@
+__author__ = "mihprog"
+
+__license__ = "GPL"
+__version__ = "1.1.4"
+
+__email__ = "mih@mihprog.com"
+__status__ = "Production"
+
 import os
 import time
 import signal

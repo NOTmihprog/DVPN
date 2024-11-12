@@ -1,48 +1,70 @@
+#!/usr/bin/env python
+
+__author__ = "mihprog"
+__copyright__ = "Copyright 2024, Planet Earth"
+__credits__ = ["mihprog", "coffe"]
+
+__license__ = "GPL"
+__version__ = "1.1.4"
+
+__maintainer__ = "mihprog"
+__email__ = "mih@mihprog.com"
+__status__ = "Production"
+
 import sys
 import logging
 from logging.handlers import QueueHandler
 from queue import Queue
 import colorama
+import config
 
 from Peer.peer import Peer
 from TUN.tun import TUNControl
 from Modules.crypto import SymmetricCrypto
-import config
+from Modules.router import Router
 
 from UI.TextUI import TextApp
 from UI.TUI import TUIApp
+from PeerList.file import PeerListFromFile
 
 
-class UiAPI:
+class UAPI:
     def __init__(self, conf, log_queue=None):
         self.conf = conf
         self.log_queue = log_queue
-        self.peers = self.conf.net_config.get("peers")
 
-        self.peer = Peer(self.conf.PEER_ID, self.peers, self.conf.SERVER_ADDR,
-                         self.conf.SERVER_PORT, self.conf.LOCAL_ADDR, self.conf.LOCAL_PORT_RANGE)
+        self.peer = Peer(peer_id=self.conf.PEER_ID, serv_addr=self.conf.SERVER_ADDR,
+                         serv_port=self.conf.SERVER_PORT, local_addr=self.conf.LOCAL_ADDR,
+                         local_ports=self.conf.LOCAL_PORT_RANGE)
 
-        self.crypto = SymmetricCrypto(peers=self.peers, peer_id=self.conf.PEER_ID,
+        self.crypto = SymmetricCrypto(peer_id=self.conf.PEER_ID,
                                       dec_in=self.peer.output, enc_out=self.peer.input)
 
-        self.tun_control = TUNControl(tun_name=self.conf.TUN_NAME, addr=self.conf.PEER_ADDR,
-                                      mask=self.conf.net_config.get("mask"),
-                                      input=self.crypto.dec_out, output=self.crypto.enc_in,
-                                      peers=self.peers)
+        self.router = Router(input=self.crypto.dec_out, output=self.crypto.enc_in)
+
+        net0_in, net0_out = self.router.register_rote(b"net0")
+
+        self.tun_control = TUNControl(tun_name=self.conf.TUN_NAME, addr=self.conf.NET_ADDR,
+                                      mask=self.conf.NET_MASK,
+                                      input=net0_in, output=net0_out, peer_id=self.conf.PEER_ID)
+
+        self.peer_list = PeerListFromFile(config.PEER_FILE, self.conf.PEER_ID, add_peer=self.add_peer,
+                                          del_peer=self.del_peer, update_peer=self.update_peer)
 
     def stop(self):
         self.tun_control.stop()
         self.peer.stop()
         self.crypto.stop()
+        self.router.stop()
 
     def get_peers(self):
-        return self.peers
+        return self.peer_list.peer_list
 
     def get_endpoint(self, peer_id):
-        return self.peer.routeSearch.ID2DADDR.get(peer_id)
+        return self.peer.get_peer_endpoint(peer_id)
 
     def get_peer_status(self, peer_id):
-        return self.peer.is_online(peer_id)
+        return self.peer.is_peer_online(peer_id)
 
     def get_peer_ping(self, peer_id):
         if self.get_peer_status(peer_id):
@@ -66,10 +88,39 @@ class UiAPI:
     def get_local_addr(self):
         return self.peer.sock.getsockname()
 
-    def update_peers(self, peers):
-        self.tun_control.update_peers(peers)
-        self.peer.update_peers(peers)
-        self.crypto.update_peers(peers)
+    def add_peer(self, peer):
+        """
+        :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
+        :return:None
+        """
+        if not self.tun_control.add_peer(peer):
+            logging.warning(f"Peer {peer} add to tun_control failed")
+        if not self.peer.add_peer(peer):
+            logging.warning(f"Peer {peer} add to peer failed")
+        if not self.crypto.add_peer(peer):
+            logging.warning(f"Peer {peer} add to crypto failed")
+
+    def del_peer(self, peer):
+        """
+        :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
+        :return:None
+        """
+        if not self.tun_control.del_peer(peer):
+            logging.warning(f"Peer {peer} del from tun_control failed")
+        if not self.peer.del_peer(peer):
+            logging.warning(f"Peer {peer} del from peer failed")
+        if not self.crypto.del_peer(peer):
+            logging.warning(f"Peer {peer} del from crypto failed")
+
+    def update_peer(self, peer):
+        """
+        :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
+        :return:None
+        """
+        if not self.tun_control.update_peer(peer):
+            logging.warning(f"Peer {peer} update to tun_control failed")
+        if not self.crypto.update_peer(peer):
+            logging.warning(f"Peer {peer} update to crypto failed")
 
 
 if __name__ == "__main__":
@@ -77,20 +128,20 @@ if __name__ == "__main__":
         colorama.init()
         logging.basicConfig(level=config.LOG_LEVEL, stream=sys.stdout, format=config.LOG_FORMAT)
         logging.info("Starting mode: log only")
-        app = TextApp(UiAPI(config))
+        app = TextApp(UAPI(config))
         app.run()
 
     elif config.UI_TYPE == "text":
         colorama.init()
         logging.basicConfig(level=config.LOG_LEVEL, stream=sys.stdout, format=config.LOG_FORMAT)
         logging.info("Starting mode: TextUI")
-        app = TextApp(UiAPI(config))
+        app = TextApp(UAPI(config))
         app.run()
 
     elif config.UI_TYPE == "tui":
         log_queue = Queue()
         logging.basicConfig(level=config.LOG_LEVEL, handlers=[QueueHandler(log_queue)], format=config.LOG_FORMAT)
-        app = TUIApp(UiAPI(conf=config, log_queue=log_queue))
+        app = TUIApp(UAPI(conf=config, log_queue=log_queue))
         logging.info("Starting mode: TextUI")
         app.run()
 

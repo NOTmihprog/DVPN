@@ -1,5 +1,12 @@
-import time
+__author__ = "mihprog"
 
+__license__ = "GPL"
+__version__ = "1.1.4"
+
+__email__ = "mih@mihprog.com"
+__status__ = "Production"
+
+import time
 from textual.app import App, ComposeResult
 from textual.widgets import DataTable
 from textual.widgets import RichLog

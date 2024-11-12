@@ -1,0 +1,12 @@
+/build/
+/dist/
+/dvpn_src.tar.xz
+/main.spec
+/test.py
+/test.socket.py
+/test.wav
+/TestConfig.py
+/TestClient.py
+/testTUI.py
+/.idea
+/.venv

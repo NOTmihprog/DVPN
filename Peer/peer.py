@@ -1,3 +1,11 @@
+__author__ = "mihprog"
+
+__license__ = "GPL"
+__version__ = "1.1.4"
+
+__email__ = "mih@mihprog.com"
+__status__ = "Production"
+
 from queue import Queue, Empty
 import threading
 import logging
@@ -8,7 +16,7 @@ import json
 
 
 class RouteSearch:
-    def __init__(self, serv_addr, serv_port, peer_id, peers, sock, input=None):
+    def __init__(self, serv_addr, serv_port, peer_id, sock, input=None):
         if input is None:
             self.input = Queue()
         else:
@@ -21,7 +29,7 @@ class RouteSearch:
         self.DADDR2ID = {}
         self.ID2DADDR = {}
         self.peer_list = []
-        self.update_peers(peers)
+        self.peer_list.append(peer_id)
         self.peer_receive_time = {}
 
         self.serv_last_recv_time = None
@@ -37,9 +45,6 @@ class RouteSearch:
         self.__send_annonce_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
 
-    def update_peers(self, peers):
-        self.peer_list = list(peer.get("id") for peer in peers)
-
     def update_socket(self, sock):
         self.sock = sock
 
@@ -52,7 +57,7 @@ class RouteSearch:
 
                 last_packet = self.peer_receive_time.get(peer_id)
                 if last_packet is not None and (time.time_ns() - last_packet) / 1000000000 > 45:
-                    self.del_daddr(peer_id)
+                    self.__del_daddr(peer_id)
 
                 packet = json.dumps({"type": "get", "id": peer_id}).encode("utf-8")
                 try:
@@ -115,7 +120,6 @@ class RouteSearch:
                 logging.debug(f"{self.__class__.__name__} |"
                               f" Packet from {self.server_addr}:{self.server_port} peer id not in peer list")
                 continue
-
             self.peer_receive_time[id] = receive_time
             last_addr = self.ID2DADDR.get(id)
             if last_addr is not None:
@@ -125,23 +129,49 @@ class RouteSearch:
             self.ID2DADDR[id] = (addr, port)
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
-    def del_daddr(self, peer_id):
+    def __del_daddr(self, peer_id):
         last_addr = self.ID2DADDR.get(peer_id)
         if last_addr is not None:
             del self.DADDR2ID[last_addr]
 
         self.ID2DADDR[peer_id] = None
 
-    def stop(self):
+    def add_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, error: False
+        """
+        peer_id = peer.get("id")
+        if peer_id is not None and peer_id != self.peer_id:
+            self.peer_list.append(peer_id)
+            return True
+        else:
+            return False
+
+    def del_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, not found: False
+        """
+        peer_id = peer.get("id")
+        if peer_id is not None and peer_id in self.peer_list:
+            self.peer_list.remove(peer_id)
+            self.__del_daddr(peer_id)
+            return True
+        else:
+            return False
+
+    def stop(self, join=False):
         self.__is_run = False
-        self.__receiver_proc.join()
-        self.__send_search_proc.join()
-        self.__send_annonce_proc.join()
+        if join:
+            self.__receiver_proc.join()
+            self.__send_search_proc.join()
+            self.__send_annonce_proc.join()
         logging.info(f"{self.__class__.__name__} | Full - stopped")
 
 
 class PingUtils:
-    def __init__(self, peer_id, peers, input=None, output=None):
+    def __init__(self, peer_id, input=None, output=None):
         if input is None:
             self.input = Queue()
         else:
@@ -152,9 +182,7 @@ class PingUtils:
             self.output = output
 
         self.peer_id = peer_id
-
         self.peer_list = []
-        self.update_peers(peers)
 
         self.peer_send_time = {}
         self.peer_receive_time = {}
@@ -167,9 +195,6 @@ class PingUtils:
         self.__receiver_proc.start()
         self.__sender_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
-
-    def update_peers(self, peers):
-        self.peer_list = list(filter(lambda peer_id: peer_id != self.peer_id, list(peer.get("id") for peer in peers)))
 
     def __sender(self):
         logging.info(f"{self.__class__.__name__} | Thread sender - started")
@@ -201,15 +226,39 @@ class PingUtils:
                 self.peer_receive_time[peer_id] = receive_time
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
-    def stop(self):
+    def add_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, error: False
+        """
+        peer_id = peer.get("id")
+        if peer_id is not None and peer_id != self.peer_id:
+            self.peer_list.append(peer_id)
+            return True
+        else:
+            return False
+
+    def del_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, not found: False
+        """
+        peer_id = peer.get("id")
+        if peer_id is not None and peer_id in self.peer_list:
+            self.peer_list.remove(peer_id)
+        else:
+            return False
+
+    def stop(self, join=False):
         self.__is_run = False
-        self.__receiver_proc.join()
-        self.__sender_proc.join()
+        if join:
+            self.__receiver_proc.join()
+            self.__sender_proc.join()
         logging.info(f"{self.__class__.__name__} | Full - stopped")
 
 
 class Peer:
-    def __init__(self, peer_id, peers, serv_addr, serv_port, local_addr=None, local_ports=None, input=None, output=None):
+    def __init__(self, peer_id, serv_addr, serv_port, local_addr=None, local_ports=None, input=None, output=None):
         if input is None:
             self.input = Queue()
         else:
@@ -229,8 +278,8 @@ class Peer:
         self.sock = None
         self.reload_socket(local_addr, random.randint(self.local_ports_range[0], self.local_ports_range[1]))
 
-        self.routeSearch = RouteSearch(serv_addr, serv_port, peer_id, peers, self.sock)
-        self.ping_utils = PingUtils(peer_id, peers, output=self.input)
+        self.__routeSearch = RouteSearch(serv_addr, serv_port, peer_id, self.sock)
+        self.__ping_utils = PingUtils(peer_id, output=self.input)
 
         self.__is_run = True
         self.__receiver_proc = threading.Thread(target=self.__receiver)
@@ -241,10 +290,6 @@ class Peer:
         self.__sender_proc.start()
         self.__port_control_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
-
-    def update_peers(self, peers):
-        self.routeSearch.update_peers(peers)
-        self.ping_utils.update_peers(peers)
 
     def reload_socket(self, local_addr=None, local_port=None):
         try:
@@ -258,7 +303,7 @@ class Peer:
         self.sock.settimeout(1)
 
         try:
-            self.routeSearch.update_socket(self.sock)
+            self.__routeSearch.update_socket(self.sock)
         except AttributeError:
             pass
 
@@ -286,16 +331,16 @@ class Peer:
             except OSError:
                 continue
             if addr[0] == self.server_addr and addr[1] == self.server_port:
-                self.routeSearch.input.put(packet)
+                self.__routeSearch.input.put(packet)
                 continue
 
-            peer_id = self.routeSearch.DADDR2ID.get(addr)
+            peer_id = self.__routeSearch.DADDR2ID.get(addr)
             if peer_id is None:
                 continue
 
             if packet[:4] == b"ping" or packet[:4] == b"pong":
                 if packet[4:] == self.peer_id.encode("utf-8"):
-                    self.ping_utils.input.put((packet[:4].decode("utf-8"), peer_id))
+                    self.__ping_utils.input.put((packet[:4].decode("utf-8"), peer_id))
                     continue
             self.output.put((packet, peer_id))
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
@@ -308,7 +353,7 @@ class Peer:
             except Empty:
                 continue
 
-            daddr = self.routeSearch.ID2DADDR.get(peer_id)
+            daddr = self.__routeSearch.ID2DADDR.get(peer_id)
             if daddr is None:
                 logging.debug(f"{self.__class__.__name__} | "
                               f"packet to {peer_id} destination addr not found")
@@ -321,26 +366,46 @@ class Peer:
                 continue
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
 
-    def stop(self):
+    def add_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, is self: False
+        """
+        result = True
+        result = result and self.__routeSearch.add_peer(peer)
+        result = result and self.__ping_utils.add_peer(peer)
+        return result
+
+    def del_peer(self, peer) -> bool:
+        """
+        :param peer: {"id": "<peer_id>"}
+        :return: ok: True, not found: False
+        """
+        result = True
+        result = result and self.__routeSearch.del_peer(peer)
+        result = result and self.__ping_utils.del_peer(peer)
+        return result
+
+    def stop(self, join=False):
         self.__is_run = False
 
-        self.routeSearch.stop()
-        self.ping_utils.stop()
-
-        self.__receiver_proc.join()
-        self.__sender_proc.join()
-        self.__port_control_proc.join()
+        self.__routeSearch.stop(join)
+        self.__ping_utils.stop(join)
+        if join:
+            self.__receiver_proc.join()
+            self.__sender_proc.join()
+            self.__port_control_proc.join()
         self.sock.close()
         logging.info(f"{self.__class__.__name__} | Full - stopped")
 
-    def get_ping(self, peer_id):
-        ping = self.ping_utils.peer_ping.get(peer_id)
+    def get_ping(self, peer_id: str) -> int:
+        ping = self.__ping_utils.peer_ping.get(peer_id)
         return ping if ping is not None else 0
 
-    def is_online(self, peer_id):
+    def is_peer_online(self, peer_id: str) -> bool or None:
         if peer_id == self.peer_id:
             return True
-        last_pong = self.ping_utils.peer_receive_time.get(peer_id)
+        last_pong = self.__ping_utils.peer_receive_time.get(peer_id)
         if last_pong is None:
             return None
         if (time.time_ns()-last_pong)/1000000000 > 45:
@@ -348,11 +413,14 @@ class Peer:
         else:
             return True
 
-    def is_serv_online(self):
-        slrt = self.routeSearch.serv_last_recv_time
+    def is_serv_online(self) -> bool or None:
+        slrt = self.__routeSearch.serv_last_recv_time
         if slrt is None:
             return None
         if (time.time_ns()-slrt)/1000000000 > 45:
             return False
         else:
             return True
+
+    def get_peer_endpoint(self, peer_id) -> tuple or None:
+        return self.__routeSearch.ID2DADDR.get(peer_id)
