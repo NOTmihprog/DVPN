@@ -1,6 +1,7 @@
-from queue import Queue, Empty
+from queue import Queue
 import logging
 import threading
+from Modules.utils import PipeConn, PipeEmpty
 
 
 class FakeQueue:
@@ -21,16 +22,21 @@ class FakeQueue:
         return self.output.empty()
 
 
+class FakePipeConn(PipeConn):
+    def __init__(self, input, output, route):
+        super().__init__(input, output)
+        self.route = route
+
+    def send(self, item):
+        if type(item) is not tuple:
+            logging.debug(f"{self.__class__.__name__} | put - item: {item} type is not tuple")
+            raise ValueError
+        return self.output.put((self.route+bytes(item[0]), item[1]))
+
+
 class Router:
-    def __init__(self, input=None, output=None):
-        if input is None:
-            self.input = Queue()
-        else:
-            self.input = input
-        if output is None:
-            self.output = Queue()
-        else:
-            self.output = output
+    def __init__(self, pipe: PipeConn):
+        self.pipe = pipe
 
         self.route = {}
 
@@ -39,7 +45,7 @@ class Router:
         self.__receiver_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
 
-    def register_rote(self, route: bytes) -> (Queue, FakeQueue):
+    def register_rote(self, route: bytes) -> FakePipeConn:
         route = bytes(route)
         if len(route) != 4:
             logging.debug(f"{self.__class__.__name__} | register_rote - route: {route}, len != 4")
@@ -47,14 +53,14 @@ class Router:
         input = Queue()
         self.route[route] = input
         logging.debug(f"{self.__class__.__name__} | register_rote - add route: {route}")
-        return input, FakeQueue(route, self.output)
+        return FakePipeConn(input, self.pipe.output, route)
 
     def __receiver(self):
         logging.info(f"{self.__class__.__name__} | Thread receiver - started")
         while self.__is_run:
             try:
-                packet, peer_id = self.input.get(timeout=1)
-            except Empty:
+                packet, peer_id = self.pipe.recv(timeout=1)
+            except PipeEmpty:
                 continue
             except ValueError:
                 logging.debug(f"{self.__class__.__name__} | Thread receiver - ValueError, packet drop")

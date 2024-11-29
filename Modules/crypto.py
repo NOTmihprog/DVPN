@@ -6,7 +6,7 @@ __version__ = "1.1.4"
 __email__ = "mih@mihprog.com"
 __status__ = "Development"
 
-from queue import Queue, Empty
+
 import threading
 import logging
 
@@ -14,29 +14,13 @@ import base64
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
+from Modules.utils import PipeConn, PipeEmpty
 
 
 class SymmetricCrypto:
-    def __init__(self, peer_id, dec_in=None, dec_out=None, enc_in=None, enc_out=None):
-        if dec_in is None:
-            self.dec_in = Queue()
-        else:
-            self.dec_in = dec_in
-
-        if dec_out is None:
-            self.dec_out = Queue()
-        else:
-            self.dec_out = dec_out
-
-        if enc_in is None:
-            self.enc_in = Queue()
-        else:
-            self.enc_in = enc_in
-
-        if enc_out is None:
-            self.enc_out = Queue()
-        else:
-            self.enc_out = enc_out
+    def __init__(self, peer_id, pipe_in: PipeConn, pipe_out: PipeConn):
+        self.pipe_in = pipe_in
+        self.pipe_out = pipe_out
 
         self.backend = default_backend()
         self.crypto_by_peer = {}
@@ -92,18 +76,18 @@ class SymmetricCrypto:
         logging.info(f"{self.__class__.__name__} | Thread encrypter - started")
         while self.__is_run:
             try:
-                packet, peer_id = self.enc_in.get(timeout=1)
-            except Empty:
+                packet, peer_id = self.pipe_in.recv(timeout=1)
+            except PipeEmpty:
                 continue
             encryptor = self.crypto_by_peer.get(peer_id)
             if encryptor is None:
-                self.enc_out.put((packet, peer_id))
+                self.pipe_out.send((packet, peer_id))
                 continue
             encryptor = encryptor.encryptor()
             padder = padding.PKCS7(self.block_size).padder()
             try:
                 padded_packet = padder.update(packet) + padder.finalize()
-                self.enc_out.put((encryptor.update(padded_packet) + encryptor.finalize(), peer_id))
+                self.pipe_out.send((encryptor.update(padded_packet) + encryptor.finalize(), peer_id))
             except ValueError:
                 logging.debug(f"{self.__class__.__name__} | packet to {peer_id} encrypt error")
         logging.info(f"{self.__class__.__name__} | Thread encrypter - stopped")
@@ -112,18 +96,18 @@ class SymmetricCrypto:
         logging.info(f"{self.__class__.__name__} | Thread decrypter - started")
         while self.__is_run:
             try:
-                packet, peer_id = self.dec_in.get(timeout=1)
-            except Empty:
+                packet, peer_id = self.pipe_out.recv(timeout=1)
+            except PipeEmpty:
                 continue
             decryptor = self.crypto_by_peer.get(self.peer_id)
             if decryptor is None:
-                self.dec_out.put((packet, peer_id))
+                self.pipe_in.send((packet, peer_id))
                 continue
             decryptor = decryptor.decryptor()
             unpadder = padding.PKCS7(self.block_size).unpadder()
             try:
                 decrypted_packet = decryptor.update(packet)
-                self.dec_out.put((unpadder.update(decrypted_packet) + unpadder.finalize(), peer_id))
+                self.pipe_in.send((unpadder.update(decrypted_packet) + unpadder.finalize(), peer_id))
             except ValueError:
                 logging.debug(f"{self.__class__.__name__} | packet from {peer_id} decrypt error")
         logging.info(f"{self.__class__.__name__} | Thread decrypter - stopped")

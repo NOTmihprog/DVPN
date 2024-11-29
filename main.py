@@ -22,6 +22,7 @@ from Peer.peer import Peer
 from TUN.tun import TUNControl
 from Modules.crypto import SymmetricCrypto
 from Modules.router import Router
+from Modules.utils import Pipe
 
 from UI.TextUI import TextApp
 from UI.TUI import TUIApp
@@ -33,20 +34,21 @@ class UAPI:
         self.conf = conf
         self.log_queue = log_queue
 
+        peer_pipe, _peer_pipe = Pipe()
+
         self.peer = Peer(peer_id=self.conf.PEER_ID, serv_addr=self.conf.SERVER_ADDR,
                          serv_port=self.conf.SERVER_PORT, local_addr=self.conf.LOCAL_ADDR,
-                         local_ports=self.conf.LOCAL_PORT_RANGE)
+                         local_ports=self.conf.LOCAL_PORT_RANGE, pipe=_peer_pipe)
+        crypto_pipe, _crupto_pipe = Pipe()
+        self.crypto = SymmetricCrypto(peer_id=self.conf.PEER_ID, pipe_in=_crupto_pipe, pipe_out=peer_pipe)
 
-        self.crypto = SymmetricCrypto(peer_id=self.conf.PEER_ID,
-                                      dec_in=self.peer.output, enc_out=self.peer.input)
+        self.router = Router(pipe=crypto_pipe)
 
-        self.router = Router(input=self.crypto.dec_out, output=self.crypto.enc_in)
-
-        net0_in, net0_out = self.router.register_rote(b"net0")
+        net0_pipe = self.router.register_rote(b"net0")
 
         self.tun_control = TUNControl(tun_name=self.conf.TUN_NAME, addr=self.conf.NET_ADDR,
                                       mask=self.conf.NET_MASK,
-                                      input=net0_in, output=net0_out, peer_id=self.conf.PEER_ID)
+                                      pipe=net0_pipe, peer_id=self.conf.PEER_ID)
 
         self.peer_list = PeerListFromFile(config.PEER_FILE, self.conf.PEER_ID, add_peer=self.add_peer,
                                           del_peer=self.del_peer, update_peer=self.update_peer)

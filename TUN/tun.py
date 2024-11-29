@@ -8,22 +8,14 @@ __status__ = "Production"
 
 from TUN.tuntap import TunTap
 from ipaddress import IPv4Address
-from queue import Queue, Empty
+from Modules.utils import PipeConn, PipeEmpty
 import threading
 import logging
 
 
 class TUNControl:
-    def __init__(self, tun_name, addr, mask, peer_id, input: Queue = None, output: Queue = None):
-        if input is None:
-            self.input = Queue()
-        else:
-            self.input = input
-
-        if output is None:
-            self.output = Queue()
-        else:
-            self.output = output
+    def __init__(self, tun_name, addr, mask, peer_id, pipe: PipeConn):
+        self.pipe = pipe
 
         self.ID2LADDR = {}
         self.LADDR2ID = {}
@@ -115,15 +107,15 @@ class TUNControl:
             if peer_id is None:
                 logging.debug(f"{self.__class__.__name__} | Packet to {daddr} peer id not found")
                 continue
-            self.output.put((buf, peer_id))
+            self.pipe.send((buf, peer_id))
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
     def __sender(self):
         logging.info(f"{self.__class__.__name__} | Thread sender - started")
         while self.__is_run:
             try:
-                buf, peer_id = self.input.get(timeout=1)
-            except Empty:
+                buf, peer_id = self.pipe.recv(timeout=1)
+            except PipeEmpty:
                 continue
             try:
                 self.tun.write(buf)
@@ -139,4 +131,3 @@ class TUNControl:
         self.__receiver_proc.join()
         self.tun.close()
         logging.info(f"{self.__class__.__name__} | Full - stopped")
-

@@ -7,6 +7,7 @@ __email__ = "mih@mihprog.com"
 __status__ = "Production"
 
 from queue import Queue, Empty
+from Modules.utils import PipeConn, PipeEmpty
 import threading
 import logging
 import random
@@ -36,9 +37,9 @@ class RouteSearch:
 
         self.__is_run = True
 
-        self.__receiver_proc = threading.Thread(target=self.__receiver)
-        self.__send_search_proc = threading.Thread(target=self.__send_search)
-        self.__send_annonce_proc = threading.Thread(target=self.__send_annonce)
+        self.__receiver_proc = threading.Thread(target=self.__receiver, daemon=True)
+        self.__send_search_proc = threading.Thread(target=self.__send_search, daemon=True)
+        self.__send_annonce_proc = threading.Thread(target=self.__send_annonce, daemon=True)
 
         self.__receiver_proc.start()
         self.__send_search_proc.start()
@@ -171,16 +172,8 @@ class RouteSearch:
 
 
 class PingUtils:
-    def __init__(self, peer_id, input=None, output=None):
-        if input is None:
-            self.input = Queue()
-        else:
-            self.input = input
-        if output is None:
-            self.output = Queue()
-        else:
-            self.output = output
-
+    def __init__(self, peer_id, pipe: PipeConn):
+        self.pipe = pipe
         self.peer_id = peer_id
         self.peer_list = []
 
@@ -189,8 +182,8 @@ class PingUtils:
         self.peer_ping = {}
 
         self.__is_run = True
-        self.__receiver_proc = threading.Thread(target=self.__receiver)
-        self.__sender_proc = threading.Thread(target=self.__sender)
+        self.__receiver_proc = threading.Thread(target=self.__receiver, daemon=True)
+        self.__sender_proc = threading.Thread(target=self.__sender, daemon=True)
 
         self.__receiver_proc.start()
         self.__sender_proc.start()
@@ -202,7 +195,7 @@ class PingUtils:
             for peer_id in self.peer_list:
                 buf = f"ping{peer_id}".encode("utf-8")
                 self.peer_send_time[peer_id] = time.time_ns()
-                self.output.put((buf, peer_id))
+                self.pipe.send((buf, peer_id))
             time.sleep(15)
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
 
@@ -210,12 +203,12 @@ class PingUtils:
         logging.info(f"{self.__class__.__name__} | Thread receiver - started")
         while self.__is_run:
             try:
-                ping_type, peer_id = self.input.get(timeout=1)
-            except Empty:
+                ping_type, peer_id = self.pipe.recv(timeout=1)
+            except PipeEmpty:
                 continue
             if ping_type == "ping":
                 buf = f"pong{peer_id}".encode("utf-8")
-                self.output.put((buf, peer_id))
+                self.pipe.send((buf, peer_id))
             elif ping_type == "pong":
                 send_time = self.peer_send_time.get(peer_id)
                 if send_time is None:
@@ -258,16 +251,8 @@ class PingUtils:
 
 
 class Peer:
-    def __init__(self, peer_id, serv_addr, serv_port, local_addr=None, local_ports=None, input=None, output=None):
-        if input is None:
-            self.input = Queue()
-        else:
-            self.input = input
-
-        if output is None:
-            self.output = Queue()
-        else:
-            self.output = output
+    def __init__(self, peer_id, serv_addr, serv_port, pipe: PipeConn, local_addr=None, local_ports=None):
+        self.pipe = pipe
 
         self.peer_id = str(peer_id)
         self.server_addr = str(serv_addr)
@@ -279,12 +264,13 @@ class Peer:
         self.reload_socket(local_addr, random.randint(self.local_ports_range[0], self.local_ports_range[1]))
 
         self.__routeSearch = RouteSearch(serv_addr, serv_port, peer_id, self.sock)
-        self.__ping_utils = PingUtils(peer_id, output=self.input)
+        self.__ping_utils_pipe = PipeConn(Queue(), Queue())
+        self.__ping_utils = PingUtils(peer_id, PipeConn(self.__ping_utils_pipe.output, pipe.input))
 
         self.__is_run = True
-        self.__receiver_proc = threading.Thread(target=self.__receiver)
-        self.__sender_proc = threading.Thread(target=self.__sender)
-        self.__port_control_proc = threading.Thread(target=self.__port_control)
+        self.__receiver_proc = threading.Thread(target=self.__receiver, daemon=True)
+        self.__sender_proc = threading.Thread(target=self.__sender, daemon=True)
+        self.__port_control_proc = threading.Thread(target=self.__port_control, daemon=True)
 
         self.__receiver_proc.start()
         self.__sender_proc.start()
@@ -340,17 +326,17 @@ class Peer:
 
             if packet[:4] == b"ping" or packet[:4] == b"pong":
                 if packet[4:] == self.peer_id.encode("utf-8"):
-                    self.__ping_utils.input.put((packet[:4].decode("utf-8"), peer_id))
+                    self.__ping_utils_pipe.send((packet[:4].decode("utf-8"), peer_id))
                     continue
-            self.output.put((packet, peer_id))
+            self.pipe.send((packet, peer_id))
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
     def __sender(self):
         logging.info(f"{self.__class__.__name__} | Thread sender - started")
         while self.__is_run:
             try:
-                packet, peer_id = self.input.get(timeout=1)
-            except Empty:
+                packet, peer_id = self.pipe.recv(timeout=1)
+            except PipeEmpty:
                 continue
 
             daddr = self.__routeSearch.ID2DADDR.get(peer_id)
