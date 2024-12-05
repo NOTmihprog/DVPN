@@ -45,10 +45,14 @@ class Router:
         self.__receiver_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
 
-    def register_rote(self, route: bytes) -> FakePipeConn:
-        route = bytes(route)
-        if len(route) != 4:
-            logging.debug(f"{self.__class__.__name__} | register_rote - route: {route}, len != 4")
+    def register_rote(self, route: int) -> FakePipeConn:
+        if route > 255:
+            logging.debug(f"{self.__class__.__name__} | register_rote - route: {route}, route > 255")
+            raise ValueError
+        try:
+            route = route.to_bytes(1)
+        except OverflowError:
+            logging.debug(f"{self.__class__.__name__} | register_rote - route: {route}, OverflowError")
             raise ValueError
         input = Queue()
         self.route[route] = input
@@ -66,12 +70,12 @@ class Router:
                 logging.debug(f"{self.__class__.__name__} | Thread receiver - ValueError, packet drop")
                 continue
 
-            output = self.route.get(packet[:4])
+            output = self.route.get(packet[:1])
             if output is None:
-                logging.debug(f"{self.__class__.__name__} | Thread receiver - route: {packet[:4]} not found, packet drop")
+                logging.debug(f"{self.__class__.__name__} | Thread receiver - route: {packet[:1]} not found, packet drop")
                 continue
 
-            output.put((packet[4:], peer_id))
+            output.put((packet[1:], peer_id))
 
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
