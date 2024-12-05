@@ -41,7 +41,7 @@ class Router:
         self.route = {}
 
         self.__is_run = True
-        self.__receiver_proc = threading.Thread(target=self.__receiver)
+        self.__receiver_proc = threading.Thread(target=self.__receiver, daemon=True)
         self.__receiver_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
 

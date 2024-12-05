@@ -49,9 +49,9 @@ class PeerListFromFile:
 
             peer = dict(name=peer_name, id=peer_id, addr=peer_addr, key=peer_key)
             if peer_id in self.peer_id_list:
-                self.__update_peer(peer)
+                self.__update_peer(peer_id=peer_id, addr=peer_addr, key=peer_key)
             else:
                 self.peer_id_list.append(peer_id)
                 self.peer_list.append(peer)
-                self.__add_peer(peer)
+                self.__add_peer(peer_id=peer_id, addr=peer_addr, key=peer_key)
 

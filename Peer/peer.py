@@ -103,10 +103,10 @@ class RouteSearch:
             receive_time = time.time_ns()
             self.serv_last_recv_time = receive_time
 
-            id = data.get("id")
+            peer_id = data.get("id")
             addr = data.get("addr")
             port = data.get("port")
-            if id is None or addr is None or port is None:
+            if peer_id is None or addr is None or port is None:
                 logging.debug(f"{self.__class__.__name__} |"
                               f" Packet from {self.server_addr}:{self.server_port} id or adrr or port is None")
                 continue
@@ -117,17 +117,17 @@ class RouteSearch:
                               f" Packet from {self.server_addr}:{self.server_port} port not int")
                 continue
 
-            if id not in self.peer_list:
+            if peer_id not in self.peer_list:
                 logging.debug(f"{self.__class__.__name__} |"
                               f" Packet from {self.server_addr}:{self.server_port} peer id not in peer list")
                 continue
-            self.peer_receive_time[id] = receive_time
-            last_addr = self.ID2DADDR.get(id)
+            self.peer_receive_time[peer_id] = receive_time
+            last_addr = self.ID2DADDR.get(peer_id)
             if last_addr is not None:
                 del self.DADDR2ID[last_addr]
 
-            self.DADDR2ID[(addr, port)] = id
-            self.ID2DADDR[id] = (addr, port)
+            self.DADDR2ID[(addr, port)] = peer_id
+            self.ID2DADDR[peer_id] = (addr, port)
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
     def __del_daddr(self, peer_id):
@@ -137,34 +137,32 @@ class RouteSearch:
 
         self.ID2DADDR[peer_id] = None
 
-    def add_peer(self, peer) -> bool:
+    def add_peer(self, peer_id: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>"}
+        :param peer_id: str, len = 32, hex
         :return: ok: True, error: False
         """
-        peer_id = peer.get("id")
-        if peer_id is not None and peer_id != self.peer_id:
+        if peer_id != self.peer_id:
             self.peer_list.append(peer_id)
             return True
         else:
             return False
 
-    def del_peer(self, peer) -> bool:
+    def del_peer(self, peer_id: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>"}
+        :param peer_id: str, len = 32, hex
         :return: ok: True, not found: False
         """
-        peer_id = peer.get("id")
-        if peer_id is not None and peer_id in self.peer_list:
+        if peer_id in self.peer_list:
             self.peer_list.remove(peer_id)
             self.__del_daddr(peer_id)
             return True
         else:
             return False
 
-    def stop(self, join=False):
+    def stop(self, wait=False):
         self.__is_run = False
-        if join:
+        if wait:
             self.__receiver_proc.join()
             self.__send_search_proc.join()
             self.__send_annonce_proc.join()
@@ -219,32 +217,30 @@ class PingUtils:
                 self.peer_receive_time[peer_id] = receive_time
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
-    def add_peer(self, peer) -> bool:
+    def add_peer(self, peer_id: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>"}
+        :param peer_id: str, len = 32, hex
         :return: ok: True, error: False
         """
-        peer_id = peer.get("id")
-        if peer_id is not None and peer_id != self.peer_id:
+        if peer_id != self.peer_id:
             self.peer_list.append(peer_id)
             return True
         else:
             return False
 
-    def del_peer(self, peer) -> bool:
+    def del_peer(self, peer_id: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>"}
+        :param peer_id: str, len = 32, hex
         :return: ok: True, not found: False
         """
-        peer_id = peer.get("id")
-        if peer_id is not None and peer_id in self.peer_list:
+        if peer_id in self.peer_list:
             self.peer_list.remove(peer_id)
         else:
             return False
 
-    def stop(self, join=False):
+    def stop(self, wait=False):
         self.__is_run = False
-        if join:
+        if wait:
             self.__receiver_proc.join()
             self.__sender_proc.join()
         logging.info(f"{self.__class__.__name__} | Full - stopped")
@@ -345,31 +341,36 @@ class Peer:
                               f"packet to {peer_id} destination addr not found")
                 continue
             if len(packet) <= 65507:
-                self.sock.sendto(packet, daddr)
+                try:
+                    self.sock.sendto(packet, daddr)
+                except OSError:
+                    logging.debug(f"{self.__class__.__name__} | "
+                                  f"packet to peer {peer_id} socket OS Error")
+                    continue
             else:
                 logging.debug(f"{self.__class__.__name__} | "
                               f"packet to peer {peer_id} very long, len > 65507")
                 continue
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
 
-    def add_peer(self, peer) -> bool:
+    def add_peer(self, peer_id: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>"}
+        :param peer_id: str, len = 32, hex
         :return: ok: True, is self: False
         """
         result = True
-        result = result and self.__routeSearch.add_peer(peer)
-        result = result and self.__ping_utils.add_peer(peer)
+        result = result and self.__routeSearch.add_peer(peer_id)
+        result = result and self.__ping_utils.add_peer(peer_id)
         return result
 
-    def del_peer(self, peer) -> bool:
+    def del_peer(self, peer_id: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>"}
+        :param peer_id: str, len = 32, hex
         :return: ok: True, not found: False
         """
         result = True
-        result = result and self.__routeSearch.del_peer(peer)
-        result = result and self.__ping_utils.del_peer(peer)
+        result = result and self.__routeSearch.del_peer(peer_id)
+        result = result and self.__ping_utils.del_peer(peer_id)
         return result
 
     def stop(self, join=False):

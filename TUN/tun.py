@@ -25,7 +25,7 @@ class TUNControl:
         self.tun.config(addr, mask)
         self.addr = str(addr)
 
-        self.add_peer(dict(id=self.peer_id, addr=self.addr))  # add self peer
+        self.add_peer(peer_id=self.peer_id, addr=self.addr)  # add self peer
 
         self.__receiver_proc = threading.Thread(target=self.__receiver)
         self.__sender_proc = threading.Thread(target=self.__sender)
@@ -36,29 +36,25 @@ class TUNControl:
         self.__sender_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
 
-    def add_peer(self, peer) -> bool:
+    def add_peer(self, peer_id: str, addr: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>", "addr": "192.168.1.1"}
+        :param peer_id: str, len = 32, hex
+        :param addr: str, local ip addr, 192.168.1.1
         :return: ok: True, error: False
         """
-        peer_id = peer.get("id")
-        addr = peer.get("addr")
-        if peer_id is None or addr is None:
-            return False
-        elif self.ID2LADDR.get(peer_id) is not None or self.LADDR2ID.get(addr) is not None:
+        if self.ID2LADDR.get(peer_id) is not None or self.LADDR2ID.get(addr) is not None:
             return False
 
         self.ID2LADDR[peer_id] = addr
         self.LADDR2ID[addr] = peer_id
         return True
 
-    def del_peer(self, peer) -> bool:        
+    def del_peer(self, peer_id: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>"}
+        :param peer_id: str, len = 32, hex
         :return: ok: True, error: False
         """
-        peer_id = peer.get("id")
-        if peer_id is None or peer_id == self.peer_id:
+        if peer_id == self.peer_id:
             return False
         addr = self.ID2LADDR.get(peer_id)
         if addr is None:
@@ -67,14 +63,13 @@ class TUNControl:
         self.LADDR2ID[addr] = None
         self.ID2LADDR[peer_id] = None
 
-    def update_peer(self, peer) -> bool:
+    def update_peer(self, peer_id: str, addr: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>", "addr": "192.168.1.1"}
+        :param peer_id: str, len = 32, hex
+        :param addr: str, local ip addr, 192.168.1.1
         :return: ok: True, error: False
         """
-        peer_id = peer.get("id")
-        addr = peer.get("addr")
-        if peer_id is None or addr is None or peer_id == self.peer_id or self.ID2LADDR.get(peer_id) is None:
+        if peer_id == self.peer_id or self.ID2LADDR.get(peer_id) is None:
             return False
 
         last_addr = self.ID2LADDR.get(peer_id)

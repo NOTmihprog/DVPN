@@ -35,15 +35,12 @@ class SymmetricCrypto:
         self.__decrypter_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
 
-    def add_peer(self, peer) -> bool:
+    def add_peer(self, peer_id: str, key: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>", "key": "<crypto key>"}
+        :param peer_id: str, len = 32, hex
+        :param key: <crypto key>, base64, len = 32
         :return: ok: True, error: False
         """
-        key = peer.get("key")
-        peer_id = peer.get("id")
-        if peer_id is None or key is None:
-            return False
         key = base64.urlsafe_b64decode(key)
         if len(key) != 32:
             logging.warning(f"{self.__class__.__name__} | peer {peer_id} key not loaded len != 32")
@@ -55,22 +52,22 @@ class SymmetricCrypto:
             logging.warning(f"{self.__class__.__name__} | Peer {peer_id} key not loaded")
             return False
 
-    def del_peer(self, peer) -> bool:
+    def del_peer(self, peer_id: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>"}
+        :param peer_id: str, len = 32, hex
         :return: ok: True, error: False
         """
-        peer_id = peer.get("id")
         if peer_id is None or self.crypto_by_peer.get(peer_id) is None:
             return False
         self.crypto_by_peer[peer_id] = None
 
-    def update_peer(self, peer) -> bool:
+    def update_peer(self, peer_id: str, key: str) -> bool:
         """
-        :param peer: {"id": "<peer_id>", "key": "<crypto key>"}
+        :param peer_id: str, len = 32, hex
+        :param key: <crypto key>, base64, len = 32
         :return: ok: True, error: False
         """
-        return self.add_peer(peer)
+        return self.add_peer(peer_id=peer_id, key=key)
 
     def __encrypter(self):
         logging.info(f"{self.__class__.__name__} | Thread encrypter - started")
@@ -79,7 +76,7 @@ class SymmetricCrypto:
                 packet, peer_id = self.pipe_in.recv(timeout=1)
             except PipeEmpty:
                 continue
-            encryptor = self.crypto_by_peer.get(peer_id)
+            encryptor = self.crypto_by_peer.get(self.peer_id)
             if encryptor is None:
                 self.pipe_out.send((packet, peer_id))
                 continue
@@ -118,8 +115,9 @@ class SymmetricCrypto:
         else:
             return False
 
-    def stop(self):
+    def stop(self, wait=False):
         self.__is_run = False
-        self.__encrypter_proc.join()
-        self.__decrypter_proc.join()
+        if wait:
+            self.__encrypter_proc.join()
+            self.__decrypter_proc.join()
         logging.info(f"{self.__class__.__name__} | Full - stopped")

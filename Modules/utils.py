@@ -1,3 +1,4 @@
+import time
 from queue import Queue, Empty
 
 
@@ -21,8 +22,8 @@ class PipeConn:
 
 
 class Pipe:
-    def __new__(cls):
-        q1 = Queue()
-        q2 = Queue()
+    def __new__(cls, maxsize=0):
+        q1 = Queue(maxsize=maxsize)
+        q2 = Queue(maxsize=maxsize)
         return PipeConn(input=q1, output=q2), PipeConn(input=q2, output=q1)
 

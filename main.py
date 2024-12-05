@@ -13,6 +13,7 @@ __status__ = "Production"
 
 import sys
 import logging
+import time
 from logging.handlers import QueueHandler
 from queue import Queue
 import colorama
@@ -24,8 +25,6 @@ from Modules.crypto import SymmetricCrypto
 from Modules.router import Router
 from Modules.utils import Pipe
 
-from UI.TextUI import TextApp
-from UI.TUI import TUIApp
 from PeerList.file import PeerListFromFile
 
 
@@ -90,65 +89,63 @@ class UAPI:
     def get_local_addr(self):
         return self.peer.sock.getsockname()
 
-    def add_peer(self, peer):
+    def add_peer(self, peer_id: str, addr=None, key=None):
         """
-        :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
-        :return:None
+        :param peer_id: str, len = 32, hex
+        :param addr: str, local ip addr, 192.168.1.1
+        :param key: <crypto key>, base64, len = 32
+        :return: None
         """
-        if not self.tun_control.add_peer(peer):
-            logging.warning(f"Peer {peer} add to tun_control failed")
-        if not self.peer.add_peer(peer):
-            logging.warning(f"Peer {peer} add to peer failed")
-        if not self.crypto.add_peer(peer):
-            logging.warning(f"Peer {peer} add to crypto failed")
+        if not self.peer.add_peer(peer_id=peer_id):
+            logging.warning(f"Peer {peer_id} add to peer failed")
 
-    def del_peer(self, peer):
-        """
-        :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
-        :return:None
-        """
-        if not self.tun_control.del_peer(peer):
-            logging.warning(f"Peer {peer} del from tun_control failed")
-        if not self.peer.del_peer(peer):
-            logging.warning(f"Peer {peer} del from peer failed")
-        if not self.crypto.del_peer(peer):
-            logging.warning(f"Peer {peer} del from crypto failed")
+        if addr is not None:
+            if not self.tun_control.add_peer(peer_id=peer_id, addr=addr):
+                logging.warning(f"Peer {peer_id}, {addr} add to tun_control failed")
 
-    def update_peer(self, peer):
+        if key is not None:
+            if not self.crypto.add_peer(peer_id=peer_id, key=key):
+                logging.warning(f"Peer {peer_id} add to crypto failed")
+        else:
+            logging.warning(f"Peer {peer_id} encryption disabled")
+
+    def del_peer(self, peer_id):
         """
-        :param peer: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
-        :return:None
+        :param peer_id: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
+        :return: None
         """
-        if not self.tun_control.update_peer(peer):
-            logging.warning(f"Peer {peer} update to tun_control failed")
-        if not self.crypto.update_peer(peer):
-            logging.warning(f"Peer {peer} update to crypto failed")
+        if not self.tun_control.del_peer(peer_id=peer_id):
+            logging.warning(f"Peer {peer_id} del from tun_control failed")
+        if not self.peer.del_peer(peer_id=peer_id):
+            logging.warning(f"Peer {peer_id} del from peer failed")
+        if not self.crypto.del_peer(peer_id=peer_id):
+            logging.warning(f"Peer {peer_id} del from crypto failed")
+
+    def update_peer(self, peer_id: str, addr=None, key=None):
+        """
+        :param peer_id: str, len = 32, hex
+        :param addr: str, local ip addr, 192.168.1.1
+        :param key: <crypto key>, base64, len = 32
+        :return: None
+        """
+        if addr is not None:
+            if not self.tun_control.update_peer(peer_id=peer_id, addr=addr):
+                logging.warning(f"Peer {peer_id} update to tun_control failed")
+
+        if key is not None:
+            if not self.crypto.update_peer(peer_id=peer_id, key=key):
+                logging.warning(f"Peer {peer_id} update to crypto failed")
 
 
 if __name__ == "__main__":
-    if config.UI_TYPE is None:
-        colorama.init()
-        logging.basicConfig(level=config.LOG_LEVEL, stream=sys.stdout, format=config.LOG_FORMAT)
-        logging.info("Starting mode: log only")
-        app = TextApp(UAPI(config))
-        app.run()
+    colorama.init()
+    logging.basicConfig(level=config.LOG_LEVEL, stream=sys.stdout, format=config.LOG_FORMAT)
+    logging.info("Starting mode: log only")
+    uapi = UAPI(config)
+    while True:
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            break
+    uapi.stop()
 
-    elif config.UI_TYPE == "text":
-        colorama.init()
-        logging.basicConfig(level=config.LOG_LEVEL, stream=sys.stdout, format=config.LOG_FORMAT)
-        logging.info("Starting mode: TextUI")
-        app = TextApp(UAPI(config))
-        app.run()
-
-    elif config.UI_TYPE == "tui":
-        log_queue = Queue()
-        logging.basicConfig(level=config.LOG_LEVEL, handlers=[QueueHandler(log_queue)], format=config.LOG_FORMAT)
-        app = TUIApp(UAPI(conf=config, log_queue=log_queue))
-        logging.info("Starting mode: TextUI")
-        app.run()
-
-    else:
-        colorama.init()
-        logging.basicConfig(level=config.LOG_LEVEL, stream=sys.stdout, format=config.LOG_FORMAT)
-        logging.critical("UI Type not found")
-        sys.exit(1)
