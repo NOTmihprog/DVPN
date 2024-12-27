@@ -210,7 +210,8 @@ class PingUtils:
                     ping_packet = 0
 
                 last_packet = self.peer_receive_time.get(peer_id)
-                if (last_packet is not None or ping_packet >= 5) and ((time.time_ns() - last_packet) / 1000000000) > 45:
+                if ((last_packet is not None or ping_packet >= 5) and
+                        ((time.time_ns() - (0 if last_packet is None else last_packet)) / 1000000000) > 45):
                     self.api.del_endpoint(peer_id)
                     self.api.create_event(dict(peer_id=peer_id, endpoint=None))
                     ping_packet = 0
