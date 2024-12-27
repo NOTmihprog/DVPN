@@ -188,6 +188,7 @@ class PingUtils:
         self.peer_send_time = {}
         self.peer_receive_time = {}
         self.peer_ping = {}
+        self.peer_ping_packet = {}
 
         self.__is_run = True
         self.__receiver_proc = threading.Thread(target=self.__receiver, daemon=True)
@@ -204,14 +205,23 @@ class PingUtils:
             for peer_id in self.peer_list:
                 if self.api.get_peer_endpoint(peer_id) is None:
                     continue
+                ping_packet = self.peer_ping_packet.get(peer_id)
+                if ping_packet is None:
+                    ping_packet = 0
+
                 last_packet = self.peer_receive_time.get(peer_id)
-                if last_packet is not None and (time.time_ns() - last_packet) / 1000000000 > 45:
+                if (last_packet is not None or ping_packet >= 5) and ((time.time_ns() - last_packet) / 1000000000) > 45:
                     self.api.del_endpoint(peer_id)
                     self.api.create_event(dict(peer_id=peer_id, endpoint=None))
+                    ping_packet = 0
                     logging.debug(f"{self.__class__.__name__} | peer {peer_id} status offline")
+
                 buf = f"ping{peer_id}".encode("utf-8")
                 self.peer_send_time[peer_id] = time.time_ns()
                 self.pipe.send((buf, peer_id))
+
+                self.peer_ping_packet[peer_id] = ping_packet + 1
+
                 logging.debug(f"{self.__class__.__name__} | send ping to {peer_id}")
             time.sleep(15)
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
