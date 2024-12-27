@@ -23,6 +23,7 @@ else:
     sys.exit(1)
 
 CONFIG_FILE_NAME = 'config.ini'
+CONFIG_FILE_PATH = os.path.join(ROOT_DIR, CONFIG_FILE_NAME)
 
 
 LOG_FORMAT = (f"{Style.NORMAL + Fore.LIGHTGREEN_EX}|"
@@ -31,134 +32,166 @@ LOG_FORMAT = (f"{Style.NORMAL + Fore.LIGHTGREEN_EX}|"
               f"{Style.NORMAL + Fore.LIGHTWHITE_EX}%(message)s{Style.RESET_ALL}")
 
 
-config = configparser.ConfigParser()
-config.read(os.path.join(ROOT_DIR, CONFIG_FILE_NAME))
-try:
-    config_search_server = config["SearchServer"]
-except KeyError:
-    logging.critical(f"Error, [SearchServer] not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
+class ItemError(Exception):
+    def __init__(self, name):
+        self.name = name
 
-SERVER_ADDR = config_search_server.get("Addr")
-if SERVER_ADDR is None:
-    logging.critical(f"Error, [SearchServer] Addr not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
-
-SERVER_PORT = config_search_server.get("Port")
-if SERVER_PORT is None:
-    logging.critical(f"Error, [SearchServer] Port not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
-try:
-    SERVER_PORT = int(SERVER_PORT)
-except ValueError:
-    logging.critical(f"Error, [SearchServer] Port in {CONFIG_FILE_NAME} not int")
-    sys.exit(1)
-
-try:
-    config_peer = config["Peer"]
-except KeyError:
-    logging.critical(f"Error, [Peer] not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
-
-PEER_ID = str(config_peer.get("PeerId"))
-if PEER_ID is None:
-    logging.critical(f"Error, [Peer] PeerId not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
-elif len(PEER_ID) != 32:
-    logging.critical(f"Error, [Peer] PeerId in {CONFIG_FILE_NAME} len != 32")
-    sys.exit(1)
-
-try:
-    bytes.fromhex(PEER_ID)
-except ValueError:
-    logging.critical(f"Error, [Peer] PeerId in {CONFIG_FILE_NAME} not hex")
-    sys.exit(1)
-
-LOCAL_ADDR = str(config_peer.get("BindAddr"))
-if LOCAL_ADDR is None:
-    logging.critical(f"Error, [Peer] BindAddr not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
-
-LOCAL_PORT_RANGE = str(config_peer.get("BindPort"))
-if LOCAL_PORT_RANGE is None:
-    logging.critical(f"Error, [Peer] BindPort not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
-try:
-    LOCAL_PORT_RANGE = int(LOCAL_PORT_RANGE)
-    LOCAL_PORT_RANGE = (LOCAL_PORT_RANGE, LOCAL_PORT_RANGE)
-except ValueError:
-    try:
-        LOCAL_PORT_RANGE = LOCAL_PORT_RANGE.split("-")
-        LOCAL_PORT_RANGE = (int(LOCAL_PORT_RANGE[0]), int(LOCAL_PORT_RANGE[1]))
-    except ValueError:
-        logging.critical(f"Error, [Peer] BindPort in {CONFIG_FILE_NAME} invalid")
+    def critical_exit(self, section, file_name):
+        self.log(section, file_name)
         sys.exit(1)
 
-
-try:
-    config_peer_list = config["PeerList"]
-except KeyError:
-    logging.critical(f"Error, [config_peer_list] not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
-
-PEER_FILE = config_peer_list.get("File")
-if PEER_FILE is None:
-    logging.critical(f"Error, [PeerList] File not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
-PEER_FILE = os.path.join(ROOT_DIR, PEER_FILE)
-
-try:
-    config_tun = config["NET"]
-except KeyError:
-    logging.critical(f"Error, [NET] not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
-
-TUN_NAME = config_tun.get("TunName")
-if TUN_NAME is None:
-    logging.critical(f"Error, [NET] Name not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
-
-NET_ADDR = config_tun.get("Addr")
-if NET_ADDR is None:
-    logging.critical(f"Error, [NET] Addr not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
-
-NET_MASK = config_tun.get("Mask")
-if NET_MASK is None:
-    logging.critical(f"Error, [NET] Mask not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
+    def log(self, section, file_name):
+        logging.critical(f"Error, [{section}] {self.name} error in {file_name}")
 
 
-try:
-    config_ui = config["UI"]
-except KeyError:
-    logging.critical(f"Error, [UI] not found in {CONFIG_FILE_NAME}")
-    sys.exit(1)
+class ItemNotFoundError(ItemError):
+    def __init__(self, name):
+        super().__init__(name)
 
-UI_TYPE = str(config_ui.get("Type")).lower()
-if UI_TYPE == "none":
-    UI_TYPE = None
+    def log(self, section, file_name):
+        logging.critical(f"Error, [{section}] {self.name} not found in {file_name}")
 
-LOG_LEVEL = str(config_ui.get("LogLevel")).lower()
-if LOG_LEVEL == "none":
-    LOG_LEVEL = logging.INFO
 
-elif LOG_LEVEL == "debug":
-    LOG_LEVEL = logging.DEBUG
+class ItemNotEqualError(ItemError):
+    def __init__(self, name, item_type):
+        super().__init__(name)
+        self.type = item_type
 
-elif LOG_LEVEL == "info":
-    LOG_LEVEL = logging.INFO
+    def log(self, section, file_name):
+        logging.critical(f"Error, [{section}] {self.name} in {file_name} not {self.type}")
 
-elif LOG_LEVEL == "warning":
-    LOG_LEVEL = logging.WARNING
 
-elif LOG_LEVEL == "error":
-    LOG_LEVEL = logging.ERROR
+class ItemLenNotEqualError(ItemError):
+    def __init__(self, name, item_len):
+        super().__init__(name)
+        self.len = item_len
 
-elif LOG_LEVEL == "critical":
-    LOG_LEVEL = logging.CRITICAL
+    def log(self, section, file_name):
+        logging.critical(f"Error, [{section}] {self.name} in {file_name} len != {self.len}")
 
-else:
-    logging.critical(f"Error, [UI] LogLevel: '{LOG_LEVEL}' in {CONFIG_FILE_NAME} not recognized")
-    sys.exit(1)
 
+class ItemNotValidError(ItemError):
+    def __init__(self, name):
+        super().__init__(name)
+
+    def log(self, section, file_name):
+        logging.critical(f"Error, [{section}] {self.name} in {file_name} not valid")
+
+
+class PeerConfig:
+    def __init__(self, config):
+        self.server_addr = config.get("ServerAddr")
+        if self.server_addr is None:
+            raise ItemNotFoundError("ServerAddr")
+
+        try:
+            self.server_port = int(config.get("ServerPort"))
+        except ValueError:
+            raise ItemNotEqualError("ServerPort", int)
+        except TypeError:
+            raise ItemNotFoundError("ServerPort")
+
+        self.peer_id = str(config.get("PeerId"))
+        if self.peer_id is None:
+            raise ItemNotFoundError("PeerId")
+        elif len(self.peer_id) != 32:
+            raise ItemLenNotEqualError("PeerId", 32)
+        try:
+            bytes.fromhex(self.peer_id)
+        except ValueError:
+            raise ItemNotEqualError("ServerPort", "hex")
+
+        self.bind_addr = str(config.get("BindAddr"))
+        if self.bind_addr is None:
+            raise ItemNotFoundError("BindAddr")
+
+        self.bind_port_range = str(config.get("BindPort"))
+        if self.bind_port_range is None:
+            raise ItemNotFoundError("BindPort")
+        try:
+            self.bind_port_range = int(self.bind_port_range)
+            self.bind_port_range = (self.bind_port_range, self.bind_port_range)
+        except ValueError:
+            try:
+                self.bind_port_range = self.bind_port_range.split("-")
+                self.bind_port_range = (int(self.bind_port_range[0]), int(self.bind_port_range[1]))
+            except ValueError:
+                raise ItemNotValidError("BindPort")
+
+
+class NetConfig:
+    def __init__(self, config):
+        self.name = config.get("TunName")
+        if self.name is None:
+            raise ItemNotFoundError("TunName")
+
+        self.mtu = config.get("MTU")
+        if self.mtu is None:
+            raise ItemNotFoundError("MTU")
+
+        self.addr = config.get("Addr")
+        if self.addr is None:
+            raise ItemNotFoundError("Addr")
+
+        self.mask = config.get("Mask")
+        if self.mask is None:
+            raise ItemNotFoundError("Mask")
+
+
+class AppConfig:
+    def __init__(self, config):
+        self.peer_file = config.get("PeerFile")
+        if self.peer_file is None:
+            raise ItemNotFoundError("PeerFile")
+        self.peer_file = os.path.join(ROOT_DIR, self.peer_file)
+
+        self.log_level = str(config.get("LogLevel")).lower()
+        if self.log_level == "none":
+            self.log_level = logging.INFO
+
+        elif self.log_level == "debug":
+            self.log_level = logging.DEBUG
+
+        elif self.log_level == "info":
+            self.log_level = logging.INFO
+
+        elif self.log_level == "warning":
+            self.log_level = logging.WARNING
+
+        elif self.log_level == "error":
+            self.log_level = logging.ERROR
+
+        elif self.log_level == "critical":
+            self.log_level = logging.CRITICAL
+
+        else:
+            raise ItemNotValidError(self.log_level)
+
+
+class Config:
+    def __init__(self, path: str):
+        self.__config = configparser.ConfigParser()
+        self.__config.read(path)
+
+        try:
+            self.peer = PeerConfig(self.__config["Peer"])
+        except KeyError:
+            logging.critical(f"Error, [Peer] not found in {CONFIG_FILE_NAME}")
+            sys.exit(1)
+        except ItemError as e:
+            e.critical_exit("Peer", CONFIG_FILE_NAME)
+
+        try:
+            self.net = NetConfig(self.__config["NET"])
+        except KeyError:
+            logging.critical(f"Error, [NET] not found in {CONFIG_FILE_NAME}")
+            sys.exit(1)
+        except ItemError as e:
+            e.critical_exit("NET", CONFIG_FILE_NAME)
+        try:
+            self.app = AppConfig(self.__config["App"])
+        except KeyError:
+            logging.critical(f"Error, [App] not found in {CONFIG_FILE_NAME}")
+            sys.exit(1)
+        except ItemError as e:
+            e.critical_exit("App", CONFIG_FILE_NAME)
