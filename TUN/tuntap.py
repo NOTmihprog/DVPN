@@ -161,7 +161,7 @@ class Tap(object):
                     return
         return int(maskbits)
 
-    def config(self, ip, mask, gateway="0.0.0.0"):
+    def config(self, ip, mask, gateway="0.0.0.0", mtu=-1):
         '''
         config device's ip and mask
 
@@ -183,6 +183,8 @@ class Tap(object):
         try:
             subprocess.check_call('ip link set ' + self.name + ' up', shell=True)
             subprocess.check_call('ip addr add ' + self.ip + '/%d ' % nmask + " dev " + self.name, shell=True)
+            if mtu >= 0:
+                subprocess.check_call(f"ip link set dev {self.name} mtu {mtu}", shell=True)
         except:
             logging.warning("error when config")
             self.close()
@@ -217,7 +219,7 @@ class Tap(object):
             pass
         pass
 
-    def read(self, size=1522):
+    def read(self, size=1522, timeout=1):
         '''
         read device data with given size
 
@@ -229,7 +231,7 @@ class Tap(object):
 
         '''
         self.read_lock.acquire()
-        ready, _, _ = select.select([self.handle], [], [], 1)
+        ready, _, _ = select.select([self.handle], [], [], timeout)
         if not ready:
             self.read_lock.release()
             return None
@@ -339,7 +341,7 @@ class WinTap(Tap):
         else:
             return None
 
-    def config(self, ip, mask, gateway="0.0.0.0"):
+    def config(self, ip, mask, gateway="0.0.0.0", mtu=-1):
         self.ip = ip
         self.mask = mask
         self.gateway = gateway
@@ -371,7 +373,11 @@ class WinTap(Tap):
             sargs = sargs.replace("GATEWAY", self.gateway)
         subprocess.check_call(sargs, shell=True)
 
-    def read(self):
+        if mtu >= 0:
+            subprocess.check_call(f"""netsh interface ipv4 set subinterface "{self.name}" mtu={mtu} store=persistent""", shell=True)
+
+    def read(self, size=1500, timeout=1):
+        """size and timeout not working"""
         self.read_lock.acquire()
         result = None
         try:
