@@ -20,9 +20,10 @@ class TUNControl:
         self.ID2LADDR = {}
         self.LADDR2ID = {}
         self.peer_id = peer_id
+        self.mtu = mtu if mtu is not None else 1500
 
         self.tun = TunTap(nic_type="Tun", nic_name=tun_name)
-        self.tun.config(addr, mask, mtu if mtu is not None else -1)
+        self.tun.config(addr, mask, mtu=self.mtu)
         self.addr = str(addr)
 
         self.add_peer(peer_id=self.peer_id, addr=self.addr)  # add self peer

@@ -124,9 +124,11 @@ class NetConfig:
         self.name = config.get("TunName")
         if self.name is None:
             raise ItemNotFoundError("TunName")
-
-        self.mtu = config.get("MTU")
-        if self.mtu is None:
+        try:
+            self.mtu = int(config.get("MTU"))
+        except ValueError:
+            raise ItemNotEqualError("MTU", int)
+        except TypeError:
             raise ItemNotFoundError("MTU")
 
         self.addr = config.get("Addr")

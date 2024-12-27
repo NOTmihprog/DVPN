@@ -184,7 +184,7 @@ class Tap(object):
             subprocess.check_call('ip link set ' + self.name + ' up', shell=True)
             subprocess.check_call('ip addr add ' + self.ip + '/%d ' % nmask + " dev " + self.name, shell=True)
             if mtu >= 0:
-                subprocess.check_call(f"ip link set dev {self.name} mtu {mtu}", shell=True)
+                subprocess.check_call(f"ip link set mtu {mtu} dev {self.name}", shell=True)
         except:
             logging.warning("error when config")
             self.close()
