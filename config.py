@@ -87,7 +87,7 @@ class PeerConfig:
         try:
             self.server_port = int(config.get("ServerPort"))
         except ValueError:
-            raise ItemNotEqualError("ServerPort", int)
+            raise ItemNotEqualError("ServerPort", "int")
         except TypeError:
             raise ItemNotFoundError("ServerPort")
 
@@ -99,7 +99,7 @@ class PeerConfig:
         try:
             bytes.fromhex(self.peer_id)
         except ValueError:
-            raise ItemNotEqualError("ServerPort", "hex")
+            raise ItemNotEqualError("PeerId", "hex")
 
         self.bind_addr = str(config.get("BindAddr"))
         if self.bind_addr is None:
@@ -127,7 +127,7 @@ class NetConfig:
         try:
             self.mtu = int(config.get("MTU"))
         except ValueError:
-            raise ItemNotEqualError("MTU", int)
+            raise ItemNotEqualError("MTU", "int")
         except TypeError:
             raise ItemNotFoundError("MTU")
 

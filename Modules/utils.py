@@ -1,3 +1,5 @@
+import logging
+import threading
 import time
 from queue import Queue, Empty
 
@@ -27,3 +29,28 @@ class Pipe:
         q2 = Queue(maxsize=maxsize)
         return PipeConn(input=q1, output=q2), PipeConn(input=q2, output=q1)
 
+
+class EventPipe(threading.Thread):
+    def __init__(self, maxsize=0):
+        super().__init__()
+        self.event_q = Queue(maxsize=maxsize)
+        self.func_list = []
+
+        self.daemon = True
+        self.start()
+
+    def create_event(self, event: dict):
+        self.event_q.put(event)
+
+    def reg_event(self, func):
+        self.func_list.append(func)
+        return func
+
+    def run(self):
+        while True:
+            event = self.event_q.get()
+            for func in self.func_list:
+                try:
+                    func(event)
+                except Exception as e:
+                    logging.warning(e)

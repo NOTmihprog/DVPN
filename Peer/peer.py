@@ -7,7 +7,7 @@ __email__ = "mih@mihprog.com"
 __status__ = "Production"
 
 from queue import Queue, Empty
-from Modules.utils import PipeConn, PipeEmpty
+from Modules.utils import PipeConn, PipeEmpty, EventPipe
 import threading
 import logging
 import random
@@ -26,6 +26,7 @@ class RouteSearch:
         self.server_port = int(serv_port)
         self.peer_id = peer_id
         self.sock = sock
+        self.api = None
 
         self.DADDR2ID = {}
         self.ID2DADDR = {}
@@ -41,6 +42,7 @@ class RouteSearch:
         self.__send_search_proc = threading.Thread(target=self.__send_search, daemon=True)
         self.__send_annonce_proc = threading.Thread(target=self.__send_annonce, daemon=True)
 
+    def start(self):
         self.__receiver_proc.start()
         self.__send_search_proc.start()
         self.__send_annonce_proc.start()
@@ -53,16 +55,13 @@ class RouteSearch:
         logging.info(f"{self.__class__.__name__} | Thread send search - started")
         while self.__is_run:
             for peer_id in self.peer_list:
-                if peer_id == self.peer_id:
+                if peer_id == self.peer_id or self.api.get_peer_endpoint(peer_id) is not None:
                     continue
-
-                last_packet = self.peer_receive_time.get(peer_id)
-                if last_packet is not None and (time.time_ns() - last_packet) / 1000000000 > 45:
-                    self.__del_daddr(peer_id)
 
                 packet = json.dumps({"type": "get", "id": peer_id}).encode("utf-8")
                 try:
                     self.sock.sendto(packet, (self.server_addr, self.server_port))
+                    logging.debug(f"{self.__class__.__name__} | Send search request peer {peer_id}")
                 except OSError:
                     logging.debug(f"{self.__class__.__name__} | Send search error, OSError")
                 time.sleep(0.1)
@@ -75,6 +74,7 @@ class RouteSearch:
             packet = json.dumps({"type": "annonce", "id": self.peer_id}).encode("utf-8")
             try:
                 self.sock.sendto(packet, (self.server_addr, self.server_port))
+                logging.debug(f"{self.__class__.__name__} | Send annonce")
             except OSError:
                 logging.debug(f"{self.__class__.__name__} | Send annonce error, OSError")
             time.sleep(10)
@@ -108,7 +108,7 @@ class RouteSearch:
             port = data.get("port")
             if peer_id is None or addr is None or port is None:
                 logging.debug(f"{self.__class__.__name__} |"
-                              f" Packet from {self.server_addr}:{self.server_port} id or adrr or port is None")
+                              f" Packet from {self.server_addr}:{self.server_port} id or addr or port is None")
                 continue
             try:
                 port = int(port)
@@ -128,9 +128,18 @@ class RouteSearch:
 
             self.DADDR2ID[(addr, port)] = peer_id
             self.ID2DADDR[peer_id] = (addr, port)
+
+            self.api.create_event(dict(peer_id=peer_id, endpoint=(addr, port)))
+            if peer_id == self.peer_id:
+                logging.debug(
+                    f"{self.__class__.__name__} | receive annonce {addr}:{port}")
+            else:
+                logging.debug(f"{self.__class__.__name__} | peer {peer_id} new endpoint {addr}:{port} last addr "
+                              f"{str(last_addr[0])+':'+str(last_addr[1]) if last_addr is not None else None}")
+
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
-    def __del_daddr(self, peer_id):
+    def del_daddr(self, peer_id):
         last_addr = self.ID2DADDR.get(peer_id)
         if last_addr is not None:
             del self.DADDR2ID[last_addr]
@@ -155,7 +164,7 @@ class RouteSearch:
         """
         if peer_id in self.peer_list:
             self.peer_list.remove(peer_id)
-            self.__del_daddr(peer_id)
+            self.del_daddr(peer_id)
             return True
         else:
             return False
@@ -174,6 +183,7 @@ class PingUtils:
         self.pipe = pipe
         self.peer_id = peer_id
         self.peer_list = []
+        self.api = None
 
         self.peer_send_time = {}
         self.peer_receive_time = {}
@@ -183,6 +193,7 @@ class PingUtils:
         self.__receiver_proc = threading.Thread(target=self.__receiver, daemon=True)
         self.__sender_proc = threading.Thread(target=self.__sender, daemon=True)
 
+    def start(self):
         self.__receiver_proc.start()
         self.__sender_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
@@ -191,9 +202,17 @@ class PingUtils:
         logging.info(f"{self.__class__.__name__} | Thread sender - started")
         while self.__is_run:
             for peer_id in self.peer_list:
+                if self.api.get_peer_endpoint(peer_id) is None:
+                    continue
+                last_packet = self.peer_receive_time.get(peer_id)
+                if last_packet is not None and (time.time_ns() - last_packet) / 1000000000 > 45:
+                    self.api.del_endpoint(peer_id)
+                    self.api.create_event(dict(peer_id=peer_id, endpoint=None))
+                    logging.debug(f"{self.__class__.__name__} | peer {peer_id} status offline")
                 buf = f"ping{peer_id}".encode("utf-8")
                 self.peer_send_time[peer_id] = time.time_ns()
                 self.pipe.send((buf, peer_id))
+                logging.debug(f"{self.__class__.__name__} | send ping to {peer_id}")
             time.sleep(15)
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
 
@@ -207,6 +226,7 @@ class PingUtils:
             if ping_type == "ping":
                 buf = f"pong{peer_id}".encode("utf-8")
                 self.pipe.send((buf, peer_id))
+                logging.debug(f"{self.__class__.__name__} | receive ping from {peer_id}")
             elif ping_type == "pong":
                 send_time = self.peer_send_time.get(peer_id)
                 if send_time is None:
@@ -215,6 +235,8 @@ class PingUtils:
                 ping = (receive_time - send_time)/1000000
                 self.peer_ping[peer_id] = ping
                 self.peer_receive_time[peer_id] = receive_time
+                self.api.create_event(dict(peer_id=peer_id, ping=ping))
+                logging.debug(f"{self.__class__.__name__} | receive pong from {peer_id} ping: {ping}")
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
     def add_peer(self, peer_id: str) -> bool:
@@ -246,9 +268,51 @@ class PingUtils:
         logging.info(f"{self.__class__.__name__} | Full - stopped")
 
 
+class API:
+    def __init__(self, route_search, ping_utils, peer_id, event_pipe):
+        self.__route_search = route_search
+        self.__ping_utils = ping_utils
+        self.peer_id = peer_id
+        self.event_pipe = event_pipe
+
+    def get_ping(self, peer_id: str) -> int:
+        ping = self.__ping_utils.peer_ping.get(peer_id)
+        return ping if ping is not None else 0
+
+    def is_peer_online(self, peer_id: str) -> bool or None:
+        if peer_id == self.peer_id:
+            return True
+        last_pong = self.__ping_utils.peer_receive_time.get(peer_id)
+        if last_pong is None:
+            return None
+        if (time.time_ns()-last_pong)/1000000000 > 45:
+            return False
+        else:
+            return True
+
+    def is_serv_online(self) -> bool or None:
+        slrt = self.__route_search.serv_last_recv_time
+        if slrt is None:
+            return None
+        if (time.time_ns()-slrt)/1000000000 > 45:
+            return False
+        else:
+            return True
+
+    def get_peer_endpoint(self, peer_id) -> tuple or None:
+        return self.__route_search.ID2DADDR.get(peer_id)
+
+    def del_endpoint(self, peer_id):
+        self.__route_search.del_daddr(peer_id)
+
+    def create_event(self, event):
+        self.event_pipe.create_event(event)
+
+
 class Peer:
-    def __init__(self, peer_id, serv_addr, serv_port, pipe: PipeConn, local_addr=None, local_ports=None):
+    def __init__(self, peer_id, serv_addr, serv_port, pipe: PipeConn, event_pipe, local_addr=None, local_ports=None):
         self.pipe = pipe
+        self.event_pipe = event_pipe
 
         self.peer_id = str(peer_id)
         self.server_addr = str(serv_addr)
@@ -259,9 +323,16 @@ class Peer:
         self.sock = None
         self.reload_socket(local_addr, random.randint(self.local_ports_range[0], self.local_ports_range[1]))
 
-        self.__routeSearch = RouteSearch(serv_addr, serv_port, peer_id, self.sock)
+        self.__route_search = RouteSearch(serv_addr, serv_port, peer_id, self.sock)
         self.__ping_utils_pipe = PipeConn(Queue(), Queue())
         self.__ping_utils = PingUtils(peer_id, PipeConn(self.__ping_utils_pipe.output, pipe.input))
+        self.api = API(self.__route_search, self.__ping_utils, self.peer_id, event_pipe=event_pipe)
+
+        self.__route_search.api = self.api
+        self.__ping_utils.api = self.api
+
+        self.__route_search.start()
+        self.__ping_utils.start()
 
         self.__is_run = True
         self.__receiver_proc = threading.Thread(target=self.__receiver, daemon=True)
@@ -285,7 +356,7 @@ class Peer:
         self.sock.settimeout(1)
 
         try:
-            self.__routeSearch.update_socket(self.sock)
+            self.__route_search.update_socket(self.sock)
         except AttributeError:
             pass
 
@@ -293,12 +364,15 @@ class Peer:
         logging.info(f"{self.__class__.__name__} | Thread port_control - started")
         while self.__is_run:
             time.sleep(40)
-            server_status = self.is_serv_online()
+            server_status = self.api.is_serv_online()
             if server_status is None:
                 continue
             elif server_status:
                 continue
-            self.reload_socket(self.local_addr, random.randint(self.local_ports_range[0], self.local_ports_range[1]))
+
+            new_port = random.randint(self.local_ports_range[0], self.local_ports_range[1])
+            self.reload_socket(self.local_addr, new_port)
+            self.api.create_event(dict(bind_addr=self.local_addr, bind_port=new_port))
             logging.warning(f"{self.__class__.__name__} | Thread port_control - port changed")
 
         logging.info(f"{self.__class__.__name__} | Thread port_control - stopped")
@@ -311,12 +385,13 @@ class Peer:
             except TimeoutError:
                 continue
             except OSError:
+                logging.info(f"{self.__class__.__name__} | Thread receiver - socket OSError")
                 continue
             if addr[0] == self.server_addr and addr[1] == self.server_port:
-                self.__routeSearch.input.put(packet)
+                self.__route_search.input.put(packet)
                 continue
 
-            peer_id = self.__routeSearch.DADDR2ID.get(addr)
+            peer_id = self.__route_search.DADDR2ID.get(addr)
             if peer_id is None:
                 continue
 
@@ -335,7 +410,7 @@ class Peer:
             except PipeEmpty:
                 continue
 
-            daddr = self.__routeSearch.ID2DADDR.get(peer_id)
+            daddr = self.__route_search.ID2DADDR.get(peer_id)
             if daddr is None:
                 logging.debug(f"{self.__class__.__name__} | "
                               f"packet to {peer_id} destination addr not found")
@@ -359,7 +434,7 @@ class Peer:
         :return: ok: True, is self: False
         """
         result = True
-        result = result and self.__routeSearch.add_peer(peer_id)
+        result = result and self.__route_search.add_peer(peer_id)
         result = result and self.__ping_utils.add_peer(peer_id)
         return result
 
@@ -369,14 +444,14 @@ class Peer:
         :return: ok: True, not found: False
         """
         result = True
-        result = result and self.__routeSearch.del_peer(peer_id)
+        result = result and self.__route_search.del_peer(peer_id)
         result = result and self.__ping_utils.del_peer(peer_id)
         return result
 
     def stop(self, join=False):
         self.__is_run = False
 
-        self.__routeSearch.stop(join)
+        self.__route_search.stop(join)
         self.__ping_utils.stop(join)
         if join:
             self.__receiver_proc.join()
@@ -384,30 +459,3 @@ class Peer:
             self.__port_control_proc.join()
         self.sock.close()
         logging.info(f"{self.__class__.__name__} | Full - stopped")
-
-    def get_ping(self, peer_id: str) -> int:
-        ping = self.__ping_utils.peer_ping.get(peer_id)
-        return ping if ping is not None else 0
-
-    def is_peer_online(self, peer_id: str) -> bool or None:
-        if peer_id == self.peer_id:
-            return True
-        last_pong = self.__ping_utils.peer_receive_time.get(peer_id)
-        if last_pong is None:
-            return None
-        if (time.time_ns()-last_pong)/1000000000 > 45:
-            return False
-        else:
-            return True
-
-    def is_serv_online(self) -> bool or None:
-        slrt = self.__routeSearch.serv_last_recv_time
-        if slrt is None:
-            return None
-        if (time.time_ns()-slrt)/1000000000 > 45:
-            return False
-        else:
-            return True
-
-    def get_peer_endpoint(self, peer_id) -> tuple or None:
-        return self.__routeSearch.ID2DADDR.get(peer_id)
