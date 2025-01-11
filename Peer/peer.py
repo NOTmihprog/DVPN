@@ -214,8 +214,10 @@ class PingUtils:
                         ((time.time_ns() - (0 if last_packet is None else last_packet)) / 1000000000) > 45):
                     self.api.del_endpoint(peer_id)
                     self.api.create_event(dict(peer_id=peer_id, endpoint=None))
-                    ping_packet = 0
+                    self.peer_ping_packet[peer_id] = None
+                    self.peer_receive_time[peer_id] = None
                     logging.debug(f"{self.__class__.__name__} | peer {peer_id} status offline")
+                    continue
 
                 buf = f"ping{peer_id}".encode("utf-8")
                 self.peer_send_time[peer_id] = time.time_ns()
