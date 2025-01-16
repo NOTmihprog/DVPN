@@ -74,7 +74,7 @@ class Router:
 
     def register_range(self, min: int, max: int, mark: bool=True) -> FakePipeConnRange:
         if max > 255 and min < max:
-            logging.debug(f"{self.__class__.__name__} | register_rote - range: {max}, range > 255")
+            logging.debug(f"{self.__class__.__name__} | register_route - range: {max}, range > 255")
             raise ValueError
         input = Queue()
         for route in range(min, max+1):
