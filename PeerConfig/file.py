@@ -20,8 +20,11 @@ class PeerListFromFile:
 
         self.peer_id = peer_id
 
-        self.peer_id_list = []
         self.peer_list = []
+        self.peer_name = {}
+        self.peer_addr = {}
+        self.peer_crypto = {}
+        self.peer_sub_args = {}
 
         self.load_file()
 
@@ -33,7 +36,8 @@ class PeerListFromFile:
             peer_id = peer.get("id")
             peer_name = str(peer.get("name"))
             peer_addr = peer.get("addr")
-            peer_key = peer.get("key")
+            peer_crypto = peer.get("crypto")
+            peer_sub_args = peer.get("args")
 
             if peer_id is None:
                 continue
@@ -47,11 +51,13 @@ class PeerListFromFile:
             except ValueError:
                 continue
 
-            peer = dict(name=peer_name, id=peer_id, addr=peer_addr, key=peer_key)
-            if peer_id in self.peer_id_list:
-                self.__update_peer(peer_id=peer_id, addr=peer_addr, key=peer_key)
+            if peer_id in self.peer_list:
+                self.__update_peer(peer_id=peer_id, addr=peer_addr, crypto=peer_crypto)
             else:
-                self.peer_id_list.append(peer_id)
-                self.peer_list.append(peer)
-                self.__add_peer(peer_id=peer_id, addr=peer_addr, key=peer_key)
+                self.peer_list.append(peer_id)
+                self.peer_name[peer_id] = peer_name
+                self.peer_addr[peer_id] = peer_addr
+                self.peer_crypto[peer_id] = peer_crypto
+                self.peer_sub_args[peer_id] = peer_sub_args
+                self.__add_peer(peer_id=peer_id, addr=peer_addr, crypto=peer_crypto)
 
