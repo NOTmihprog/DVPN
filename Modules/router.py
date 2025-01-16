@@ -98,9 +98,9 @@ class Router:
             except ValueError:
                 logging.debug(f"{self.__class__.__name__} | Thread receiver - ValueError, packet drop")
                 continue
-
-            output, is_mark = self.route.get(packet[:1])
-            if output is None:
+            try:
+                output, is_mark = self.route.get(packet[:1])
+            except TypeError:
                 logging.debug(f"{self.__class__.__name__} | Thread receiver - route: {int.from_bytes(packet[:1])} not found, packet drop")
                 continue
             if is_mark:
