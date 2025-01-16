@@ -33,6 +33,19 @@ class FakePipeConn(PipeConn):
             raise ValueError
         return self.output.put((self.route+bytes(item[0]), item[1]))
 
+class FakePipeConnRange(PipeConn):
+    def __init__(self, input, output, range):
+        super().__init__(input, output)
+        self.min, self.max = range
+
+    def send(self, item):
+        if type(item) is not tuple:
+            logging.debug(f"{self.__class__.__name__} | put - item: {item} type is not tuple")
+            raise ValueError
+        packet, peer_id, mark = item
+        if self.min <= mark <= self.max:
+            return self.output.put((int.to_bytes(mark)+packet, peer_id))
+
 
 class Router:
     def __init__(self, pipe: PipeConn):
@@ -45,19 +58,35 @@ class Router:
         self.__receiver_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
 
-    def register_rote(self, route: int) -> FakePipeConn:
+    def register_rote(self, route: int, mark: bool=False) -> FakePipeConn:
         if route > 255:
             logging.debug(f"{self.__class__.__name__} | register_rote - route: {route}, route > 255")
             raise ValueError
         try:
             route = route.to_bytes(1)
         except OverflowError:
-            logging.debug(f"{self.__class__.__name__} | register_rote - route: {route}, OverflowError")
+            logging.debug(f"{self.__class__.__name__} | register_rote - route: {int.from_bytes(route)}, OverflowError")
             raise ValueError
         input = Queue()
-        self.route[route] = input
-        logging.debug(f"{self.__class__.__name__} | register_rote - add route: {route}")
+        self.route[route] = (input, mark)
+        logging.debug(f"{self.__class__.__name__} | register_rote - add route: {int.from_bytes(route)}")
         return FakePipeConn(input, self.pipe.output, route)
+
+    def register_range(self, min: int, max: int, mark: bool=True) -> FakePipeConnRange:
+        if max > 255 and min < max:
+            logging.debug(f"{self.__class__.__name__} | register_rote - range: {max}, range > 255")
+            raise ValueError
+        input = Queue()
+        for route in range(min, max+1):
+            try:
+                route = route.to_bytes(1)
+            except OverflowError:
+                logging.debug(f"{self.__class__.__name__} | register_rote - route: {int.from_bytes(route)}, OverflowError")
+                raise ValueError
+            self.route[route] = (input, mark)
+        logging.debug(f"{self.__class__.__name__} | register_rote - add range: {min}-{max}")
+
+        return FakePipeConnRange(input, self.pipe.output, (min, max))
 
     def __receiver(self):
         logging.info(f"{self.__class__.__name__} | Thread receiver - started")
@@ -70,12 +99,14 @@ class Router:
                 logging.debug(f"{self.__class__.__name__} | Thread receiver - ValueError, packet drop")
                 continue
 
-            output = self.route.get(packet[:1])
+            output, is_mark = self.route.get(packet[:1])
             if output is None:
-                logging.debug(f"{self.__class__.__name__} | Thread receiver - route: {packet[:1]} not found, packet drop")
+                logging.debug(f"{self.__class__.__name__} | Thread receiver - route: {int.from_bytes(packet[:1])} not found, packet drop")
                 continue
-
-            output.put((packet[1:], peer_id))
+            if is_mark:
+                output.put((packet[1:], peer_id, int.from_bytes(packet[:1])))
+            else:
+                output.put((packet[1:], peer_id))
 
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
