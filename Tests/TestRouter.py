@@ -2,26 +2,58 @@ import config
 import sys
 import logging
 from Modules.router import Router
+from Modules.utils import Pipe
+import unittest
 
 
-logging.basicConfig(level=config.LOG_LEVEL, stream=sys.stdout, format=config.LOG_FORMAT)
+logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, format=config.LOG_FORMAT)
 
-router = Router()
 
-test = router.register_rote(b"test")
-tset = router.register_rote(b"tset")
+class TestRouter(unittest.TestCase):
+    def __init__(self, methodName: str = "RunTest"):
+        super().__init__(methodName)
 
-router.input.put((b"testtest message", "test"))
-router.input.put(b"testtest message")
-router.input.put((b"tsettest message", "test"))
+        self.pipe1, pipe2 = Pipe()
 
-print("test:", test[0].get(timeout=1))
-print("tset:", tset[0].get(timeout=1))
+        self.router = Router(pipe2)
 
-test[1].put((b"test message", "test"))
-tset[1].put((b"test message", "test"))
+        self.route1 = self.router.register_rote(1)
+        self.route2 = self.router.register_rote(2)
+        self.range_route = self.router.register_range(3, 10)
 
-print(router.output.get(timeout=1))
-print(router.output.get(timeout=1))
+    def test_sent_to_pipe(self):
+        self.pipe1.send((int(1).to_bytes(1) + b"test message", "test"))
+        self.pipe1.send(int(1).to_bytes(1) + b"test message")
+        self.pipe1.send((int(2).to_bytes(1) + b"tset message", "test"))
 
-router.stop()
+        self.pipe1.send((int(11).to_bytes(1) + b"test message", "test"))
+        self.pipe1.send((int(3).to_bytes(1) + b"test message", "test"))
+        self.pipe1.send((int(5).to_bytes(1) + b"test message", "test"))
+        self.pipe1.send((int(10).to_bytes(1) + b"test message", "test"))
+
+        self.assertEqual(self.route1.recv(timeout=1), (b'test message', 'test'))
+        self.assertEqual(self.route2.recv(timeout=1), (b'tset message', 'test'))
+
+        self.assertEqual(self.range_route.recv(timeout=1), (b'test message', 'test', 3))
+        self.assertEqual(self.range_route.recv(timeout=1), (b'test message', 'test', 5))
+        self.assertEqual(self.range_route.recv(timeout=1), (b'test message', 'test', 10))
+
+    def test_recv_from_pipe(self):
+        self.route1.send((b"test message", "test"))
+        self.route2.send((b"test message", "test"))
+
+        self.range_route.send((b"test message", "test", 0))
+        self.range_route.send((b"test message", "test", 3))
+        self.range_route.send((b"test message", "test", 5))
+        self.range_route.send((b"test message", "test", 10))
+        self.range_route.send((b"test message", "test", 11))
+
+        self.assertEqual(self.pipe1.recv(timeout=1), (b'\x01test message', 'test'))
+        self.assertEqual(self.pipe1.recv(timeout=1), (b'\x02test message', 'test'))
+
+        self.assertEqual(self.pipe1.recv(timeout=1), (b'\x03test message', 'test'))
+        self.assertEqual(self.pipe1.recv(timeout=1), (b'\x05test message', 'test'))
+        self.assertEqual(self.pipe1.recv(timeout=1), (b'\ntest message', 'test'))
+
+if __name__ == '__main__':
+    unittest.main()
