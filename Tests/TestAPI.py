@@ -28,9 +28,9 @@ peers = get("peers")
 
 send_to_peer_id = None
 for peer in peers:
-    peer_id = get("peer_name", peer)
+    peer_name = get("peer_name", peer)
     if get("peer_name", peer) == send_to:
-        send_to_peer_id = peer_id
+        send_to_peer_id = peer
 
 if send_to_peer_id is None:
     print("no name error")
