@@ -1,6 +1,5 @@
 import logging
 import threading
-import time
 from queue import Queue, Empty
 
 
@@ -45,6 +44,9 @@ class EventPipe(threading.Thread):
     def reg_event(self, func):
         self.func_list.append(func)
         return func
+
+    def rem_event(self, func):
+        self.func_list.remove(func)
 
     def run(self):
         while True:
