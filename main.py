@@ -168,7 +168,7 @@ if __name__ == "__main__":
 
     con = ConnectorUnix("/tmp/dvpn.sock")
     api = API(con, uapi, uapi.router.register_range(32, 255))
-    uapi.event_pipe.reg_event(api.event_handler)
+    uapi.event_pipe.add_listener(api.event_handler)
 
     while True:
         try:
