@@ -21,10 +21,10 @@ from Peer.peer import Peer
 from TUN.tun import TUNControl
 from Modules.crypto import SymmetricCrypto
 from Modules.router import Router
-from Modules.utils import Pipe, EventPipe
+from Modules.utils import Pipe, EventPipe, ConnectorUnix
 
 from PeerConfig.file import PeerListFromFile
-from Modules.api import API, ConnectorUnix
+from Modules.api import API
 
 
 class UAPI:
