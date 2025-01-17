@@ -1,5 +1,5 @@
 import time
-from Modules.api import ConnectorUnix
+from Modules.utils import ConnectorUnix
 
 con = ConnectorUnix("/tmp/test.sock")
 sock_addr = "/tmp/dvpn.sock"

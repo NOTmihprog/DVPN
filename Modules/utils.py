@@ -1,5 +1,8 @@
 import logging
 import threading
+import msgpack
+import socket
+import os
 from queue import Queue, Empty
 
 
@@ -56,3 +59,69 @@ class EventPipe(threading.Thread):
                     func(event)
                 except Exception as e:
                     logging.warning(e)
+
+
+class Connector:
+    def __init__(self, sock):
+        self.sock = sock
+        self.sock.setblocking(True)
+        self.__is_run = True
+
+    def close(self):
+        self.sock.close()
+
+    def recv(self):
+        try:
+            packet, addr = self.sock.recvfrom(65507)
+        except BlockingIOError:
+            logging.info(f"{self.__class__.__name__} | BlockingIOError")
+            return None, None
+        except TimeoutError:
+            return None, None
+        except OSError:
+            logging.info(f"{self.__class__.__name__} | OSError")
+            return None, None
+        try:
+            return msgpack.loads(packet), addr
+        except msgpack.ExtraData:
+            logging.info(f"{self.__class__.__name__} | msgpack ExtraData")
+            return None, None
+        except msgpack.FormatError:
+            logging.info(f"{self.__class__.__name__} | msgpack FormatError")
+            return None, None
+        except msgpack.StackError:
+            logging.info(f"{self.__class__.__name__} | msgpack StackError")
+            return None, None
+        except ValueError:
+            logging.info(f"{self.__class__.__name__} | msgpack ValueError")
+            return None, None
+
+
+    def send(self, packet, addr):
+        try:
+            self.sock.sendto(msgpack.dumps(packet), addr)
+        except PermissionError:
+            logging.info(f"{self.__class__.__name__} | PermissionError")
+            return None
+        except OSError:
+            logging.info(f"{self.__class__.__name__} | OSError")
+            return None
+
+
+class ConnectorInet(Connector):
+    def __init__(self, bind_addr: tuple[str, int]):
+        self.__sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.__sock.bind(bind_addr)
+
+        super().__init__(self.__sock)
+
+
+class ConnectorUnix(Connector):
+    def __init__(self, bind_addr: str):
+        if os.path.exists(bind_addr):
+            os.remove(bind_addr)
+        self.__sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.__sock.bind(bind_addr)
+
+        super().__init__(self.__sock)
+
