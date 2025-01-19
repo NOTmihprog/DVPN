@@ -44,41 +44,42 @@ class API:
     def __handler_get(self, packet):
         request = packet.get("req")
         peer_id = packet.get("peer_id")
-        if request == "peers":
-            return self.uapi.get_peers()
+        match request:
+            case "peers":
+                return self.uapi.get_peers()
 
-        elif request == "peer_name":
-            return self.uapi.get_peer_name(peer_id)
+            case "peer_name":
+                return self.uapi.get_peer_name(peer_id)
 
-        elif request == "peer_addr":
-            return self.uapi.get_peer_addr(peer_id)
+            case "peer_addr":
+                return self.uapi.get_peer_addr(peer_id)
 
-        elif request == "peer_crypto":
-            return self.uapi.get_peer_crypto(peer_id)
+            case "peer_crypto":
+                return self.uapi.get_peer_crypto(peer_id)
 
-        elif request == "peer_sub_args":
-            return self.uapi.get_peer_sub_args(peer_id)
+            case "peer_sub_args":
+                return self.uapi.get_peer_sub_args(peer_id)
 
-        elif request == "peer_sub_arg":
-            return self.uapi.get_peer_sub_arg(peer_id, packet.get("arg"))
+            case "peer_sub_arg":
+                return self.uapi.get_peer_sub_arg(peer_id, packet.get("arg"))
 
-        elif request == "peer_endpoint":
-            return self.uapi.get_endpoint(peer_id)
+            case "peer_endpoint":
+                return self.uapi.get_endpoint(peer_id)
 
-        elif request == "peer_status":
-            return self.uapi.get_peer_status(peer_id)
+            case "peer_status":
+                return self.uapi.get_peer_status(peer_id)
 
-        elif request == "peer_ping":
-            return self.uapi.get_peer_ping(peer_id)
+            case "peer_ping":
+                return self.uapi.get_peer_ping(peer_id)
 
-        elif request == "peer_crypto_status":
-            return self.uapi.get_crypto_status(peer_id)
+            case "peer_crypto_status":
+                return self.uapi.get_crypto_status(peer_id)
 
-        elif request == "server_status":
-            return self.uapi.get_server_status()
+            case "server_status":
+                return self.uapi.get_server_status()
 
-        elif request == "local_addr":
-            return self.uapi.get_local_addr()
+            case "local_addr":
+                return self.uapi.get_local_addr()
 
 
     def __send_event(self, event, addr):
@@ -95,16 +96,17 @@ class API:
         if type(route) is not int:
             return "not_int"
 
-        if request == "reg":
-            return self.router.add_route(addr, route)
+        match request:
+            case "reg":
+                return self.router.add_route(addr, route)
 
-        elif request == "del":
-            if self.router.ROUTE2ADDR.get(route) != addr:
-                return "not_permission"
-            return self.router.del_route(route)
+            case "del":
+                if self.router.ROUTE2ADDR.get(route) != addr:
+                    return "not_permission"
+                return self.router.del_route(route)
 
-        elif request == "routes":
-            return self.router.get_routes(addr)
+            case "routes":
+                return self.router.get_routes(addr)
 
     def __receiver(self):
         while self.__is_run:
@@ -113,47 +115,48 @@ class API:
             if type(packet) is not dict:
                 continue
             packet_type = packet.get("type")
-            if packet_type == "init":
-                self.connections[addr] = {"name": packet.get("name")}
+            conn_inited = self.connections.get(addr) is not None
+            match conn_inited, packet_type:
+                case False, "init":
+                    self.connections[addr] = {"name": packet.get("name")}
 
-            elif packet_type == "ping":
-                self.con.send({"type": "pong"}, addr)
-                logging.debug(f"{self.__class__.__name__} | receive ping from conn {addr}")
-
-
-            elif self.connections.get(addr) is None: #  position is elif not an error
-                self.__send_close(addr)
-                logging.debug(f"{self.__class__.__name__} | receive {packet_type} from unknown conn {addr}")
-                continue
-
-            elif packet_type == "net":
-                self.router.packet_handler(packet, addr)
+                case _, "ping":
+                    self.con.send({"type": "pong"}, addr)
+                    logging.debug(f"{self.__class__.__name__} | receive ping from conn {addr}")
 
 
-            elif packet_type == "pong":
-                send_time = self.conn_ping_send_time.get(addr)
-                if send_time is None:
+                case False, _: #  position is case not an error
+                    self.__send_close(addr)
+                    logging.debug(f"{self.__class__.__name__} | receive {packet_type} from unknown conn {addr}")
                     continue
-                receive_time = time.time_ns()
-                ping = (receive_time - send_time) / 1000000
-                self.conn_ping[addr] = ping
-                self.conn_ping_receive_time[addr] = receive_time
-                logging.debug(f"{self.__class__.__name__} | receive pong from conn {addr} ping: {ping}")
 
-            elif packet_type == "get":
-                response = self.__handler_get(packet)
-                self.con.send({"type": "res",
-                                      "id": packet.get("id"),
-                                      "res": response}, addr)
+                case True, "net":
+                    self.router.packet_handler(packet, addr)
 
-            elif packet_type == "route":
-                response = self.__handler_route(packet, addr)
-                self.con.send({"type": "res",
-                                      "id": packet.get("id"),
-                                      "res": response}, addr)
+                case True, "pong":
+                    send_time = self.conn_ping_send_time.get(addr)
+                    if send_time is None:
+                        continue
+                    receive_time = time.time_ns()
+                    ping = (receive_time - send_time) / 1000000
+                    self.conn_ping[addr] = ping
+                    self.conn_ping_receive_time[addr] = receive_time
+                    logging.debug(f"{self.__class__.__name__} | receive pong from conn {addr} ping: {ping}")
 
-            elif packet_type == "close":
-                self.close_conn(addr)
+                case True, "get":
+                    response = self.__handler_get(packet)
+                    self.con.send({"type": "res",
+                                          "id": packet.get("id"),
+                                          "res": response}, addr)
+
+                case True, "route":
+                    response = self.__handler_route(packet, addr)
+                    self.con.send({"type": "res",
+                                          "id": packet.get("id"),
+                                          "res": response}, addr)
+
+                case True, "close":
+                    self.close_conn(addr)
 
     def __ping_sender(self):
         logging.info(f"{self.__class__.__name__} | Thread ping sender - started")
