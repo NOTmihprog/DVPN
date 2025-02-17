@@ -41,8 +41,8 @@ class EventPipe(threading.Thread):
         self.daemon = True
         self.start()
 
-    def create_event(self, event: dict):
-        self.__event_q.put(event)
+    def event(self, **kwargs):
+        self.__event_q.put(kwargs)
 
     def add_listener(self, func):
         self.__func_list.append(func)
@@ -56,10 +56,16 @@ class EventPipe(threading.Thread):
             event = self.__event_q.get()
             for func in self.__func_list:
                 try:
-                    func(event)
+                    if func.__code__.co_argcount == 1 and func.__code__.co_varnames[0] == "event":
+                        func(event)
+                    else:
+                        try:
+                            args = list(event[arg] for arg in func.__code__.co_varnames)
+                        except KeyError:
+                            continue
+                        func(*args)
                 except Exception as e:
                     logging.warning(e)
-
 
 class Connector:
     def __init__(self, sock):
