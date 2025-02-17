@@ -17,7 +17,7 @@ import threading
 from Modules.utils import EventPipe
 
 class PeerConfigStorage:
-    def __init__(self, file_path, mode="rw"):
+    def __init__(self, peer_id: str, file_path: str, mode: str="rw"):
         self.__file_path = file_path
         self.__file_readable = mode.lower().index("r") > -1
         self.__file_writable = mode.lower().index("w") > -1
@@ -32,6 +32,8 @@ class PeerConfigStorage:
         self.__peer_crypto = {}
         self.__peer_sub_args = {}
 
+        self.peer_id = peer_id
+        self.__peer_list.append(peer_id)
         self.__read_config()
 
     def add_listener(self, func):
@@ -197,6 +199,12 @@ class PeerConfigStorage:
             self.__peer_sub_args[peer_id][arg] = val
         except TypeError:
             self.__peer_sub_args[peer_id] = {arg: val}
+
+    def peer_exists(self, peer_id: str) -> bool:
+        return peer_id in self.__peer_list
+
+    def peer_is_self(self, peer_id: str) -> bool:
+        return peer_id == self.peer_id
 
 
 
