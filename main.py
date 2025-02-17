@@ -11,19 +11,21 @@ __maintainer__ = "mihprog"
 __email__ = "mih@mihprog.com"
 __status__ = "Production"
 
+import os
 import sys
 import logging
 import time
 import colorama
 import config
+import typer
 
 from Peer.peer import Peer
 from TUN.tun import TUNControl
 from Modules.crypto import SymmetricCrypto
 from Modules.router import Router
-from Modules.utils import Pipe, EventPipe, ConnectorUnix
+from Modules.utils import Pipe, EventPipe, ConnectorUnix, ConnectorInet
 
-from PeerConfig.file import PeerListFromFile
+from Modules.peer_storage import PeerConfigStorage
 from Modules.api import API
 
 
@@ -40,8 +42,8 @@ class UAPI:
         self.peer = Peer(peer_id=self.conf.peer.peer_id, serv_addr=self.conf.peer.server_addr,
                          serv_port=self.conf.peer.server_port, local_addr=self.conf.peer.bind_addr,
                          local_ports=self.conf.peer.bind_port_range, pipe=_peer_pipe, event_pipe=self.event_pipe)
-        crypto_pipe, _crupto_pipe = Pipe()
-        self.crypto = SymmetricCrypto(peer_id=self.conf.peer.peer_id, pipe_in=_crupto_pipe, pipe_out=peer_pipe)
+        crypto_pipe, _crypto_pipe = Pipe()
+        self.crypto = SymmetricCrypto(peer_id=self.conf.peer.peer_id, pipe_in=_crypto_pipe, pipe_out=peer_pipe)
 
         self.router = Router(pipe=crypto_pipe)
 
@@ -63,22 +65,22 @@ class UAPI:
         self.router.stop()
 
     def get_peers(self):
-        return self.peer_list.peer_list
+        return self.peer_list.__peer_list
 
     def get_peer_name(self, peer_id):
-        return self.peer_list.peer_name.get(peer_id)
+        return self.peer_list.__peer_name.get(peer_id)
 
     def get_peer_addr(self, peer_id):
-        return self.peer_list.peer_addr.get(peer_id)
+        return self.peer_list.__peer_addr.get(peer_id)
 
     def get_peer_crypto(self, peer_id):
-        return self.peer_list.peer_crypto.get(peer_id)
+        return self.peer_list.__peer_crypto.get(peer_id)
 
     def get_peer_sub_args(self, peer_id):
-        return self.peer_list.peer_sub_args.get(peer_id)
+        return self.peer_list.__peer_sub_args.get(peer_id)
 
     def get_peer_sub_arg(self, peer_id, arg):
-        args = self.peer_list.peer_sub_args.get(peer_id)
+        args = self.peer_list.__peer_sub_args.get(peer_id)
         if type(args) is dict:
             return args.get(arg)
 
@@ -110,7 +112,7 @@ class UAPI:
     def get_local_addr(self):
         return self.peer.sock.getsockname()
 
-
+'''
     def add_peer(self, peer_id: str, addr=None, crypto=None):
         """
         :param peer_id: str, len = 32, hex
@@ -157,16 +159,26 @@ class UAPI:
         if type(crypto) is dict:
             if not self.crypto.update_peer(peer_id=peer_id, key=crypto.get("key")):
                 logging.warning(f"Peer {peer_id} update to crypto failed")
+'''
 
+typer_app = typer.Typer()
 
-if __name__ == "__main__":
-    colorama.init()
+@typer_app.callback(invoke_without_command=True)
+def main():
     conf = config.Config(config.CONFIG_FILE_PATH)
     logging.basicConfig(level=conf.app.log_level, stream=sys.stdout, format=config.LOG_FORMAT)
     logging.info("Starting mode: log only")
     uapi = UAPI(conf)
 
-    con = ConnectorUnix("/tmp/dvpn.sock")
+    if os.name == 'nt' or conf.net is None:
+        con = ConnectorInet(("127.0.0.1", 9902))
+    else:
+        try:
+            os.mkdir(config.SOCKET_DIR_PATH)
+        except FileExistsError:
+            pass
+        con = ConnectorUnix(os.path.join(config.SOCKET_DIR_PATH, f"{conf.net.name}.sock"))
+
     api = API(con, uapi, uapi.router.register_range(32, 255))
     uapi.event_pipe.add_listener(api.event_handler)
 
@@ -177,3 +189,8 @@ if __name__ == "__main__":
             break
     uapi.stop()
 
+
+if __name__ == "__main__":
+    colorama.init()
+
+    typer_app()

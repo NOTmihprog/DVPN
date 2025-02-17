@@ -25,6 +25,8 @@ else:
 CONFIG_FILE_NAME = 'config.ini'
 CONFIG_FILE_PATH = os.path.join(ROOT_DIR, CONFIG_FILE_NAME)
 
+SOCKET_DIR_PATH = "/run/dvpn"
+
 
 LOG_FORMAT = (f"{Style.NORMAL + Fore.LIGHTGREEN_EX}|"
               f"{Fore.CYAN + Style.DIM}%(asctime)s{Style.NORMAL + Fore.LIGHTGREEN_EX}|{Style.RESET_ALL} "
@@ -186,8 +188,8 @@ class Config:
         try:
             self.net = NetConfig(self.__config["NET"])
         except KeyError:
-            logging.critical(f"Error, [NET] not found in {CONFIG_FILE_NAME}")
-            sys.exit(1)
+            logging.info(f"Section [NET] not found in {CONFIG_FILE_NAME} network disabled")
+            self.net = None
         except ItemError as e:
             e.critical_exit("NET", CONFIG_FILE_NAME)
         try:
