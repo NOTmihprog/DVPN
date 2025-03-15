@@ -17,6 +17,8 @@ import threading
 from Modules.utils import EventPipe
 
 class PeerConfigStorage:
+    __slots__ = ("__file_path", "__file_readable", "__file_writable", "__event_pipe", "__write_lock", "__peer_list",
+                 "__peer_name", "__peer_addr", "__peer_crypto", "__peer_sub_args", "peer_id")
     def __init__(self, peer_id: str, file_path: str, mode: str="rw"):
         self.__file_path = file_path
         self.__file_readable = mode.lower().index("r") > -1
@@ -213,56 +215,3 @@ class PeerConfigStorage:
             if peer_id.startswith(peer_id_segment):
                 return peer_id
         return None
-
-
-
-class FileLoader:
-    def __init__(self, file_path, peer_id, add_peer, del_peer, update_peer):
-        self.file_path = file_path
-
-        self.__add_peer = add_peer
-        self.__del_peer = del_peer
-        self.__update_peer = update_peer
-
-        self.peer_id = peer_id
-
-        self.peer_list = []
-        self.peer_name = {}
-        self.peer_addr = {}
-        self.peer_crypto = {}
-        self.peer_sub_args = {}
-
-        self.load_file()
-
-    def load_file(self):
-        file = open(self.file_path)
-        peer_list = json.load(file)
-        file.close()
-        for peer in peer_list:
-            peer_id = peer.get("id")
-            peer_name = str(peer.get("name"))
-            peer_addr = peer.get("addr")
-            peer_crypto = peer.get("crypto")
-            peer_sub_args = peer.get("args")
-
-            if peer_id is None:
-                continue
-            elif len(peer_id) != 32 or peer_id == self.peer_id:
-                continue
-            else:
-                peer_id = str(peer_id)
-
-            try:
-                bytes.fromhex(peer_id)
-            except ValueError:
-                continue
-
-            if peer_id in self.peer_list:
-                self.__update_peer(peer_id=peer_id, addr=peer_addr, crypto=peer_crypto)
-            else:
-                self.peer_list.append(peer_id)
-                self.peer_name[peer_id] = peer_name
-                self.peer_addr[peer_id] = peer_addr
-                self.peer_crypto[peer_id] = peer_crypto
-                self.peer_sub_args[peer_id] = peer_sub_args
-                self.__add_peer(peer_id=peer_id, addr=peer_addr, crypto=peer_crypto)
