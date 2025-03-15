@@ -6,13 +6,16 @@ __version__ = "1.1.4"
 __email__ = "mih@mihprog.com"
 __status__ = "Development"
 
+import ipaddress
 import os
+import random
 import sys
 import logging
+import uuid
+
 from colorama import Fore, Style
 
 import configparser
-
 
 if getattr(sys, 'frozen', False):
     ROOT_DIR = os.path.dirname(os.path.abspath(sys.executable))
@@ -25,6 +28,9 @@ else:
 CONFIG_FILE_NAME = 'config.ini'
 CONFIG_FILE_PATH = os.path.join(ROOT_DIR, CONFIG_FILE_NAME)
 
+PEERS_FILE_NAME = "peers.cnf"
+PEERS_FILE_PATH = os.path.join(ROOT_DIR, PEERS_FILE_NAME)
+
 SOCKET_DIR_PATH = "/run/dvpn"
 
 
@@ -32,6 +38,51 @@ LOG_FORMAT = (f"{Style.NORMAL + Fore.LIGHTGREEN_EX}|"
               f"{Fore.CYAN + Style.DIM}%(asctime)s{Style.NORMAL + Fore.LIGHTGREEN_EX}|{Style.RESET_ALL} "
               f"%(levelname)s {Fore.LIGHTGREEN_EX}|{Fore.LIGHTYELLOW_EX}->{Style.RESET_ALL} "
               f"{Style.NORMAL + Fore.LIGHTWHITE_EX}%(message)s{Style.RESET_ALL}")
+
+DEFAULT_CONFIG ="""
+[Peer]
+ServerAddr = 62.109.29.213
+ServerPort = 6484
+
+# PeerId string len = 32: generate uuid.uuid4().hex
+PeerId = {peer_id}
+
+# local bind ip
+BindAddr = 0.0.0.0
+
+# local port or port range, exemple: 8647, 8647-9942, 8647-8647
+BindPort = 8647-9942
+
+
+[NET]
+# tun interface name, ignored on windows
+TunName = dnet
+
+MTU = 1350
+Addr = {addr}
+Mask = 255.255.255.0
+
+[App]
+# Log Levels DEBUG, INFO, WARNING, ERROR, CRITICAL
+LogLevel = DEBUG
+"""
+
+def get_random_ip(net):
+    net = ipaddress.IPv4Network(net)
+    net_list = list(net)
+    net_list.remove(net.network_address)
+    net_list.remove(net.broadcast_address)
+    return random.choice(net_list)
+
+if not os.path.isfile(CONFIG_FILE_PATH):
+    try:
+        file = open(CONFIG_FILE_PATH, "w")
+    except Exception as e:
+        logging.critical(f"Create config file error: {e}")
+        sys.exit(2)
+    file.seek(0)
+    file.write(DEFAULT_CONFIG.format(peer_id=uuid.uuid4().hex, addr=get_random_ip("10.10.33.0/24")))
+    file.close()
 
 
 class ItemError(Exception):
@@ -144,11 +195,6 @@ class NetConfig:
 
 class AppConfig:
     def __init__(self, config):
-        self.peer_file = config.get("PeerFile")
-        if self.peer_file is None:
-            raise ItemNotFoundError("PeerFile")
-        self.peer_file = os.path.join(ROOT_DIR, self.peer_file)
-
         self.log_level = str(config.get("LogLevel")).lower()
         if self.log_level == "none":
             self.log_level = logging.INFO

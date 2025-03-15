@@ -70,7 +70,7 @@ class RouteSearch:
                 try:
                     self.sock.sendto(packet, (self.server_addr, self.server_port))
                     logging.debug(f"{self.__class__.__name__} | Send search request peer "
-                                  f"{self.__peer_storage.get_peer_name(peer_id)}({peer_id})")
+                                  f"{peer_id}")
                 except OSError as e:
                     logging.debug(f"{self.__class__.__name__} | Send search error, OSError {e}")
                 time.sleep(0.1)
@@ -80,10 +80,12 @@ class RouteSearch:
     def __send_annonce(self):
         logging.info(f"{self.__class__.__name__} | Thread send annonce - started")
         while self.__is_run:
-            packet = json.dumps({"type": "annonce", "id": self.__peer_storage.peer_id}).encode("utf-8")
+            peer_id = self.__peer_storage.peer_id
+            packet = json.dumps({"type": "annonce", "id": peer_id}).encode("utf-8")
             try:
                 self.sock.sendto(packet, (self.server_addr, self.server_port))
-                logging.debug(f"{self.__class__.__name__} | Send annonce")
+                logging.debug(f"{self.__class__.__name__} | Send annonce "
+                              f"{peer_id}")
             except OSError as e:
                 logging.debug(f"{self.__class__.__name__} | Send annonce error, OSError {e}")
             time.sleep(10)
@@ -126,7 +128,7 @@ class RouteSearch:
                               f" Packet from {self.server_addr}:{self.server_port} port not int")
                 continue
 
-            if self.__peer_storage.peer_exists(peer_id):
+            if not self.__peer_storage.peer_exists(peer_id):
                 logging.debug(f"{self.__class__.__name__} |"
                               f" Packet from {self.server_addr}:{self.server_port} peer_id not found in peer_storage")
                 continue
@@ -144,7 +146,7 @@ class RouteSearch:
                     f"{self.__class__.__name__} | receive annonce {addr}:{port}")
             else:
                 logging.debug(f"{self.__class__.__name__} | "
-                              f"peer {self.__peer_storage.get_peer_name(peer_id)}({peer_id})"
+                              f"peer {peer_id}"
                               f" new endpoint {addr}:{port} last addr "
                               f"{str(last_addr[0])+':'+str(last_addr[1]) if last_addr is not None else None}")
 
@@ -157,9 +159,9 @@ class RouteSearch:
 
         self.ID2DADDR[peer_id] = None
 
-    def __event_handler(self, event_type, peer_id):
-        match event_type:
-            case "del_peer":
+    def __event_handler(self, action, peer_id):
+        match action:
+            case "del":
                 self.del_daddr(peer_id)
 
     def stop(self, wait=False):
@@ -198,6 +200,8 @@ class PingUtils:
             for peer_id in self.__peer_storage.get_peers_id():
                 if self.api.get_peer_endpoint(peer_id) is None:
                     continue
+                if self.__peer_storage.peer_is_self(peer_id):
+                    continue
                 ping_packet = self.peer_ping_packets_send.get(peer_id)
                 if ping_packet is None:
                     ping_packet = 0
@@ -210,7 +214,7 @@ class PingUtils:
                     self.peer_ping_packets_send[peer_id] = None
                     self.peer_receive_time[peer_id] = None
                     logging.debug(f"{self.__class__.__name__} |"
-                                  f" peer {self.__peer_storage.get_peer_name(peer_id)}({peer_id}) status offline")
+                                  f" peer {peer_id} status offline")
                     continue
 
                 buf = f"ping{peer_id}".encode("utf-8")
@@ -220,7 +224,7 @@ class PingUtils:
                 self.peer_ping_packets_send[peer_id] = ping_packet + 1
 
                 logging.debug(f"{self.__class__.__name__} |"
-                              f" send ping to {self.__peer_storage.get_peer_name(peer_id)}({peer_id})")
+                              f" send ping to {peer_id}")
             time.sleep(15)
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
 
@@ -235,7 +239,7 @@ class PingUtils:
                 buf = f"pong{peer_id}".encode("utf-8")
                 self.pipe.send((buf, peer_id))
                 logging.debug(f"{self.__class__.__name__} |"
-                              f" receive ping from {self.__peer_storage.get_peer_name(peer_id)}({peer_id})")
+                              f" receive ping from {peer_id}")
             elif ping_type == "pong":
                 send_time = self.peer_send_time.get(peer_id)
                 if send_time is None:
@@ -246,7 +250,7 @@ class PingUtils:
                 self.peer_receive_time[peer_id] = receive_time
                 self.api.event(peer_id=peer_id, ping=ping)
                 logging.debug(f"{self.__class__.__name__} |"
-                              f" receive pong from {self.__peer_storage.get_peer_name(peer_id)}({peer_id})"
+                              f" receive pong from {peer_id}"
                               f" ping: {ping}")
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
@@ -411,7 +415,7 @@ class Peer:
             daddr = self.__route_search.ID2DADDR.get(peer_id)
             if daddr is None:
                 logging.debug(f"{self.__class__.__name__} | "
-                              f"packet to {self.__peer_storage.get_peer_name(peer_id)}({peer_id})"
+                              f"packet to {peer_id}"
                               f" destination addr not found")
                 continue
             if len(packet) <= 65507:
@@ -419,11 +423,11 @@ class Peer:
                     self.sock.sendto(packet, daddr)
                 except OSError:
                     logging.debug(f"{self.__class__.__name__} | packet to peer "
-                                  f"{self.__peer_storage.get_peer_name(peer_id)}({peer_id}) socket OS Error")
+                                  f"{peer_id} socket OS Error")
                     continue
             else:
                 logging.debug(f"{self.__class__.__name__} | packet to peer"
-                              f" {self.__peer_storage.get_peer_name(peer_id)}({peer_id}) very long, len > 65507")
+                              f" {peer_id} very long, len > 65507")
                 continue
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
 

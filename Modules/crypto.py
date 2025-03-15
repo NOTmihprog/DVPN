@@ -7,106 +7,188 @@ __email__ = "mih@mihprog.com"
 __status__ = "Development"
 
 
+import os
 import threading
 import logging
-
 import base64
+import binascii
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import padding
-from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.hmac import HMAC
+
 from Modules.utils import PipeConn, PipeEmpty
+from Modules.peer_storage import PeerConfigStorage
+
+
+
+class InvalidToken(Exception):
+    pass
+
+
+
+class Symmetric():
+    def __init__(self, key: bytes | str) -> None:
+        try:
+            key = base64.urlsafe_b64decode(key)
+        except binascii.Error as exc:
+            raise ValueError(
+                "Key must be 32 url-safe base64-encoded bytes."
+            ) from exc
+        if len(key) != 32:
+            raise ValueError(
+                "Key must be 32 url-safe base64-encoded bytes."
+            )
+
+        self._signing_key = key[:16]
+        self._encryption_key = key[16:]
+
+
+    @classmethod
+    def generate_key(cls) -> bytes:
+        return base64.urlsafe_b64encode(os.urandom(32))
+
+    def encrypt(self, data: bytes) -> bytes:
+        iv = os.urandom(16)
+        return self._encrypt_from_parts(data, iv)
+
+    def _encrypt_from_parts(self, data: bytes, iv: bytes) -> bytes:
+
+        padder = padding.PKCS7(algorithms.AES.block_size).padder()
+        padded_data = padder.update(data) + padder.finalize()
+        encryptor = Cipher(
+            algorithms.AES(self._encryption_key),
+            modes.CBC(iv),
+        ).encryptor()
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+
+        basic_parts = (
+                iv
+                + ciphertext
+        )
+
+        h = HMAC(self._signing_key, hashes.SHA256())
+        h.update(basic_parts)
+        hmac = h.finalize()
+        return basic_parts + hmac
+
+    def decrypt(self, token: bytes | str) -> bytes:
+        return self._decrypt_data(token)
+
+
+    def _verify_signature(self, data: bytes) -> None:
+        h = HMAC(self._signing_key, hashes.SHA256())
+        h.update(data[:-32])
+        try:
+            h.verify(data[-32:])
+        except InvalidSignature:
+            raise InvalidToken
+
+    def _decrypt_data(self, data: bytes) -> bytes:
+
+        self._verify_signature(data)
+
+        iv = data[:16]
+        ciphertext = data[16:-32]
+        decryptor = Cipher(
+            algorithms.AES(self._encryption_key), modes.CBC(iv)
+        ).decryptor()
+        plaintext_padded = decryptor.update(ciphertext)
+        try:
+            plaintext_padded += decryptor.finalize()
+        except ValueError:
+            raise InvalidToken
+        unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+
+        unpadded = unpadder.update(plaintext_padded)
+        try:
+            unpadded += unpadder.finalize()
+        except ValueError:
+            raise InvalidToken
+        return unpadded
+
 
 
 class SymmetricCrypto:
-    def __init__(self, peer_id, pipe_in: PipeConn, pipe_out: PipeConn):
+    def __init__(self, peer_storage: PeerConfigStorage, pipe_in: PipeConn, pipe_out: PipeConn):
         self.pipe_in = pipe_in
         self.pipe_out = pipe_out
+        self.__peer_storage = peer_storage
 
-        self.backend = default_backend()
         self.crypto_by_peer = {}
-        self.block_size = 128
-        self.peer_id = peer_id
+
+        for peer_id in self.__peer_storage.get_peers_id():
+            peer_crypto = self.__peer_storage.get_peer_crypto(peer_id)
+            if peer_crypto is None:
+                logging.warning(f"{self.__class__.__name__} | Peer {peer_id} Encryption disabled")
+                continue
+            self.__event_handler("add", peer_id, peer_crypto)
+        self.__peer_storage.add_listener(self.__event_handler)
 
         self.__is_run = True
-        self.__encrypter_proc = threading.Thread(target=self.__encrypter)
-        self.__decrypter_proc = threading.Thread(target=self.__decrypter)
+        self.__encrypter_proc = threading.Thread(target=self.__encrypter, daemon=True)
+        self.__decrypter_proc = threading.Thread(target=self.__decrypter, daemon=True)
 
         self.__encrypter_proc.start()
         self.__decrypter_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
 
-    def add_peer(self, peer_id: str, key: str) -> bool:
-        """
-        :param peer_id: str, len = 32, hex
-        :param key: <crypto key>, base64, len = 32
-        :return: ok: True, error: False
-        """
-        key = base64.urlsafe_b64decode(key)
-        if len(key) != 32:
-            logging.warning(f"{self.__class__.__name__} | peer {peer_id} key not loaded len != 32")
-            return False
-        try:
-            self.crypto_by_peer[peer_id] = Cipher(algorithms.AES(key), modes.ECB(), self.backend)
-            return True
-        except ValueError:
-            logging.warning(f"{self.__class__.__name__} | Peer {peer_id} key not loaded")
-            return False
+    def __event_handler(self, action, peer_id, crypto):
+        match action:
+            case "add" | "update":
+                try:
+                    key = crypto.get("key")
+                    self.crypto_by_peer[peer_id] = Symmetric(key)
+                except ValueError as e:
+                    logging.warning(f"{self.__class__.__name__} | Peer {peer_id} crypto.key load error: {e}, Encryption disabled")
+                    return
 
-    def del_peer(self, peer_id: str) -> bool:
-        """
-        :param peer_id: str, len = 32, hex
-        :return: ok: True, error: False
-        """
-        if peer_id is None or self.crypto_by_peer.get(peer_id) is None:
-            return False
-        self.crypto_by_peer[peer_id] = None
+                except KeyError:
+                    logging.warning(f"{self.__class__.__name__} | Peer {peer_id} crypto.key not found, Encryption disabled")
+                    return
 
-    def update_peer(self, peer_id: str, key: str) -> bool:
-        """
-        :param peer_id: str, len = 32, hex
-        :param key: <crypto key>, base64, len = 32
-        :return: ok: True, error: False
-        """
-        return self.add_peer(peer_id=peer_id, key=key)
+            case "del":
+                self.crypto_by_peer[peer_id] = None
 
     def __encrypter(self):
         logging.info(f"{self.__class__.__name__} | Thread encrypter - started")
         while self.__is_run:
             try:
-                packet, peer_id = self.pipe_in.recv(timeout=1)
-            except PipeEmpty:
-                continue
-            encryptor = self.crypto_by_peer.get(self.peer_id)
-            if encryptor is None:
-                self.pipe_out.send((packet, peer_id))
-                continue
-            encryptor = encryptor.encryptor()
-            padder = padding.PKCS7(self.block_size).padder()
-            try:
-                padded_packet = padder.update(packet) + padder.finalize()
-                self.pipe_out.send((encryptor.update(padded_packet) + encryptor.finalize(), peer_id))
-            except ValueError:
-                logging.debug(f"{self.__class__.__name__} | packet to {peer_id} encrypt error")
+                try:
+                    packet, peer_id = self.pipe_in.recv(timeout=1)
+                except PipeEmpty:
+                    continue
+                encryptor = self.crypto_by_peer.get(peer_id)
+                if encryptor is None:
+                    self.pipe_out.send((packet, peer_id))
+                    continue
+                try:
+                    self.pipe_out.send((encryptor.encrypt(packet), peer_id))
+                except InvalidToken:
+                    logging.debug(f"{self.__class__.__name__} | packet to {peer_id} encrypt error")
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
         logging.info(f"{self.__class__.__name__} | Thread encrypter - stopped")
 
     def __decrypter(self):
         logging.info(f"{self.__class__.__name__} | Thread decrypter - started")
         while self.__is_run:
             try:
-                packet, peer_id = self.pipe_out.recv(timeout=1)
-            except PipeEmpty:
-                continue
-            decryptor = self.crypto_by_peer.get(self.peer_id)
-            if decryptor is None:
-                self.pipe_in.send((packet, peer_id))
-                continue
-            decryptor = decryptor.decryptor()
-            unpadder = padding.PKCS7(self.block_size).unpadder()
-            try:
-                decrypted_packet = decryptor.update(packet)
-                self.pipe_in.send((unpadder.update(decrypted_packet) + unpadder.finalize(), peer_id))
-            except ValueError:
-                logging.debug(f"{self.__class__.__name__} | packet from {peer_id} decrypt error")
+                try:
+                    packet, peer_id = self.pipe_out.recv(timeout=1)
+                except PipeEmpty:
+                    continue
+                decryptor = self.crypto_by_peer.get(self.__peer_storage.peer_id)
+                if decryptor is None:
+                    self.pipe_in.send((packet, peer_id))
+                    continue
+                try:
+                    self.pipe_in.send((decryptor.decrypt(packet), peer_id))
+                except InvalidToken:
+                    logging.debug(f"{self.__class__.__name__} | packet from {peer_id} decrypt error")
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
         logging.info(f"{self.__class__.__name__} | Thread decrypter - stopped")
 
     def is_use_crypto(self, peer_id):

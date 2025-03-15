@@ -11,27 +11,34 @@ __maintainer__ = "mihprog"
 __email__ = "mih@mihprog.com"
 __status__ = "Production"
 
+import base64
+import ipaddress
+import json
 import os
 import sys
+import uuid
 import logging
 import time
 import colorama
 import config
 import typer
+from typing_extensions import Annotated
+from tabulate import tabulate
 
 from Peer.peer import Peer
 from TUN.tun import TUNControl
 from Modules.crypto import SymmetricCrypto
 from Modules.router import Router
-from Modules.utils import Pipe, EventPipe, ConnectorUnix, ConnectorInet
+from Modules.utils import Pipe, EventPipe, ConnectorUnix, ConnectorInet, PeerLogsHandler
 
 from Modules.peer_storage import PeerConfigStorage
 from Modules.api import API
 
 
 class UAPI:
-    def __init__(self, conf: config.Config, log_queue=None):
+    def __init__(self, conf: config.Config, peer_storage, log_queue=None):
         self.conf = conf
+        self.__peer_storage = peer_storage
         self.log_queue = log_queue
         self.peer_sub_args_runtime = {}
 
@@ -39,50 +46,28 @@ class UAPI:
 
         peer_pipe, _peer_pipe = Pipe()
 
-        self.peer = Peer(peer_id=self.conf.peer.peer_id, serv_addr=self.conf.peer.server_addr,
-                         serv_port=self.conf.peer.server_port, local_addr=self.conf.peer.bind_addr,
-                         local_ports=self.conf.peer.bind_port_range, pipe=_peer_pipe, event_pipe=self.event_pipe)
+        self.peer = Peer(peer_storage=self.__peer_storage, serv_addr=self.conf.peer.server_addr,
+                         event_pipe=self.event_pipe, serv_port=self.conf.peer.server_port,
+                         local_addr=self.conf.peer.bind_addr, local_ports=self.conf.peer.bind_port_range,
+                         pipe=_peer_pipe)
+
         crypto_pipe, _crypto_pipe = Pipe()
-        self.crypto = SymmetricCrypto(peer_id=self.conf.peer.peer_id, pipe_in=_crypto_pipe, pipe_out=peer_pipe)
+        self.crypto = SymmetricCrypto(peer_storage=self.__peer_storage, pipe_in=_crypto_pipe, pipe_out=peer_pipe)
 
         self.router = Router(pipe=crypto_pipe)
 
-        net0_pipe = self.router.register_rote(1)
+        if self.conf.net is not None:
+            net0_pipe = self.router.register_rote(1)
 
-        self.tun_control = TUNControl(tun_name=self.conf.net.name, addr=self.conf.net.addr,
-                                      mask=self.conf.net.mask, mtu=self.conf.net.mtu,
-                                      pipe=net0_pipe, peer_id=self.conf.peer.peer_id)
-
-        self.peer_list = PeerListFromFile(conf.app.peer_file, self.conf.peer.peer_id,
-                                          add_peer=self.add_peer,
-                                          del_peer=self.del_peer,
-                                          update_peer=self.update_peer)
+            self.tun_control = TUNControl(tun_name=self.conf.net.name, peer_storage=self.__peer_storage,
+                                          mask=self.conf.net.mask, mtu=self.conf.net.mtu, pipe=net0_pipe)
 
     def stop(self):
-        self.tun_control.stop()
+        if self.conf.net is not None:
+            self.tun_control.stop()
         self.peer.stop()
         self.crypto.stop()
         self.router.stop()
-
-    def get_peers(self):
-        return self.peer_list.__peer_list
-
-    def get_peer_name(self, peer_id):
-        return self.peer_list.__peer_name.get(peer_id)
-
-    def get_peer_addr(self, peer_id):
-        return self.peer_list.__peer_addr.get(peer_id)
-
-    def get_peer_crypto(self, peer_id):
-        return self.peer_list.__peer_crypto.get(peer_id)
-
-    def get_peer_sub_args(self, peer_id):
-        return self.peer_list.__peer_sub_args.get(peer_id)
-
-    def get_peer_sub_arg(self, peer_id, arg):
-        args = self.peer_list.__peer_sub_args.get(peer_id)
-        if type(args) is dict:
-            return args.get(arg)
 
     def get_endpoint(self, peer_id):
         return self.peer.api.get_peer_endpoint(peer_id)
@@ -112,63 +97,90 @@ class UAPI:
     def get_local_addr(self):
         return self.peer.sock.getsockname()
 
-'''
-    def add_peer(self, peer_id: str, addr=None, crypto=None):
-        """
-        :param peer_id: str, len = 32, hex
-        :param addr: str, local ip addr, 192.168.1.1
-        :param crypto: {"key": <crypto key>}, base64, len = 32
-        :return: None
-        """
-        if not self.peer.add_peer(peer_id=peer_id):
-            logging.warning(f"Peer {peer_id} add to peer failed")
 
-        if addr is not None:
-            if not self.tun_control.add_peer(peer_id=peer_id, addr=addr):
-                logging.warning(f"Peer {peer_id}, {addr} add to tun_control failed")
-
-        if type(crypto) is dict:
-            if not self.crypto.add_peer(peer_id=peer_id, key=crypto.get("key")):
-                logging.warning(f"Peer {peer_id} add to crypto failed")
-        else:
-            logging.info(f"Peer {peer_id} encryption disabled")
-
-    def del_peer(self, peer_id):
-        """
-        :param peer_id: {"id": "<peer_id>", "addr": "<ip addr>", "key": "<crypto key>"}
-        :return: None
-        """
-        if not self.tun_control.del_peer(peer_id=peer_id):
-            logging.warning(f"Peer {peer_id} del from tun_control failed")
-        if not self.peer.del_peer(peer_id=peer_id):
-            logging.warning(f"Peer {peer_id} del from peer failed")
-        if not self.crypto.del_peer(peer_id=peer_id):
-            logging.warning(f"Peer {peer_id} del from crypto failed")
-
-    def update_peer(self, peer_id: str, addr=None, crypto=None):
-        """
-        :param peer_id: str, len = 32, hex
-        :param addr: str, local ip addr, 192.168.1.1
-        :param crypto: {"key": <crypto key>}, base64, len = 32
-        :return: None
-        """
-        if addr is not None:
-            if not self.tun_control.update_peer(peer_id=peer_id, addr=addr):
-                logging.warning(f"Peer {peer_id} update to tun_control failed")
-
-        if type(crypto) is dict:
-            if not self.crypto.update_peer(peer_id=peer_id, key=crypto.get("key")):
-                logging.warning(f"Peer {peer_id} update to crypto failed")
-'''
 
 typer_app = typer.Typer()
 
+def get_peer_id_or_exit(peer_id: str, peer_storage: PeerConfigStorage) -> str:
+    if len(peer_id) < 32:
+        peer_id = peer_storage.get_full_peer_id(peer_id)
+    else:
+        try:
+            peer_id = bytes.fromhex(peer_id).hex()
+        except ValueError:
+            logging.critical(f"Peer_id {peer_id} invalid")
+            sys.exit(1)
+    if peer_id is None:
+        logging.critical(f"Peer_id {peer_id} not found")
+        sys.exit(1)
+    return peer_id
+
+def write_or_print_or_exit(out, data, onl_json):
+    out_data = json.dumps(data)
+    if not onl_json:
+        out_data = base64.urlsafe_b64encode(out_data.encode()).decode()
+    if out is None:
+        print(out_data)
+    else:
+        try:
+            file = open(out, "w")
+        except Exception as e:
+            logging.critical(f"Open file error: {e}")
+            sys.exit(1)
+        file.seek(0)
+        file.write(out_data)
+        file.close()
+
+def read_input_or_exit(inp: str) -> any:
+    if inp is not None:
+        try:
+            file = open(inp, "r")
+        except Exception as e:
+            logging.critical(f"Open file error: {e}")
+            sys.exit(1)
+        file.seek(0)
+        inp_data = file.read()
+        file.close()
+    else:
+        inp_data = input("Paste peers string: ")
+    try:
+        inp_data = base64.urlsafe_b64decode(inp_data).decode()
+    except ValueError:
+        pass
+    try:
+        inp_data = json.loads(inp_data)
+    except ValueError:
+        logging.critical("Load error")
+        sys.exit(1)
+    return inp_data
+
 @typer_app.callback(invoke_without_command=True)
-def main():
+def main(ctx: typer.models.Context,
+         disable_net: Annotated[bool, typer.Option("--disable-net", "-dn",
+                                                help="Disable network interface")] = False,
+         ):
     conf = config.Config(config.CONFIG_FILE_PATH)
-    logging.basicConfig(level=conf.app.log_level, stream=sys.stdout, format=config.LOG_FORMAT)
+    logging.basicConfig(level=conf.app.log_level, stream=sys.stdout,
+                        format=config.LOG_FORMAT)
+    if disable_net:
+        conf.net = None
+
+    peer_storage = PeerConfigStorage(conf.peer.peer_id, config.PEERS_FILE_PATH)
+
+    if conf.net is not None and peer_storage.get_peer_addr(peer_storage.peer_id) is None:
+        peer_storage.set_peer(peer_id=peer_storage.peer_id, addr=conf.net.addr)
+
+    if ctx.invoked_subcommand is not None:
+        ctx.meta["conf"] = conf
+        ctx.meta["peer_storage"] = peer_storage
+        return
+    logging.basicConfig(level=conf.app.log_level, handlers=[PeerLogsHandler(peer_storage)],
+                        format=config.LOG_FORMAT, force=True)
+
     logging.info("Starting mode: log only")
-    uapi = UAPI(conf)
+    if conf.net is None:
+        logging.info("Network disabled")
+    uapi = UAPI(conf, peer_storage)
 
     if os.name == 'nt' or conf.net is None:
         con = ConnectorInet(("127.0.0.1", 9902))
@@ -179,7 +191,7 @@ def main():
             pass
         con = ConnectorUnix(os.path.join(config.SOCKET_DIR_PATH, f"{conf.net.name}.sock"))
 
-    api = API(con, uapi, uapi.router.register_range(32, 255))
+    api = API(con, uapi, peer_storage, uapi.router.register_range(32, 255))
     uapi.event_pipe.add_listener(api.event_handler)
 
     while True:
@@ -189,6 +201,192 @@ def main():
             break
     uapi.stop()
 
+@typer_app.command(help="Generate new peer-id")
+def gen_peer_id():
+    print(uuid.uuid4().hex)
+
+@typer_app.command(help="Generate new symmetric encryption key")
+def gen_key():
+    print(base64.urlsafe_b64encode(os.urandom(32)).decode())
+
+@typer_app.command(name="set", help="Set or add peer or peer parameters")
+def set_peer(ctx: typer.models.Context,
+             peer_id: Annotated[str, typer.Option("--peer-id", "-p",
+                                                  help="Peer_id: len 32, format hex, generate: gen-peer-id")],
+             name: Annotated[str, typer.Option("--name", "-n",
+                                               help="Optional, peer name, str or None to clear")]=None,
+             addr: Annotated[str, typer.Option("--addr", "-a",
+                                               help="Optional, IPv4 address on lan network")]=None,
+             key: Annotated[str, typer.Option("--key", "-k",
+                                              help="Optional, Crypto key len 32, format base64, generate: gen-key")]=None,
+             clear: Annotated[bool, typer.Option("--clear", "-c",
+                                              help="Optional, clean not indicated parameters")] = None
+             ):
+
+
+    peer_storage: PeerConfigStorage = ctx.meta.get("peer_storage")
+
+    peer_id = get_peer_id_or_exit(peer_id, peer_storage)
+
+    peer = peer_storage.get_peer(peer_id)
+    if name == "None":
+        peer["name"] = None
+        name = None
+
+    if addr == "None":
+        peer["addr"] = None
+        addr = None
+
+    if key == "None":
+        peer["crypto"] = None
+        key = None
+    peer_storage.set_peer(**peer, force=True)
+    del peer
+
+    if key is not None:
+        try:
+            byte_key = base64.urlsafe_b64decode(key)
+        except ValueError:
+            try:
+                byte_key = base64.b64decode(key)
+            except ValueError:
+                byte_key = None
+
+        if byte_key is not None and len(byte_key) == 32:
+            key = base64.urlsafe_b64encode(byte_key).decode()
+        else:
+            logging.critical(f"key {key} invalid")
+            return
+
+
+    name = None if name == "" else name
+    try:
+        addr = None if addr is None else str(ipaddress.IPv4Address(addr))
+    except ipaddress.AddressValueError as e:
+        logging.critical(f"addr invalid, error: {e}")
+        return
+
+    peer_storage.set_peer(peer_id, name, addr, {"key": key} if key is not None else None, force=clear)
+    list_peers(ctx)
+
+@typer_app.command(name="del", help="Delete peer by id")
+def del_peer(ctx: typer.models.Context,
+             peer_id: Annotated[str, typer.Option("--peer-id", "-p",
+                                                  help="Peer_id: len 32, format hex")]):
+    peer_storage: PeerConfigStorage = ctx.meta.get("peer_storage")
+
+    peer_id = get_peer_id_or_exit(peer_id, peer_storage)
+    peer_storage.del_peer(peer_id)
+    list_peers(ctx)
+
+@typer_app.command(name="list", help="Show peers table")
+def list_peers(ctx: typer.models.Context):
+    peer_storage: PeerConfigStorage = ctx.meta.get("peer_storage")
+    headers = ["Name", "PeerID", "Addr", "crypto"]
+    table = []
+
+    for peer in peer_storage.get_peers():
+        crypto = peer.get("crypto")
+        table.append([
+            peer.get("name"),
+            peer.get("peer_id"),
+            peer.get("addr"),
+            " ".join(list(f"{key}: {crypto[key]}" for key in crypto)) if crypto is not None else "disabled"
+        ])
+
+    print("\n" + tabulate(table, headers, tablefmt="github") + "\n")
+
+@typer_app.command(name="export", help="Export peers to base64 or json")
+def export_peers(ctx: typer.models.Context,
+                 onl_json: Annotated[bool, typer.Option("--json", "-j",
+                                                             help="No encode json to base64")] = False,
+                 out: Annotated[str, typer.Option("--output", "-o",
+                                                    help="Output file path")] = None
+               ):
+    peer_storage: PeerConfigStorage = ctx.meta.get("peer_storage")
+    peers = []
+
+    for peer in peer_storage.get_peers():
+        out_peer = {
+            "name": peer.get("name"),
+            "peer_id": peer.get("peer_id"),
+            "addr": peer.get("addr"),
+            "crypto": peer.get("crypto")
+        }
+        peers.append(out_peer)
+
+    write_or_print_or_exit(out, peers, onl_json)
+
+@typer_app.command(name="import", help="Import peers from base64 or json")
+def import_peers(ctx: typer.models.Context,
+                 inp: Annotated[str, typer.Option("--input", "-i",
+                                                    help="Input file path")] = None,
+                 clear_last: Annotated[bool, typer.Option("--clear", "-c",
+                                                    help="Clear last peers")] = False
+                 ):
+    peer_storage: PeerConfigStorage = ctx.meta.get("peer_storage")
+    inp_data = read_input_or_exit(inp)
+
+    if clear_last:
+        for peer_id in peer_storage.get_peers_id():
+            peer_storage.del_peer(peer_id)
+    for peer in inp_data:
+        if peer.get("peer_id") is None:
+            if peer.get("id") is None:
+                continue
+            else:
+                peer_id = peer.get("id")
+        else:
+            peer_id = peer.get("peer_id")
+        peer_storage.set_peer(peer_id, peer.get("name"), peer.get("addr"), peer.get("crypto"), force=True)
+    list_peers(ctx)
+
+@typer_app.command(name="export-peer", help="Export peer to base64 or json")
+def export_peer(ctx: typer.models.Context,
+                peer_id: Annotated[str, typer.Option("--peer-id", "-p",
+                                                     help="Optional, peer_id: len 32, format hex,"
+                                                          " default: self peer-id")] = None,
+                onl_json: Annotated[bool, typer.Option("--json", "-j",
+                                                             help="No encode json to base64")] = False,
+                out: Annotated[str, typer.Option("--output", "-o",
+                                                    help="Output file path")] = None
+               ):
+    peer_storage: PeerConfigStorage = ctx.meta.get("peer_storage")
+    if peer_id is None:
+        peer_id = peer_storage.peer_id
+    peer_id = get_peer_id_or_exit(peer_id, peer_storage)
+    peer = peer_storage.get_peer(peer_id)
+    out_peer = {
+        "name": peer.get("name"),
+        "peer_id": peer.get("peer_id"),
+        "addr": peer.get("addr"),
+        "crypto": peer.get("crypto")
+    }
+
+    write_or_print_or_exit(out, out_peer, onl_json)
+
+@typer_app.command(name="import-peer", help="Import peer from base64 or json")
+def import_peer(ctx: typer.models.Context,
+                 inp: Annotated[str, typer.Option("--input", "-i",
+                                                    help="Input file path")] = None
+                 ):
+    peer_storage: PeerConfigStorage = ctx.meta.get("peer_storage")
+
+    peer = read_input_or_exit(inp)
+    if type(peer) is not dict:
+        logging.critical(f"data type != dict, type: {type(peer)}")
+        return
+
+    if peer.get("peer_id") is None:
+        if peer.get("id") is None:
+            logging.critical(f"Peer-id not found in data")
+            return
+        else:
+            peer_id = peer.get("id")
+    else:
+        peer_id = peer.get("peer_id")
+    peer_storage.set_peer(peer_id, peer.get("name"), peer.get("addr"), peer.get("crypto"), force=True)
+    list_peers(ctx)
 
 if __name__ == "__main__":
     colorama.init()

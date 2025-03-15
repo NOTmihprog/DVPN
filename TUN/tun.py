@@ -6,27 +6,48 @@ __version__ = "1.1.4"
 __email__ = "mih@mihprog.com"
 __status__ = "Production"
 
+import typing
+
 from TUN.tuntap import TunTap
 from ipaddress import IPv4Address
 from Modules.utils import PipeConn, PipeEmpty
+from Modules.peer_storage import PeerConfigStorage
 import threading
 import logging
 
 
 class TUNControl:
-    def __init__(self, tun_name, addr, mask, peer_id, pipe: PipeConn, mtu=None):
+    def __init__(self,
+                    tun_name: str,
+                    peer_storage: PeerConfigStorage,
+                    mask: str,
+                    pipe: PipeConn,
+                    mtu: typing.Optional[int]=None
+                 ):
         self.pipe = pipe
+        self.__peer_storage = peer_storage
 
         self.ID2LADDR = {}
         self.LADDR2ID = {}
-        self.peer_id = peer_id
         self.mtu = mtu if mtu is not None else 1500
 
-        self.tun = TunTap(nic_type="Tun", nic_name=tun_name)
-        self.tun.config(addr, mask, mtu=self.mtu)
-        self.addr = str(addr)
+        self.addr = self.__peer_storage.get_peer_addr(self.__peer_storage.peer_id)
 
-        self.add_peer(peer_id=self.peer_id, addr=self.addr)  # add self peer
+
+        for peer_id in self.__peer_storage.get_peers_id():
+            peer_addr = self.__peer_storage.get_peer_addr(peer_id)
+            if peer_addr is None:
+                continue
+            self.__event_handler("add", peer_id, peer_addr)
+        self.__peer_storage.add_listener(self.__event_handler)
+
+        try:
+            self.tun = TunTap(nic_type="Tun", nic_name=tun_name)
+            self.tun.config(self.addr, mask, mtu=self.mtu)
+        except Exception as e:
+            logging.error(f"{self.__class__.__name__} | tun init error: {e}")
+            return
+
 
         self.__receiver_proc = threading.Thread(target=self.__receiver)
         self.__sender_proc = threading.Thread(target=self.__sender)
@@ -36,49 +57,31 @@ class TUNControl:
         self.__receiver_proc.start()
         self.__sender_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
+    
+    
+    def __event_handler(self, action, peer_id, addr):
+        match action:
+            case "add":
+                self.ID2LADDR[peer_id] = addr
+                self.LADDR2ID[addr] = peer_id
+                
+            case "del":
+                peer_addr = self.ID2LADDR.get(peer_id)
+                if peer_addr is None:
+                    logging.debug(f"{self.__class__.__name__} | Del peer error: peer_addr is None")
+                    return False
+                self.LADDR2ID[peer_addr] = None
+                self.ID2LADDR[peer_id] = None
 
-    def add_peer(self, peer_id: str, addr: str) -> bool:
-        """
-        :param peer_id: str, len = 32, hex
-        :param addr: str, local ip addr, 192.168.1.1
-        :return: ok: True, error: False
-        """
-        if self.ID2LADDR.get(peer_id) is not None or self.LADDR2ID.get(addr) is not None:
-            return False
+            case "update":
+                last_addr = self.ID2LADDR.get(peer_id)
+                if last_addr is None:
+                    logging.debug(f"{self.__class__.__name__} | Update peer error: last_addr is None")
+                    return False
 
-        self.ID2LADDR[peer_id] = addr
-        self.LADDR2ID[addr] = peer_id
-        return True
+                self.LADDR2ID[last_addr] = None
+                self.LADDR2ID[addr] = peer_id
 
-    def del_peer(self, peer_id: str) -> bool:
-        """
-        :param peer_id: str, len = 32, hex
-        :return: ok: True, error: False
-        """
-        if peer_id == self.peer_id:
-            return False
-        addr = self.ID2LADDR.get(peer_id)
-        if addr is None:
-            return False
-
-        self.LADDR2ID[addr] = None
-        self.ID2LADDR[peer_id] = None
-
-    def update_peer(self, peer_id: str, addr: str) -> bool:
-        """
-        :param peer_id: str, len = 32, hex
-        :param addr: str, local ip addr, 192.168.1.1
-        :return: ok: True, error: False
-        """
-        if peer_id == self.peer_id or self.ID2LADDR.get(peer_id) is None:
-            return False
-
-        last_addr = self.ID2LADDR.get(peer_id)
-        if last_addr is None:
-            return False
-
-        self.LADDR2ID[last_addr] = None
-        self.LADDR2ID[addr] = peer_id
 
     def __receiver(self):
         logging.info(f"{self.__class__.__name__} | Thread receiver - started")

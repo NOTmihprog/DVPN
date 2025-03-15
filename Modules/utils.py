@@ -3,7 +3,9 @@ import threading
 import msgpack
 import socket
 import os
+import re
 from queue import Queue, Empty
+from colorama import Fore
 
 
 class PipeEmpty(Empty):
@@ -55,12 +57,16 @@ class EventPipe(threading.Thread):
         while True:
             event = self.__event_q.get()
             for func in self.__func_list:
+
+                func_args = list(func.__code__.co_varnames[:func.__code__.co_argcount])
+                if len(func_args) > 0 and func_args[0] == "self":
+                    func_args.remove("self")
                 try:
-                    if func.__code__.co_argcount == 1 and func.__code__.co_varnames[0] == "event":
+                    if len(func_args) == 1 and func_args[0] == "event":
                         func(event)
                     else:
                         try:
-                            args = list(event[arg] for arg in func.__code__.co_varnames)
+                            args = list(event[arg] for arg in func_args)
                         except KeyError:
                             continue
                         func(*args)
@@ -131,3 +137,39 @@ class ConnectorUnix(Connector):
 
         super().__init__(self.__sock)
 
+
+
+class PeerLogsHandler(logging.Handler):
+    def __init__(self, peer_storage, level: int | str = 0):
+        super().__init__(level)
+        self.__peer_storage = peer_storage
+        self._logs_pipe = EventPipe()
+        self._logs_pipe.add_listener(self.__log_handler)
+        self.peer_id_mask = re.compile("[a-f0-9]{32}")
+        self.ip_mask = re.compile("(\\b25[0-5]|\\b2[0-4][0-9]|\\b[01]?[0-9][0-9]?)"
+                                  "(\\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}")
+
+    def peer_format(self, peer_id: str):
+        return (f"{Fore.LIGHTYELLOW_EX}{self.__peer_storage.get_peer_name(peer_id)}"
+                f"{Fore.GREEN}({Fore.LIGHTBLACK_EX}{peer_id}{Fore.GREEN}){Fore.LIGHTWHITE_EX}")
+
+    @staticmethod
+    def ip_format(ip: str):
+        return Fore.WHITE + (f"{Fore.GREEN}.{Fore.WHITE}".join(ip.split("."))) + Fore.LIGHTWHITE_EX
+
+    def __log_handler(self, log):
+        res = self.peer_id_mask.search(log)
+        if res is not None:
+            peer_id = res.group(0)
+            log = log.replace(peer_id, self.peer_format(peer_id))
+
+        res = self.ip_mask.search(log)
+        if res is not None:
+            ip = res.group(0)
+            log = log.replace(ip, self.ip_format(ip))
+
+        print(log)
+
+    def emit(self, record):
+        log_entry = self.format(record)
+        self._logs_pipe.event(log=log_entry)

@@ -109,10 +109,10 @@ class PeerConfigStorage:
                  ):
         event = {}
         if peer_id in self.__peer_list:
-            event["event_type"] = "update_peer"
+            event["action"] = "update"
         else:
             self.__peer_list.append(peer_id)
-            event["event_type"] = "add_peer"
+            event["action"] = "add"
         event["peer_id"] = peer_id
 
         if name is not None or force:
@@ -140,7 +140,7 @@ class PeerConfigStorage:
             return False
 
         self.__peer_list.remove(peer_id)
-        event["event_type"] = "del_peer"
+        event["action"] = "del"
         event["peer_id"] = peer_id
 
         self.__peer_name[peer_id] = None
@@ -205,6 +205,14 @@ class PeerConfigStorage:
 
     def peer_is_self(self, peer_id: str) -> bool:
         return peer_id == self.peer_id
+
+    def get_full_peer_id(self, peer_id_segment: str) -> typing.Optional[str]:
+        if peer_id_segment == "":
+            return None
+        for peer_id in self.__peer_list:
+            if peer_id.startswith(peer_id_segment):
+                return peer_id
+        return None
 
 
 

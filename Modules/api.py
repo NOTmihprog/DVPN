@@ -4,11 +4,13 @@ import time
 
 from Modules.router import FakePipeConnRange
 from Modules.utils import PipeEmpty, Connector
+from Modules.peer_storage import PeerConfigStorage
 
 
 class API:
-    def __init__(self, connector: Connector, uapi, routes_pipe):
+    def __init__(self, connector: Connector, uapi, peer_storage: PeerConfigStorage, routes_pipe):
         self.uapi = uapi
+        self.__peer_storage = peer_storage
         self.con = connector
 
         self.connections = {}
@@ -46,22 +48,22 @@ class API:
         peer_id = packet.get("peer_id")
         match request:
             case "peers":
-                return self.uapi.get_peers()
+                return self.__peer_storage.get_peers_id()
 
             case "peer_name":
-                return self.uapi.get_peer_name(peer_id)
+                return self.__peer_storage.get_peer_name(peer_id)
 
             case "peer_addr":
-                return self.uapi.get_peer_addr(peer_id)
+                return self.__peer_storage.get_peer_addr(peer_id)
 
             case "peer_crypto":
-                return self.uapi.get_peer_crypto(peer_id)
+                return self.__peer_storage.get_peer_crypto(peer_id)
 
             case "peer_sub_args":
-                return self.uapi.get_peer_sub_args(peer_id)
+                return self.__peer_storage.get_peer_sub_args(peer_id)
 
             case "peer_sub_arg":
-                return self.uapi.get_peer_sub_arg(peer_id, packet.get("arg"))
+                return self.__peer_storage.get_peer_sub_arg(peer_id, packet.get("arg"))
 
             case "peer_endpoint":
                 return self.uapi.get_endpoint(peer_id)

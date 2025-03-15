@@ -1,5 +1,5 @@
 import config
-from PeerConfig.file import PeerListFromFile
+from Modules.peer_storage import PeerListFromFile
 
 conf = config.Config(config.CONFIG_FILE_PATH)
 
