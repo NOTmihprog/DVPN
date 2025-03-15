@@ -19,6 +19,9 @@ import json
 
 
 class RouteSearch:
+    __slots__ = ("input", "__peer_storage", "server_addr", "server_port", "sock", "api", "DADDR2ID", "ID2DADDR",
+                 "peer_receive_time", "serv_last_recv_time", "__is_run", "__receiver_proc", "__send_search_proc",
+                 "__send_annonce_proc")
     def __init__(self,
                     serv_addr: str,
                     serv_port: int,
@@ -175,6 +178,8 @@ class RouteSearch:
 
 
 class PingUtils:
+    __slots__ = ("pipe", "api", "__peer_storage", "peer_send_time", "peer_receive_time",
+                 "peer_ping", "peer_ping_packets_send", "__is_run", "__receiver_proc", "__sender_proc")
     def __init__(self, peer_storage: PeerConfigStorage, pipe: PipeConn):
         self.pipe = pipe
         self.api = None
@@ -263,6 +268,7 @@ class PingUtils:
 
 
 class API:
+    __slots__ = ("__route_search", "__ping_utils", "__peer_storage", "event_pipe")
     def __init__(self, route_search, ping_utils, peer_storage: PeerConfigStorage, event_pipe: EventPipe):
         self.__route_search = route_search
         self.__ping_utils = ping_utils
@@ -304,6 +310,9 @@ class API:
 
 
 class Peer:
+    __slots__ = ("pipe", "event_pipe", "__peer_storage", "server_addr", "server_port", "local_ports_range",
+                 "local_addr", "sock", "__route_search", "__ping_utils_pipe", "__ping_utils", "api", "__is_run",
+                 "__receiver_proc", "__sender_proc", "__port_control_proc")
     def __init__(self,
                     peer_storage: PeerConfigStorage,
                     serv_addr: str,
