@@ -27,8 +27,8 @@ class InvalidToken(Exception):
     pass
 
 
-
 class Symmetric():
+    __slots__ = ("_signing_key", "_encryption_key")
     def __init__(self, key: bytes | str) -> None:
         try:
             key = base64.urlsafe_b64decode(key)
@@ -111,6 +111,8 @@ class Symmetric():
 
 
 class SymmetricCrypto:
+    __slots__ = ("pipe_in", "pipe_out", "__peer_storage", "crypto_by_peer", "__is_run", "__encrypter_proc",
+                 "__decrypter_proc")
     def __init__(self, peer_storage: PeerConfigStorage, pipe_in: PipeConn, pipe_out: PipeConn):
         self.pipe_in = pipe_in
         self.pipe_out = pipe_out
