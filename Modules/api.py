@@ -121,76 +121,84 @@ class API:
 
     def __receiver(self):
         while self.__is_run:
-            packet, addr = self.con.recv()
+            try:
+                packet, addr = self.con.recv()
 
-            if type(packet) is not dict:
-                continue
-            packet_type = packet.get("type")
-            conn_inited = self.connections.get(addr) is not None
-            match conn_inited, packet_type:
-                case False, "init":
-                    self.connections[addr] = {"name": packet.get("name")}
-
-                case _, "ping":
-                    self.con.send({"type": "pong"}, addr)
-                    logging.debug(f"{self.__class__.__name__} | receive ping from conn {addr}")
-
-
-                case False, _: #  position is case not an error
-                    self.__send_close(addr)
-                    logging.debug(f"{self.__class__.__name__} | receive {packet_type} from unknown conn {addr}")
+                if type(packet) is not dict:
                     continue
+                packet_type = packet.get("type")
+                conn_inited = self.connections.get(addr) is not None
+                match conn_inited, packet_type:
+                    case False, "init":
+                        self.connections[addr] = {"name": packet.get("name")}
 
-                case True, "net":
-                    self.router.packet_handler(packet, addr)
+                    case _, "ping":
+                        self.con.send({"type": "pong"}, addr)
+                        logging.debug(f"{self.__class__.__name__} | receive ping from conn {addr}")
 
-                case True, "pong":
-                    send_time = self.conn_ping_send_time.get(addr)
-                    if send_time is None:
+
+                    case False, _: #  position is case not an error
+                        self.__send_close(addr)
+                        logging.debug(f"{self.__class__.__name__} | receive {packet_type} from unknown conn {addr}")
                         continue
-                    receive_time = time.time_ns()
-                    ping = (receive_time - send_time) / 1000000
-                    self.conn_ping[addr] = ping
-                    self.conn_ping_receive_time[addr] = receive_time
-                    logging.debug(f"{self.__class__.__name__} | receive pong from conn {addr} ping: {ping}")
 
-                case True, "get":
-                    response = self.__handler_get(packet)
-                    self.con.send({"type": "res",
-                                          "id": packet.get("id"),
-                                          "res": response}, addr)
+                    case True, "net":
+                        self.router.packet_handler(packet, addr)
 
-                case True, "route":
-                    response = self.__handler_route(packet, addr)
-                    self.con.send({"type": "res",
-                                          "id": packet.get("id"),
-                                          "res": response}, addr)
+                    case True, "pong":
+                        send_time = self.conn_ping_send_time.get(addr)
+                        if send_time is None:
+                            continue
+                        receive_time = time.time_ns()
+                        ping = (receive_time - send_time) / 1000000
+                        self.conn_ping[addr] = ping
+                        self.conn_ping_receive_time[addr] = receive_time
+                        logging.debug(f"{self.__class__.__name__} | receive pong from conn {addr} ping: {ping}")
 
-                case True, "close":
-                    self.close_conn(addr)
+                    case True, "get":
+                        response = self.__handler_get(packet)
+                        self.con.send({"type": "res",
+                                              "id": packet.get("id"),
+                                              "res": response}, addr)
+
+                    case True, "route":
+                        response = self.__handler_route(packet, addr)
+                        self.con.send({"type": "res",
+                                              "id": packet.get("id"),
+                                              "res": response}, addr)
+
+                    case True, "close":
+                        self.close_conn(addr)
+
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
 
     def __ping_sender(self):
         logging.info(f"{self.__class__.__name__} | Thread ping sender - started")
         while self.__is_run:
-            for conn in self.connections.copy():
-                ping_packets = self.conn_ping_packets_send.get(conn)
-                if ping_packets is None:
-                    ping_packets = 0
+            try:
+                for conn in self.connections.copy():
+                    ping_packets = self.conn_ping_packets_send.get(conn)
+                    if ping_packets is None:
+                        ping_packets = 0
 
-                last_recv_time = self.conn_ping_receive_time.get(conn)
-                if last_recv_time is None:
-                    last_recv_time = 0
+                    last_recv_time = self.conn_ping_receive_time.get(conn)
+                    if last_recv_time is None:
+                        last_recv_time = 0
 
-                if ping_packets > 3 and (time.time_ns() - last_recv_time) / 1000000000 > 45:
-                    self.close_conn(conn)
-                    continue
+                    if ping_packets > 3 and (time.time_ns() - last_recv_time) / 1000000000 > 45:
+                        self.close_conn(conn)
+                        continue
 
-                self.con.send({"type": "ping"}, conn)
-                self.conn_ping_send_time[conn] = time.time_ns()
-                self.conn_ping_packets_send[conn] = ping_packets + 1
+                    self.con.send({"type": "ping"}, conn)
+                    self.conn_ping_send_time[conn] = time.time_ns()
+                    self.conn_ping_packets_send[conn] = ping_packets + 1
 
-                logging.debug(f"{self.__class__.__name__} | send ping to conn {conn}")
-            time.sleep(15)
+                    logging.debug(f"{self.__class__.__name__} | send ping to conn {conn}")
+                time.sleep(15)
+
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
         logging.info(f"{self.__class__.__name__} | Thread ping sender - stopped")
 
 

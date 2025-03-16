@@ -65,93 +65,102 @@ class RouteSearch:
     def __send_search(self):
         logging.info(f"{self.__class__.__name__} | Thread send search - started")
         while self.__is_run:
-            for peer_id in self.__peer_storage.get_peers_id():
-                if self.__peer_storage.peer_is_self(peer_id) or self.api.get_peer_endpoint(peer_id) is not None:
-                    continue
+            try:
+                for peer_id in self.__peer_storage.get_peers_id():
+                    if self.__peer_storage.peer_is_self(peer_id) or self.api.get_peer_endpoint(peer_id) is not None:
+                        continue
 
-                packet = json.dumps({"type": "get", "id": peer_id}).encode("utf-8")
-                try:
-                    self.sock.sendto(packet, (self.server_addr, self.server_port))
-                    logging.debug(f"{self.__class__.__name__} | Send search request peer "
-                                  f"{peer_id}")
-                except OSError as e:
-                    logging.debug(f"{self.__class__.__name__} | Send search error, OSError {e}")
-                time.sleep(0.1)
-            time.sleep(30)
+                    packet = json.dumps({"type": "get", "id": peer_id}).encode("utf-8")
+                    try:
+                        self.sock.sendto(packet, (self.server_addr, self.server_port))
+                        logging.debug(f"{self.__class__.__name__} | Send search request peer "
+                                      f"{peer_id}")
+                    except OSError as e:
+                        logging.debug(f"{self.__class__.__name__} | Send search error, OSError {e}")
+                    time.sleep(0.1)
+                time.sleep(30)
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
         logging.info(f"{self.__class__.__name__} | Thread send search - stopped")
 
     def __send_annonce(self):
         logging.info(f"{self.__class__.__name__} | Thread send annonce - started")
         while self.__is_run:
-            peer_id = self.__peer_storage.peer_id
-            packet = json.dumps({"type": "annonce", "id": peer_id}).encode("utf-8")
             try:
-                self.sock.sendto(packet, (self.server_addr, self.server_port))
-                logging.debug(f"{self.__class__.__name__} | Send annonce "
-                              f"{peer_id}")
-            except OSError as e:
-                logging.debug(f"{self.__class__.__name__} | Send annonce error, OSError {e}")
-            time.sleep(10)
+                peer_id = self.__peer_storage.peer_id
+                packet = json.dumps({"type": "annonce", "id": peer_id}).encode("utf-8")
+                try:
+                    self.sock.sendto(packet, (self.server_addr, self.server_port))
+                    logging.debug(f"{self.__class__.__name__} | Send annonce "
+                                  f"{peer_id}")
+                except OSError as e:
+                    logging.debug(f"{self.__class__.__name__} | Send annonce error, OSError {e}")
+                time.sleep(10)
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
         logging.info(f"{self.__class__.__name__} | Thread send annonce - stopped")
 
     def __receiver(self):
         logging.info(f"{self.__class__.__name__} | Thread receiver - started")
         while self.__is_run:
             try:
-                packet = self.input.get(timeout=1)
-            except Empty:
-                continue
-            try:
-                packet = packet.decode("utf-8")
-            except UnicodeError:
-                logging.debug(f"{self.__class__.__name__} | "
-                              f"Packet from {self.server_addr}:{self.server_port} str decode error")
-                continue
+                try:
+                    packet = self.input.get(timeout=1)
+                except Empty:
+                    continue
+                try:
+                    packet = packet.decode("utf-8")
+                except UnicodeError:
+                    logging.debug(f"{self.__class__.__name__} | "
+                                  f"Packet from {self.server_addr}:{self.server_port} str decode error")
+                    continue
 
-            try:
-                data = json.loads(packet)
-            except ValueError:
-                logging.debug(f"{self.__class__.__name__} | "
-                              f"Packet from {self.server_addr}:{self.server_port} json decode error")
-                continue
-            receive_time = time.time_ns()
-            self.serv_last_recv_time = receive_time
+                try:
+                    data = json.loads(packet)
+                except ValueError:
+                    logging.debug(f"{self.__class__.__name__} | "
+                                  f"Packet from {self.server_addr}:{self.server_port} json decode error")
+                    continue
+                receive_time = time.time_ns()
+                self.serv_last_recv_time = receive_time
 
-            peer_id = data.get("id")
-            addr = data.get("addr")
-            port = data.get("port")
-            if peer_id is None or addr is None or port is None:
-                logging.debug(f"{self.__class__.__name__} |"
-                              f" Packet from {self.server_addr}:{self.server_port} id or addr or port is None")
-                continue
-            try:
-                port = int(port)
-            except ValueError:
-                logging.debug(f"{self.__class__.__name__} |"
-                              f" Packet from {self.server_addr}:{self.server_port} port not int")
-                continue
+                peer_id = data.get("id")
+                addr = data.get("addr")
+                port = data.get("port")
+                if peer_id is None or addr is None or port is None:
+                    logging.debug(f"{self.__class__.__name__} |"
+                                  f" Packet from {self.server_addr}:{self.server_port} id or addr or port is None")
+                    continue
+                try:
+                    port = int(port)
+                except ValueError:
+                    logging.debug(f"{self.__class__.__name__} |"
+                                  f" Packet from {self.server_addr}:{self.server_port} port not int")
+                    continue
 
-            if not self.__peer_storage.peer_exists(peer_id):
-                logging.debug(f"{self.__class__.__name__} |"
-                              f" Packet from {self.server_addr}:{self.server_port} peer_id not found in peer_storage")
-                continue
-            self.peer_receive_time[peer_id] = receive_time
-            last_addr = self.ID2DADDR.get(peer_id)
-            if last_addr is not None:
-                del self.DADDR2ID[last_addr]
+                if not self.__peer_storage.peer_exists(peer_id):
+                    logging.debug(f"{self.__class__.__name__} |"
+                                  f" Packet from {self.server_addr}:{self.server_port} peer_id not found in peer_storage")
+                    continue
+                self.peer_receive_time[peer_id] = receive_time
+                last_addr = self.ID2DADDR.get(peer_id)
+                if last_addr is not None:
+                    del self.DADDR2ID[last_addr]
 
-            self.DADDR2ID[(addr, port)] = peer_id
-            self.ID2DADDR[peer_id] = (addr, port)
+                self.DADDR2ID[(addr, port)] = peer_id
+                self.ID2DADDR[peer_id] = (addr, port)
 
-            self.api.event(peer_id=peer_id, endpoint=(addr, port))
-            if self.__peer_storage.peer_is_self(peer_id):
-                logging.debug(
-                    f"{self.__class__.__name__} | receive annonce {addr}:{port}")
-            else:
-                logging.debug(f"{self.__class__.__name__} | "
-                              f"peer {peer_id}"
-                              f" new endpoint {addr}:{port} last addr "
-                              f"{str(last_addr[0])+':'+str(last_addr[1]) if last_addr is not None else None}")
+                self.api.event(peer_id=peer_id, endpoint=(addr, port))
+                if self.__peer_storage.peer_is_self(peer_id):
+                    logging.debug(
+                        f"{self.__class__.__name__} | receive annonce {addr}:{port}")
+                else:
+                    logging.debug(f"{self.__class__.__name__} | "
+                                  f"peer {peer_id}"
+                                  f" new endpoint {addr}:{port} last addr "
+                                  f"{str(last_addr[0])+':'+str(last_addr[1]) if last_addr is not None else None}")
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
 
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
@@ -202,61 +211,68 @@ class PingUtils:
     def __sender(self):
         logging.info(f"{self.__class__.__name__} | Thread sender - started")
         while self.__is_run:
-            for peer_id in self.__peer_storage.get_peers_id():
-                if self.api.get_peer_endpoint(peer_id) is None:
-                    continue
-                if self.__peer_storage.peer_is_self(peer_id):
-                    continue
-                ping_packet = self.peer_ping_packets_send.get(peer_id)
-                if ping_packet is None:
-                    ping_packet = 0
+            try:
+                for peer_id in self.__peer_storage.get_peers_id():
+                    if self.api.get_peer_endpoint(peer_id) is None:
+                        continue
+                    if self.__peer_storage.peer_is_self(peer_id):
+                        continue
+                    ping_packet = self.peer_ping_packets_send.get(peer_id)
+                    if ping_packet is None:
+                        ping_packet = 0
 
-                last_packet = self.peer_receive_time.get(peer_id)
-                if ((last_packet is not None or ping_packet >= 5) and
-                        ((time.time_ns() - (0 if last_packet is None else last_packet)) / 1000000000) > 45):
-                    self.api.del_endpoint(peer_id)
-                    self.api.event(peer_id=peer_id, endpoint=None)
-                    self.peer_ping_packets_send[peer_id] = None
-                    self.peer_receive_time[peer_id] = None
+                    last_packet = self.peer_receive_time.get(peer_id)
+                    if ((last_packet is not None or ping_packet >= 5) and
+                            ((time.time_ns() - (0 if last_packet is None else last_packet)) / 1000000000) > 45):
+                        self.api.del_endpoint(peer_id)
+                        self.api.event(peer_id=peer_id, endpoint=None)
+                        self.peer_ping_packets_send[peer_id] = None
+                        self.peer_receive_time[peer_id] = None
+                        logging.debug(f"{self.__class__.__name__} |"
+                                      f" peer {peer_id} status offline")
+                        continue
+
+                    buf = f"ping{peer_id}".encode("utf-8")
+                    self.peer_send_time[peer_id] = time.time_ns()
+                    self.pipe.send((buf, peer_id))
+
+                    self.peer_ping_packets_send[peer_id] = ping_packet + 1
+
                     logging.debug(f"{self.__class__.__name__} |"
-                                  f" peer {peer_id} status offline")
-                    continue
-
-                buf = f"ping{peer_id}".encode("utf-8")
-                self.peer_send_time[peer_id] = time.time_ns()
-                self.pipe.send((buf, peer_id))
-
-                self.peer_ping_packets_send[peer_id] = ping_packet + 1
-
-                logging.debug(f"{self.__class__.__name__} |"
-                              f" send ping to {peer_id}")
-            time.sleep(15)
+                                  f" send ping to {peer_id}")
+                time.sleep(15)
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
 
     def __receiver(self):
         logging.info(f"{self.__class__.__name__} | Thread receiver - started")
         while self.__is_run:
             try:
-                ping_type, peer_id = self.pipe.recv(timeout=1)
-            except PipeEmpty:
-                continue
-            if ping_type == "ping":
-                buf = f"pong{peer_id}".encode("utf-8")
-                self.pipe.send((buf, peer_id))
-                logging.debug(f"{self.__class__.__name__} |"
-                              f" receive ping from {peer_id}")
-            elif ping_type == "pong":
-                send_time = self.peer_send_time.get(peer_id)
-                if send_time is None:
+                try:
+                    ping_type, peer_id = self.pipe.recv(timeout=1)
+                except PipeEmpty:
                     continue
-                receive_time = time.time_ns()
-                ping = (receive_time - send_time)/1000000
-                self.peer_ping[peer_id] = ping
-                self.peer_receive_time[peer_id] = receive_time
-                self.api.event(peer_id=peer_id, ping=ping)
-                logging.debug(f"{self.__class__.__name__} |"
-                              f" receive pong from {peer_id}"
-                              f" ping: {ping}")
+                if ping_type == "ping":
+                    buf = f"pong{peer_id}".encode("utf-8")
+                    self.pipe.send((buf, peer_id))
+                    logging.debug(f"{self.__class__.__name__} |"
+                                  f" receive ping from {peer_id}")
+                elif ping_type == "pong":
+                    send_time = self.peer_send_time.get(peer_id)
+                    if send_time is None:
+                        continue
+                    receive_time = time.time_ns()
+                    ping = (receive_time - send_time)/1000000
+                    self.peer_ping[peer_id] = ping
+                    self.peer_receive_time[peer_id] = receive_time
+                    self.api.event(peer_id=peer_id, ping=ping)
+                    logging.debug(f"{self.__class__.__name__} |"
+                                  f" receive pong from {peer_id}"
+                                  f" ping: {ping}")
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
+
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
     def stop(self, wait=False):
@@ -374,17 +390,20 @@ class Peer:
     def __port_control(self):
         logging.info(f"{self.__class__.__name__} | Thread port_control - started")
         while self.__is_run:
-            time.sleep(40)
-            server_status = self.api.is_serv_online()
-            if server_status is None:
-                continue
-            elif server_status:
-                continue
+            try:
+                time.sleep(40)
+                server_status = self.api.is_serv_online()
+                if server_status is None:
+                    continue
+                elif server_status:
+                    continue
 
-            new_port = random.randint(self.local_ports_range[0], self.local_ports_range[1])
-            self.reload_socket(self.local_addr, new_port)
-            self.api.event(bind_addr=self.local_addr, bind_port=new_port)
-            logging.warning(f"{self.__class__.__name__} | Thread port_control - port changed new port {new_port}")
+                new_port = random.randint(self.local_ports_range[0], self.local_ports_range[1])
+                self.reload_socket(self.local_addr, new_port)
+                self.api.event(bind_addr=self.local_addr, bind_port=new_port)
+                logging.warning(f"{self.__class__.__name__} | Thread port_control - port changed new port {new_port}")
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
 
         logging.info(f"{self.__class__.__name__} | Thread port_control - stopped")
 
@@ -392,52 +411,58 @@ class Peer:
         logging.info(f"{self.__class__.__name__} | Thread receiver - started")
         while self.__is_run:
             try:
-                packet, addr = self.sock.recvfrom(65507)
-            except TimeoutError:
-                continue
-            except OSError as e:
-                logging.info(f"{self.__class__.__name__} | Thread receiver - socket OSError: {e}")
-                continue
-            if addr[0] == self.server_addr and addr[1] == self.server_port:
-                self.__route_search.input.put(packet)
-                continue
-
-            peer_id = self.__route_search.DADDR2ID.get(addr)
-            if peer_id is None:
-                continue
-
-            if packet[:4] == b"ping" or packet[:4] == b"pong":
-                if packet[4:] == str(self.__peer_storage.peer_id).encode("utf-8"):
-                    self.__ping_utils_pipe.send((packet[:4].decode("utf-8"), peer_id))
+                try:
+                    packet, addr = self.sock.recvfrom(65507)
+                except TimeoutError:
                     continue
-            self.pipe.send((packet, peer_id))
+                except OSError as e:
+                    logging.info(f"{self.__class__.__name__} | Thread receiver - socket OSError: {e}")
+                    continue
+                if addr[0] == self.server_addr and addr[1] == self.server_port:
+                    self.__route_search.input.put(packet)
+                    continue
+
+                peer_id = self.__route_search.DADDR2ID.get(addr)
+                if peer_id is None:
+                    continue
+
+                if packet[:4] == b"ping" or packet[:4] == b"pong":
+                    if packet[4:] == str(self.__peer_storage.peer_id).encode("utf-8"):
+                        self.__ping_utils_pipe.send((packet[:4].decode("utf-8"), peer_id))
+                        continue
+                self.pipe.send((packet, peer_id))
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
     def __sender(self):
         logging.info(f"{self.__class__.__name__} | Thread sender - started")
         while self.__is_run:
             try:
-                packet, peer_id = self.pipe.recv(timeout=1)
-            except PipeEmpty:
-                continue
-
-            daddr = self.__route_search.ID2DADDR.get(peer_id)
-            if daddr is None:
-                logging.debug(f"{self.__class__.__name__} | "
-                              f"packet to {peer_id}"
-                              f" destination addr not found")
-                continue
-            if len(packet) <= 65507:
                 try:
-                    self.sock.sendto(packet, daddr)
-                except OSError:
-                    logging.debug(f"{self.__class__.__name__} | packet to peer "
-                                  f"{peer_id} socket OS Error")
+                    packet, peer_id = self.pipe.recv(timeout=1)
+                except PipeEmpty:
                     continue
-            else:
-                logging.debug(f"{self.__class__.__name__} | packet to peer"
-                              f" {peer_id} very long, len > 65507")
-                continue
+
+                daddr = self.__route_search.ID2DADDR.get(peer_id)
+                if daddr is None:
+                    logging.debug(f"{self.__class__.__name__} | "
+                                  f"packet to {peer_id}"
+                                  f" destination addr not found")
+                    continue
+                if len(packet) <= 65507:
+                    try:
+                        self.sock.sendto(packet, daddr)
+                    except OSError:
+                        logging.debug(f"{self.__class__.__name__} | packet to peer "
+                                      f"{peer_id} socket OS Error")
+                        continue
+                else:
+                    logging.debug(f"{self.__class__.__name__} | packet to peer"
+                                  f" {peer_id} very long, len > 65507")
+                    continue
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
 
     def stop(self, join=False):

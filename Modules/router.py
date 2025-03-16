@@ -97,23 +97,26 @@ class Router:
         logging.info(f"{self.__class__.__name__} | Thread receiver - started")
         while self.__is_run:
             try:
-                packet, peer_id = self.pipe.recv(timeout=1)
-            except PipeEmpty:
-                continue
-            except ValueError:
-                logging.debug(f"{self.__class__.__name__} | Thread receiver - ValueError, packet drop")
-                continue
-            try:
-                output, is_mark = self.route.get(packet[:1])
-            except TypeError:
-                logging.debug(f"{self.__class__.__name__} | "
-                              f"Thread receiver - route: {int.from_bytes(packet[:1], "big")}"
-                              f" not found, packet drop")
-                continue
-            if is_mark:
-                output.put((packet[1:], peer_id, int.from_bytes(packet[:1])))
-            else:
-                output.put((packet[1:], peer_id))
+                try:
+                    packet, peer_id = self.pipe.recv(timeout=1)
+                except PipeEmpty:
+                    continue
+                except ValueError:
+                    logging.debug(f"{self.__class__.__name__} | Thread receiver - ValueError, packet drop")
+                    continue
+                try:
+                    output, is_mark = self.route.get(packet[:1])
+                except TypeError:
+                    logging.debug(f"{self.__class__.__name__} | "
+                                  f"Thread receiver - route: {int.from_bytes(packet[:1], "big")}"
+                                  f" not found, packet drop")
+                    continue
+                if is_mark:
+                    output.put((packet[1:], peer_id, int.from_bytes(packet[:1])))
+                else:
+                    output.put((packet[1:], peer_id))
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
 
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
 
