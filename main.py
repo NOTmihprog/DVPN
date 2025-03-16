@@ -29,7 +29,7 @@ from Peer.peer import Peer
 from TUN.tun import TUNControl
 from Modules.crypto import SymmetricCrypto
 from Modules.router import Router
-from Modules.utils import Pipe, EventPipe, ConnectorUnix, ConnectorInet, PeerLogsHandler
+from Modules.utils import Pipe, EventPipe, ConnectorUnix, ConnectorInet, PeerLogsHandler, ModuleInitError
 
 from Modules.peer_storage import PeerConfigStorage
 from Modules.api import API
@@ -41,33 +41,53 @@ class UAPI:
         self.__peer_storage = peer_storage
         self.log_queue = log_queue
         self.peer_sub_args_runtime = {}
+        try:
 
-        self.event_pipe = EventPipe()
+            self.event_pipe = EventPipe()
 
-        peer_pipe, _peer_pipe = Pipe()
+            peer_pipe, _peer_pipe = Pipe()
 
-        self.peer = Peer(peer_storage=self.__peer_storage, serv_addr=self.conf.peer.server_addr,
-                         event_pipe=self.event_pipe, serv_port=self.conf.peer.server_port,
-                         local_addr=self.conf.peer.bind_addr, local_ports=self.conf.peer.bind_port_range,
-                         pipe=_peer_pipe)
+            self.peer = Peer(peer_storage=self.__peer_storage, serv_addr=self.conf.peer.server_addr,
+                             event_pipe=self.event_pipe, serv_port=self.conf.peer.server_port,
+                             local_addr=self.conf.peer.bind_addr, local_ports=self.conf.peer.bind_port_range,
+                             pipe=_peer_pipe)
 
-        crypto_pipe, _crypto_pipe = Pipe()
-        self.crypto = SymmetricCrypto(peer_storage=self.__peer_storage, pipe_in=_crypto_pipe, pipe_out=peer_pipe)
+            crypto_pipe, _crypto_pipe = Pipe()
+            self.crypto = SymmetricCrypto(peer_storage=self.__peer_storage, pipe_in=_crypto_pipe, pipe_out=peer_pipe)
 
-        self.router = Router(pipe=crypto_pipe)
+            self.router = Router(pipe=crypto_pipe)
 
-        if self.conf.net is not None:
-            net0_pipe = self.router.register_rote(1)
+            if self.conf.net is not None:
+                net0_pipe = self.router.register_rote(1)
 
-            self.tun_control = TUNControl(tun_name=self.conf.net.name, peer_storage=self.__peer_storage,
-                                          mask=self.conf.net.mask, mtu=self.conf.net.mtu, pipe=net0_pipe)
+                self.tun_control = TUNControl(tun_name=self.conf.net.name, peer_storage=self.__peer_storage,
+                                              mask=self.conf.net.mask, mtu=self.conf.net.mtu, pipe=net0_pipe)
+        except ModuleInitError as e:
+            logging.critical(f"{self.__class__.__name__} | {e}")
+            self.stop()
+            sys.exit()
 
     def stop(self):
-        if self.conf.net is not None:
-            self.tun_control.stop()
-        self.peer.stop()
-        self.crypto.stop()
-        self.router.stop()
+        try:
+            if self.conf.net is not None:
+                self.tun_control.stop()
+        except Exception as e:
+            logging.info(f"{self.__class__.__name__} | NET stop error: {e}")
+
+        try:
+            self.peer.stop()
+        except Exception as e:
+            logging.info(f"{self.__class__.__name__} | PEER stop error: {e}")
+
+        try:
+            self.crypto.stop()
+        except Exception as e:
+            logging.info(f"{self.__class__.__name__} | CRYPTO stop error: {e}")
+
+        try:
+            self.router.stop()
+        except Exception as e:
+            logging.info(f"{self.__class__.__name__} | ROUTER stop error: {e}")
 
     def get_endpoint(self, peer_id):
         return self.peer.api.get_peer_endpoint(peer_id)
@@ -158,6 +178,9 @@ def read_input_or_exit(inp: str) -> any:
 def main(ctx: typer.models.Context,
          disable_net: Annotated[bool, typer.Option("--disable-net", "-dn",
                                                 help="Disable network interface")] = False,
+         api_addr: Annotated[str, typer.Option("--api-addr", "-a",
+                                                help="api net socket or unix socket address,"
+                                                     " UNIX socket unsupported on windows")] = None,
          ):
     conf = config.Config(config.CONFIG_FILE_PATH)
     logging.basicConfig(level=conf.app.log_level, stream=sys.stdout,
@@ -174,22 +197,63 @@ def main(ctx: typer.models.Context,
         ctx.meta["conf"] = conf
         ctx.meta["peer_storage"] = peer_storage
         return
+
+    if api_addr is None:
+        if os.name == 'nt' or conf.net is None:
+            api_addr = config.SOCKET_DEFAULT_ADDR
+        else:
+            try:
+                os.mkdir(config.SOCKET_DEFAULT_DIR)
+                api_addr = os.path.join(config.SOCKET_DEFAULT_DIR, f"{conf.net.name}.sock")
+            except FileExistsError:
+                api_addr = os.path.join(config.SOCKET_DEFAULT_DIR, f"{conf.net.name}.sock")
+            except PermissionError:
+                logging.info(f"Failed create directory: {config.SOCKET_DEFAULT_DIR},"
+                                f" Use net socket: {config.SOCKET_DEFAULT_ADDR}")
+                api_addr = config.SOCKET_DEFAULT_ADDR
+
+    try:
+        ip, port = api_addr.split(":")
+        ip = ipaddress.ip_address(ip)
+        con = ConnectorInet((str(ip), int(port)))
+    except ValueError:
+        sock_dir = os.path.split(api_addr)[0]
+        if sock_dir == "":
+            logging.critical(f"Socket path: invalid value: {api_addr}")
+            return
+        if not os.path.isdir(sock_dir):
+            logging.critical(f"Socket path: directory {sock_dir} not exist")
+            return
+        if os.name == 'nt':
+            logging.critical(f"Failed create UNIX socket {api_addr} windows unsupported UNIX sockets")
+            return
+        try:
+            con = ConnectorUnix(api_addr)
+        except IsADirectoryError:
+            logging.critical(f"Failed create UNIX socket {api_addr} Is A Directory Error")
+            return
+        except PermissionError:
+            logging.critical(f"Failed create UNIX socket {api_addr} Permission Error")
+            return
+        except OSError as e:
+            logging.critical(f"Failed start UNIX socket {api_addr} OS Error: {e}")
+            return
+    except PermissionError:
+        logging.critical(f"Failed start api on address {api_addr} Permission Error")
+        return
+    except OSError as e:
+        logging.critical(f"Failed start api on address {api_addr} OS Error: {e}")
+        return
+
+
     logging.basicConfig(level=conf.app.log_level, handlers=[PeerLogsHandler(peer_storage)],
                         format=config.LOG_FORMAT, force=True)
 
     logging.info("Starting mode: log only")
     if conf.net is None:
         logging.info("Network disabled")
-    uapi = UAPI(conf, peer_storage)
 
-    if os.name == 'nt' or conf.net is None:
-        con = ConnectorInet(("127.0.0.1", 9902))
-    else:
-        try:
-            os.mkdir(config.SOCKET_DIR_PATH)
-        except FileExistsError:
-            pass
-        con = ConnectorUnix(os.path.join(config.SOCKET_DIR_PATH, f"{conf.net.name}.sock"))
+    uapi = UAPI(conf, peer_storage)
 
     api = API(con, uapi, peer_storage, uapi.router.register_range(32, 255))
     uapi.event_pipe.add_listener(api.event_handler)
@@ -200,6 +264,8 @@ def main(ctx: typer.models.Context,
         except KeyboardInterrupt:
             break
     uapi.stop()
+    api.stop()
+    con.close()
 
 @typer_app.command(help="Generate new peer-id")
 def gen_peer_id():

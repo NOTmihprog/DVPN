@@ -10,7 +10,7 @@ import typing
 
 from TUN.tuntap import TunTap
 from ipaddress import IPv4Address
-from Modules.utils import PipeConn, PipeEmpty
+from Modules.utils import PipeConn, PipeEmpty, ModuleInitError
 from Modules.peer_storage import PeerConfigStorage
 import threading
 import logging
@@ -47,8 +47,7 @@ class TUNControl:
             self.tun = TunTap(nic_type="Tun", nic_name=tun_name)
             self.tun.config(self.addr, mask, mtu=self.mtu)
         except Exception as e:
-            logging.error(f"{self.__class__.__name__} | tun init error: {e}")
-            return
+            raise ModuleInitError(f"Tun init error: {e}")
 
 
         self.__receiver_proc = threading.Thread(target=self.__receiver)
@@ -126,9 +125,12 @@ class TUNControl:
 
     def stop(self, join=False):
         self.__is_run = False
-        if join:
-            self.__sender_proc.join()
+        try:
+            if join:
+                self.__sender_proc.join()
 
-        self.__receiver_proc.join()
-        self.tun.close()
+            self.__receiver_proc.join()
+            self.tun.close()
+        except AttributeError:
+            pass
         logging.info(f"{self.__class__.__name__} | Full - stopped")

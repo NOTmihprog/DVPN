@@ -31,6 +31,12 @@ class API:
         self.__receiver_proc.start()
         self.__ping_sender_proc.start()
 
+        bind_addr = self.con.get_bind()
+        if type(bind_addr) is tuple:
+            bind_addr = f"{bind_addr[0]}:{bind_addr[1]}"
+
+        logging.info(f"{self.__class__.__name__} | Listen address: {bind_addr}")
+
         logging.info(f"{self.__class__.__name__} | Full - started")
 
     def __send_close(self, conn):
