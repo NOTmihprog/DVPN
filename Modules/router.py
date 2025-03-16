@@ -5,6 +5,7 @@ from Modules.utils import PipeConn, PipeEmpty
 
 
 class FakeQueue:
+    __slots__ = ("route", "output")
     def __init__(self, route: bytes, output: Queue):
         self.route = route
         self.output = output
@@ -23,6 +24,7 @@ class FakeQueue:
 
 
 class FakePipeConn(PipeConn):
+    __slots__ = ("route",)
     def __init__(self, input, output, route):
         super().__init__(input, output)
         self.route = route
@@ -34,6 +36,7 @@ class FakePipeConn(PipeConn):
         return self.output.put((self.route+bytes(item[0]), item[1]))
 
 class FakePipeConnRange(PipeConn):
+    __slots__ = ("min", "max")
     def __init__(self, input, output, range):
         super().__init__(input, output)
         self.min, self.max = range
@@ -44,10 +47,11 @@ class FakePipeConnRange(PipeConn):
             raise ValueError
         packet, peer_id, mark = item
         if self.min <= mark <= self.max:
-            return self.output.put((int.to_bytes(mark)+packet, peer_id))
+            return self.output.put((int.to_bytes(mark )+packet, peer_id))
 
 
 class Router:
+    __slots__ = ("pipe", "route", "__is_run", "__receiver_proc")
     def __init__(self, pipe: PipeConn):
         self.pipe = pipe
 
@@ -63,7 +67,7 @@ class Router:
             logging.debug(f"{self.__class__.__name__} | register_rote - route: {route}, route > 255")
             raise ValueError
         try:
-            route = route.to_bytes(1)
+            route = route.to_bytes(1, "big")
         except OverflowError:
             logging.debug(f"{self.__class__.__name__} | register_rote - route: {int.from_bytes(route)}, OverflowError")
             raise ValueError
@@ -79,9 +83,10 @@ class Router:
         input = Queue()
         for route in range(min, max+1):
             try:
-                route = route.to_bytes(1)
+                route = route.to_bytes(1, "big")
             except OverflowError:
-                logging.debug(f"{self.__class__.__name__} | register_rote - route: {int.from_bytes(route)}, OverflowError")
+                logging.debug(f"{self.__class__.__name__} |"
+                              f" register_rote - route: {int.from_bytes(route)}, OverflowError")
                 raise ValueError
             self.route[route] = (input, mark)
         logging.debug(f"{self.__class__.__name__} | register_rote - add range: {min}-{max}")
@@ -101,7 +106,9 @@ class Router:
             try:
                 output, is_mark = self.route.get(packet[:1])
             except TypeError:
-                logging.debug(f"{self.__class__.__name__} | Thread receiver - route: {int.from_bytes(packet[:1])} not found, packet drop")
+                logging.debug(f"{self.__class__.__name__} | "
+                              f"Thread receiver - route: {int.from_bytes(packet[:1], "big")}"
+                              f" not found, packet drop")
                 continue
             if is_mark:
                 output.put((packet[1:], peer_id, int.from_bytes(packet[:1])))
