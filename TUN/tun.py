@@ -17,6 +17,8 @@ import logging
 
 
 class TUNControl:
+    __slots__ = ("pipe", "__peer_storage", "ID2LADDR", "LADDR2ID", "mtu", "addr", "tun", "__receiver_proc",
+                 "__sender_proc", "__is_run")
     def __init__(self,
                     tun_name: str,
                     peer_storage: PeerConfigStorage,
