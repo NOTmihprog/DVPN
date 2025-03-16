@@ -8,6 +8,9 @@ from Modules.peer_storage import PeerConfigStorage
 
 
 class API:
+    __slots__ = ("uapi", "__peer_storage", "con", "connections", "conn_ping", "conn_ping_send_time",
+                 "conn_ping_receive_time", "conn_ping_packets_send", "router", "__is_run", "__receiver_proc",
+                 "__ping_sender_proc")
     def __init__(self, connector: Connector, uapi, peer_storage: PeerConfigStorage, routes_pipe):
         self.uapi = uapi
         self.__peer_storage = peer_storage
@@ -196,6 +199,7 @@ class API:
 
 
 class APIRouter:
+    __slots__ = ("api", "range_pipe", "ADDR2ROUTES", "ROUTE2ADDR", "__is_run", "__sender_proc")
     def __init__(self, api: API, range_pipe: FakePipeConnRange):
         self.api = api
         self.range_pipe = range_pipe
