@@ -13,6 +13,7 @@ class PipeEmpty(Empty):
 
 
 class PipeConn:
+    __slots__ = ("input", "output")
     def __init__(self, input: Queue, output: Queue):
         self.input = input
         self.output = output
@@ -35,6 +36,7 @@ class Pipe:
 
 
 class EventPipe(threading.Thread):
+    __slots__ = ("__event_q", "__func_list")
     def __init__(self, maxsize=0):
         super().__init__()
         self.__event_q = Queue(maxsize=maxsize)
@@ -74,6 +76,7 @@ class EventPipe(threading.Thread):
                     logging.warning(e)
 
 class Connector:
+    __slots__ = ("sock", "__is_run")
     def __init__(self, sock):
         self.sock = sock
         self.sock.setblocking(True)
@@ -121,6 +124,7 @@ class Connector:
 
 
 class ConnectorInet(Connector):
+    __slots__ = ("__sock",)
     def __init__(self, bind_addr: tuple[str, int]):
         self.__sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.__sock.bind(bind_addr)
@@ -129,6 +133,7 @@ class ConnectorInet(Connector):
 
 
 class ConnectorUnix(Connector):
+    __slots__ = ("__sock",)
     def __init__(self, bind_addr: str):
         if os.path.exists(bind_addr):
             os.remove(bind_addr)
@@ -140,6 +145,7 @@ class ConnectorUnix(Connector):
 
 
 class PeerLogsHandler(logging.Handler):
+    __slots__ = ("__peer_storage", "_logs_pipe", "peer_id_mask", "ip_mask")
     def __init__(self, peer_storage, level: int | str = 0):
         super().__init__(level)
         self.__peer_storage = peer_storage
