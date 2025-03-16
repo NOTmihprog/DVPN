@@ -85,6 +85,8 @@ class Connector:
     def close(self):
         self.sock.close()
 
+    def get_bind(self):
+        return self.sock.getsockname()
     def recv(self):
         try:
             packet, addr = self.sock.recvfrom(65507)
@@ -179,3 +181,7 @@ class PeerLogsHandler(logging.Handler):
     def emit(self, record):
         log_entry = self.format(record)
         self._logs_pipe.event(log=log_entry)
+
+
+class ModuleInitError(Exception):
+    pass
