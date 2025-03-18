@@ -103,13 +103,13 @@ class PeerConfigStorage:
         self.__write_lock.release()
 
     def set_peer(self,
-                peer_id: str,
-                name: str=None,
-                addr: str=None,
-                endpoint: tuple[str, int] = None,
-                crypto: dict[str, any]=None,
-                sub_args: dict[str, any]=None,
-                force: bool=False
+                 peer_id: str,
+                 name: str=None,
+                 addr: str=None,
+                 endpoint: tuple[str, int] = None,
+                 crypto: dict[str, any]=None,
+                 sub_args: dict[str, any]=None,
+                 force: bool=False
                  ):
         write_conf = False
         event = {}
