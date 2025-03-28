@@ -295,18 +295,19 @@ def set_peer(ctx: typer.models.Context,
     peer_id = get_peer_id_or_exit(peer_id, peer_storage)
 
     peer = peer_storage.get_peer(peer_id)
-    if name == "None":
-        peer["name"] = None
-        name = None
+    if peer is not None:
+        if name == "None":
+            peer["name"] = None
+            name = None
 
-    if addr == "None":
-        peer["addr"] = None
-        addr = None
+        if addr == "None":
+            peer["addr"] = None
+            addr = None
 
-    if key == "None":
-        peer["crypto"] = None
-        key = None
-    peer_storage.set_peer(**peer, force=True)
+        if key == "None":
+            peer["crypto"] = None
+            key = None
+        peer_storage.set_peer(**peer, force=True)
     del peer
 
     if key is not None:
