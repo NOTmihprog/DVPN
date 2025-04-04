@@ -30,15 +30,16 @@ class InvalidToken(Exception):
 class Symmetric():
     __slots__ = ("_signing_key", "_encryption_key")
     def __init__(self, key: bytes | str) -> None:
-        try:
-            key = base64.urlsafe_b64decode(key)
-        except binascii.Error as exc:
-            raise ValueError(
-                "Key must be 32 url-safe base64-encoded bytes."
-            ) from exc
+        if type(key) is str:
+            try:
+                key = base64.urlsafe_b64decode(key)
+            except binascii.Error as exc:
+                raise ValueError(
+                    "Key must be 32 bytes."
+                ) from exc
         if len(key) != 32:
             raise ValueError(
-                "Key must be 32 url-safe base64-encoded bytes."
+                "Key must be 32 url-safe base64-encoded."
             )
 
         self._signing_key = key[:16]
@@ -141,7 +142,7 @@ class SymmetricCrypto:
             case "add" | "update":
                 try:
                     key = crypto.get("key")
-                    self.crypto_by_peer[peer_id] = Symmetric(key)
+                    self.crypto_by_peer[peer_id] = Symmetric(str(key))
                 except ValueError as e:
                     logging.warning(f"{self.__class__.__name__} | Peer {peer_id} crypto.key load error: {e}, Encryption disabled")
                     return
