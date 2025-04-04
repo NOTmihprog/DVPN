@@ -199,7 +199,7 @@ class PeerConfigStorage:
         return self.__peer_addr.get(peer_id)
 
     def get_peer_endpoint(self, peer_id: str) -> typing.Optional[tuple[str, int]]:
-        return self.__peer_addr.get(peer_id)
+        return self.__peer_endpoint.get(peer_id)
 
     def get_peer_crypto(self, peer_id: str) -> typing.Optional[dict[str, any]]:
         return self.__peer_crypto.get(peer_id)
