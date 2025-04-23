@@ -6,8 +6,6 @@ __version__ = "1.1.4"
 __email__ = "mih@mihprog.com"
 __status__ = "Development"
 
-
-import json
 import typing
 
 import msgpack
@@ -106,7 +104,7 @@ class PeerConfigStorage:
                  peer_id: str,
                  name: str=None,
                  addr: str=None,
-                 endpoint: tuple[str, int] = None,
+                 endpoint: tuple[str, int]=None,
                  crypto: dict[str, any]=None,
                  sub_args: dict[str, any]=None,
                  force: bool=False
@@ -172,6 +170,19 @@ class PeerConfigStorage:
 
         self.__event_pipe.event(**event)
         self.__write_config()
+
+    def del_peer_endpoint(self, peer_id: str):
+        event = {}
+        if not peer_id in self.__peer_list:
+            return False
+
+        event["action"] = "del"
+        event["peer_id"] = peer_id
+
+        self.__peer_endpoint[peer_id] = None
+        event["endpoint"] = None
+
+        self.__event_pipe.event(**event)
 
     def get_peer(self, peer_id: str) -> typing.Optional[dict[str, any]]:
         if not peer_id in self.__peer_list:
