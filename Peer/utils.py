@@ -1,6 +1,5 @@
 import os
 import random
-import sys
 import threading
 import time
 from typing import Optional, Union
@@ -11,7 +10,6 @@ from cryptography.hazmat.primitives.asymmetric.x448 import X448PrivateKey, X448P
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.exceptions import InvalidSignature
 
-from colorama import Fore, Style
 import logging
 import msgpack
 from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PublicKey
@@ -276,3 +274,112 @@ class Client:
                     logging.info(self.__log_prefix + f"Received packet | Packet type {packet_type} not exist")
                     continue
 
+    def stop(self, wait=False):
+        self.__is_run = False
+        if wait:
+            self.__receiver_proc.join()
+            self.__sender_proc.join()
+
+
+class PingUtils:
+    def __init__(self, peer_storage: PeerConfigStorage, pipe: PipeConn, event_pipe: EventPipe):
+        self.__pipe = pipe
+        self.__peer_storage = peer_storage
+        self.__event_pipe = event_pipe
+
+        self.ping_interval = 15 # Seconds
+
+        self.__peer_ping = {}
+        self.__peer_ping_send_time = {}
+        self.__peer_ping_receive_time = {}
+        self.__peer_ping_packets_send = {}
+
+        self.__is_run = True
+        self.__receiver_proc = threading.Thread(target=self.__receiver, daemon=True)
+        self.__sender_proc = threading.Thread(target=self.__sender, daemon=True)
+
+        self.__receiver_proc.start()
+        self.__sender_proc.start()
+        logging.info(f"{self.__class__.__name__} | Full - started")
+
+    def send_ping(self, peer_id: str):
+        packet = b"ping" + random.randbytes(random.randint(65, 150))
+        self.__pipe.send((packet, peer_id))
+
+    def send_pong(self, peer_id: str):
+        packet = b"pong" + random.randbytes(random.randint(65, 150))
+        self.__pipe.send((packet, peer_id))
+
+    def __create_event(self, peer_id: str, ping: int):
+        self.__event_pipe.event(peer_id=peer_id, ping=ping)
+
+
+    def __sender(self):
+        logging.info(f"{self.__class__.__name__} | Thread sender - started")
+        while self.__is_run:
+            try:
+                for peer_id in self.__peer_storage.get_peers_id():
+                    if self.__peer_storage.peer_is_self(peer_id):
+                        continue
+                    if self.__peer_storage.get_peer_endpoint(peer_id) is None:
+                        continue
+
+                    ping_packets = self.__peer_ping_packets_send.get(peer_id)
+                    if ping_packets is None:
+                        ping_packets = 0
+
+                    last_recv_time = self.__peer_ping_receive_time.get(peer_id)
+                    if last_recv_time is None:
+                        last_recv_time = 0
+
+                    if ping_packets > 3 and (time.time_ns() - last_recv_time) / 1000000000 > self.ping_interval*3:
+                        self.__peer_storage.del_peer_endpoint(peer_id)
+                        continue
+
+                    self.send_ping(peer_id)
+                    self.__peer_ping_send_time[peer_id] = time.time_ns()
+                    self.__peer_ping_packets_send[peer_id] = ping_packets + 1
+
+                    logging.debug(f"{self.__class__.__name__} | send ping to peer {peer_id}")
+                time.sleep(15)
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
+        logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
+
+    def __receiver(self):
+        logging.info(f"{self.__class__.__name__} | Thread receiver - started")
+        while self.__is_run:
+            try:
+                try:
+                    packet, peer_id = self.__pipe.recv(timeout=1)
+                except PipeEmpty:
+                    continue
+                if packet[:4] == b"ping":
+                    self.send_pong(peer_id)
+                    logging.debug(f"{self.__class__.__name__} | receive ping from {peer_id}")
+                elif packet[:4] == b"pong":
+                    send_time = self.__peer_ping_send_time.get(peer_id)
+                    if send_time is None:
+                        continue
+                    receive_time = time.time_ns()
+                    ping = (receive_time - send_time)/1000000
+                    self.__peer_ping[peer_id] = ping
+                    self.__peer_ping_receive_time[peer_id] = receive_time
+                    self.__create_event(peer_id, ping)
+                    logging.debug(f"{self.__class__.__name__} |"
+                                  f" receive pong from {peer_id}"
+                                  f" ping: {ping}")
+                else:
+                    logging.info(f"{self.__class__.__name__} | packet from {peer_id} type {packet[:4]} not exist")
+                    continue
+            except Exception as e:
+                logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
+
+        logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
+
+    def stop(self, wait=False):
+        self.__is_run = False
+        if wait:
+            self.__receiver_proc.join()
+            self.__sender_proc.join()
+        logging.info(f"{self.__class__.__name__} | Full - stopped")
