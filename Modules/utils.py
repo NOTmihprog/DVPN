@@ -6,6 +6,8 @@ import os
 import re
 from queue import Queue, Empty
 from colorama import Fore
+import string
+import random
 
 
 class PipeEmpty(Empty):
@@ -185,3 +187,7 @@ class PeerLogsHandler(logging.Handler):
 
 class ModuleInitError(Exception):
     pass
+
+
+def gen_peer_id(peer_len=32):
+    return ''.join([random.choice(string.ascii_letters + string.digits) for _ in range(peer_len)])
