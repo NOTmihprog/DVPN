@@ -27,7 +27,7 @@ class InvalidToken(Exception):
     pass
 
 
-class Symmetric():
+class Symmetric:
     __slots__ = ("_signing_key", "_encryption_key")
     def __init__(self, key: bytes | str) -> None:
         if type(key) is str:
