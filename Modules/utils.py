@@ -1,3 +1,11 @@
+__author__ = "mihprog"
+
+__license__ = "GPL"
+__version__ = "2.0.0"
+
+__email__ = "mih@mihprog.com"
+__status__ = "Production"
+
 import logging
 import threading
 import msgpack
@@ -155,7 +163,7 @@ class PeerLogsHandler(logging.Handler):
         self.__peer_storage = peer_storage
         self._logs_pipe = EventPipe()
         self._logs_pipe.add_listener(self.__log_handler)
-        self.peer_id_mask = re.compile("[a-f0-9]{32}")
+        self.peer_id_mask = re.compile("[a-zA-Z0-9]{32}")
         self.ip_mask = re.compile("(\\b25[0-5]|\\b2[0-4][0-9]|\\b[01]?[0-9][0-9]?)"
                                   "(\\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}")
 
@@ -189,5 +197,18 @@ class ModuleInitError(Exception):
     pass
 
 
-def gen_peer_id(peer_len=32):
-    return ''.join([random.choice(string.ascii_letters + string.digits) for _ in range(peer_len)])
+class PeerId:
+    symbols = string.ascii_letters + string.digits
+
+    @classmethod
+    def generate(cls, peer_len: int = 32) -> str:
+        return ''.join([random.choice(cls.symbols) for _ in range(peer_len)])
+
+    @classmethod
+    def validate(cls, peer_id: str, peer_len: int = 32):
+        if len(peer_id) != peer_len:
+            raise ValueError(f"len {len(peer_id)} != {peer_id}")
+        for s in peer_id:
+            if s not in cls.symbols:
+                raise ValueError(f"Symbol '{s}' not allowed")
+        return True
