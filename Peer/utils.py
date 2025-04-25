@@ -257,6 +257,7 @@ class Client:
                         logging.info(self.__log_prefix + f"Received packet | addr[1] not int")
                         continue
 
+                    peer_addr = (peer_addr[0], peer_addr[1])
 
                     if not self.__peer_storage.peer_exists(peer_id):
                         logging.info(self.__log_prefix + f"Received packet | Peer {peer_id} not found in peer_storage")
@@ -384,6 +385,12 @@ class PingUtils:
                 logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
 
         logging.info(f"{self.__class__.__name__} | Thread receiver - stopped")
+
+    def det_ping(self, peer_id: str) -> int:
+        ping = self.__peer_ping.get(peer_id)
+        if ping is None:
+            return 0
+        return ping
 
     def stop(self, wait=False):
         self.__is_run = False
