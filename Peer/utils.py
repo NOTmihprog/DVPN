@@ -95,6 +95,9 @@ class Client:
         else:
             return ServerDisconnected(addr=self.__addr, last_response=self.last_response)
 
+    def get_public_key(self):
+        return self.__public_key.public_bytes_raw()
+
     def __create_event(self, status: ServerStatus):
         self.__event_pipe.event(server=self.__addr, status=bool(status))
 
