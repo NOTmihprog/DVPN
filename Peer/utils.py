@@ -309,10 +309,36 @@ class PingUtils:
         self.__is_run = True
         self.__receiver_proc = threading.Thread(target=self.__receiver, daemon=True)
         self.__sender_proc = threading.Thread(target=self.__sender, daemon=True)
+        self.__peer_storage.add_listener(self.__event_handler)
 
         self.__receiver_proc.start()
         self.__sender_proc.start()
         logging.info(f"{self.__class__.__name__} | Full - started")
+
+    def __event_handler(self, action, peer_id, endpoint):
+        if endpoint is not None:
+            return
+        match action:
+            case "del":
+                self.__del_peer(peer_id)
+
+    def __del_peer(self, peer_id: str):
+        try:
+            del self.__peer_ping[peer_id]
+        except KeyError:
+            pass
+        try:
+            del self.__peer_ping_send_time[peer_id]
+        except KeyError:
+            pass
+        try:
+            del self.__peer_ping_receive_time[peer_id]
+        except KeyError:
+            pass
+        try:
+            del self.__peer_ping_packets_send[peer_id]
+        except KeyError:
+            pass
 
     def send_ping(self, peer_id: str):
         packet = b"ping" + random.randbytes(random.randint(65, 150))
