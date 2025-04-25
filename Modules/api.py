@@ -6,12 +6,13 @@ __version__ = "2.0.0"
 __email__ = "mih@mihprog.com"
 __status__ = "Production"
 
+import ipaddress
 import threading
 import logging
 import time
 
 from Modules.router import FakePipeConnRange
-from Modules.utils import PipeEmpty, Connector
+from Modules.utils import PipeEmpty, Connector, PeerId
 from Modules.peer_storage import PeerConfigStorage
 
 
@@ -65,9 +66,16 @@ class API:
     def __handler_get(self, packet):
         request = packet.get("req")
         peer_id = packet.get("peer_id")
+        addr = packet.get("addr")
         match request:
+            case "peer_id":
+                return self.__peer_storage.peer_id
+
             case "peers":
                 return self.__peer_storage.get_peers_id()
+
+            case "peer_exist":
+                return self.__peer_storage.peer_exists(peer_id)
 
             case "peer_name":
                 return self.__peer_storage.get_peer_name(peer_id)
@@ -96,12 +104,93 @@ class API:
             case "peer_crypto_status":
                 return self.uapi.get_crypto_status(peer_id)
 
+            case "servers":
+                return self.uapi.get_servers()
+
             case "server_status":
-                return self.uapi.get_server_status()
+                return self.uapi.get_server_status(addr)
+
+            case "server_key":
+                return self.uapi.get_server_key(addr)
+
+            case "server_last_announce":
+                return self.uapi.get_server_last_announce(addr)
+
+            case "server_last_search":
+                return self.uapi.get_server_last_search(addr)
+
+            case "server_last_response":
+                return self.uapi.get_server_last_response(addr)
 
             case "local_addr":
                 return self.uapi.get_local_addr()
 
+    def __handler_set(self, packet):
+        request = packet.get("req")
+        match request:
+            case "peer":
+                peer_id = packet.get("peer_id")
+                try:
+                    PeerId.validate(peer_id)
+                except ValueError:
+                    return "peer_id_validate_error"
+
+                name = packet.get("name")
+                if name is not None and type(name) is not str:
+                    return "name_not_str"
+
+                addr = packet.get("addr")
+                try:
+                    ipaddress.IPv4Address(addr)
+                except ValueError:
+                    return "addr_validate_error"
+                endpoint = packet.get("endpoint")
+                if type(endpoint) is not list:
+                    return "endpoint_not_list"
+                if len(endpoint) < 2:
+                    return "endpoint_len_not_2"
+                if type(endpoint[0]) is not str:
+                    return "endpoint_addr_not_str"
+                if type(endpoint[1]) is not int:
+                    return "endpoint_port_not_int"
+                endpoint = (endpoint[0], endpoint[1])
+
+                crypto = packet.get("crypto")
+                if crypto is not None and type(crypto) is not dict:
+                    return "crypto_not_dict"
+
+                sub_args = packet.get("sub_args")
+                if sub_args is not None and type(sub_args) is not dict:
+                    return "sub_args_not_dict"
+
+                force = packet.get("force")
+                if force is None:
+                    force = False
+                elif type(force) is not bool:
+                    return "force_not_bool"
+
+                return self.__peer_storage.set_peer(peer_id, name=name, addr=addr, endpoint=endpoint, crypto=crypto,
+                                                    sub_args=sub_args, force=force)
+
+    def __handler_del(self, packet):
+        request = packet.get("req")
+
+        peer_id = packet.get("peer_id")
+        try:
+            PeerId.validate(peer_id)
+        except ValueError:
+            return "peer_id_validate_error"
+
+        if not self.__peer_storage.peer_exists(peer_id):
+            return "peer_not_exist"
+        match request:
+            case "peer":
+                if self.__peer_storage.peer_is_self(peer_id):
+                    return "error_delete_self_peer"
+                return self.__peer_storage.del_peer(peer_id)
+
+            case "peer_endpoint":
+                return self.__peer_storage.del_peer_endpoint(peer_id)
 
     def __send_event(self, event, addr):
         self.con.send({"type": "event", "event": event}, addr)
@@ -170,6 +259,18 @@ class API:
                         self.con.send({"type": "res",
                                               "id": packet.get("id"),
                                               "res": response}, addr)
+
+                    case True, "set":
+                        response = self.__handler_set(packet)
+                        self.con.send({"type": "res",
+                                       "id": packet.get("id"),
+                                       "res": response}, addr)
+
+                    case True, "del":
+                        response = self.__handler_del(packet)
+                        self.con.send({"type": "res",
+                                       "id": packet.get("id"),
+                                       "res": response}, addr)
 
                     case True, "route":
                         response = self.__handler_route(packet, addr)
