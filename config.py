@@ -211,7 +211,10 @@ class ServerConfig:
 
     @property
     def port(self) -> Optional[int]:
-        return self.__config.get("port")
+        try:
+            return int(self.__config.get("port"))
+        except ValueError:
+            return None
     @port.setter
     def port(self, value: int):
         self.__config["port"] = str(value)
