@@ -397,6 +397,13 @@ class Config:
                     e.critical_exit(section, CONFIG_FILE_NAME)
 
     def save(self):
-        with open(self.__path, "w") as config_file:
-            # noinspection PyTypeChecker
-            self.__config.write(config_file)
+        try:
+            config_file = open(self.__path, "w")
+        except PermissionError:
+            logging.warning(f"{self.__class__.__name__} | write file({self.__path}) PermissionError")
+            return
+        config_file.seek(0)
+        # noinspection PyTypeChecker
+        self.__config.write(config_file)
+        config_file.flush()
+        config_file.close()
