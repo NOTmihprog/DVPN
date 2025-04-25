@@ -364,7 +364,7 @@ def del_peer(ctx: typer.models.Context,
 @typer_app.command(name="list", help="Show peers table")
 def list_peers(ctx: typer.models.Context):
     peer_storage: PeerConfigStorage = ctx.meta.get("peer_storage")
-    headers = ["Name", "PeerID", "Addr", "crypto"]
+    headers = ["Name", "PeerID", "Addr", "encryption"]
     table = []
 
     for peer in peer_storage.get_peers():
