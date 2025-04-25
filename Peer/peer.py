@@ -52,6 +52,8 @@ class Peer:
             self.__event_handler("add", peer_id, peer_endpoint)
         self.__peer_storage.add_listener(self.__event_handler)
 
+        self.__event_pipe.add_listener(self.__status_handler)
+
         for server in servers:
             self.__add_client(addr=server[0], key=server[1])
 
@@ -140,11 +142,9 @@ class Peer:
 
                 peer_id = self.__DADDR2ID.get(addr)
                 if peer_id is None:
-                    continue
-
-                client_pipe = self.clients_pipe.get(addr)
-                if client_pipe is not None:
-                    client_pipe.send((packet, addr))
+                    client_pipe = self.clients_pipe.get(addr)
+                    if client_pipe is not None:
+                        client_pipe.send((packet, addr))
                     continue
 
                 self.__pipe.send((packet, peer_id))
@@ -184,6 +184,9 @@ class Peer:
             except Exception as e:
                 logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
         logging.debug(f"{self.__class__.__name__} | Thread sender - stopped")
+
+    def get_local_addr(self):
+        return self.__sock.getsockname()
 
     def stop(self, wait=False):
         self.__is_run = False
