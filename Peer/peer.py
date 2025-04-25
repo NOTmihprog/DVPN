@@ -35,8 +35,8 @@ class Peer:
         self.__DADDR2ID: dict[tuple[str, int], str] = {}
         self.__ID2DADDR: dict[str, tuple[str, int]] = {}
 
-        self.clients: dict[tuple[str, int], Client] = {}
-        self.clients_pipe: dict[tuple[str, int], PipeConn] = {}
+        self.__clients: dict[tuple[str, int], Client] = {}
+        self.__clients_pipe: dict[tuple[str, int], PipeConn] = {}
 
         self.__sock = None
         self.reinit_socket((local_addr, random.randint(self.local_ports_range[0], self.local_ports_range[1])))
@@ -70,8 +70,8 @@ class Peer:
             key=key,
             addr=addr
         )
-        self.clients[addr] = client
-        self.clients_pipe[addr] = client_pipe
+        self.__clients[addr] = client
+        self.__clients_pipe[addr] = client_pipe
 
     def __event_handler(self, action, peer_id, endpoint):
         match action:
@@ -122,8 +122,8 @@ class Peer:
         if self.local_ports_range[0] == self.local_ports_range[1]:
             return
         offline = True
-        for client_addr in self.clients:
-            if self.clients.get(client_addr).get_server_status():
+        for client_addr in self.__clients:
+            if self.__clients.get(client_addr).get_server_status():
                 offline = False
         if offline:
             self.change_port()
@@ -142,7 +142,7 @@ class Peer:
 
                 peer_id = self.__DADDR2ID.get(addr)
                 if peer_id is None:
-                    client_pipe = self.clients_pipe.get(addr)
+                    client_pipe = self.__clients_pipe.get(addr)
                     if client_pipe is not None:
                         client_pipe.send((packet, addr))
                     continue
@@ -187,6 +187,9 @@ class Peer:
 
     def get_local_addr(self):
         return self.__sock.getsockname()
+
+    def get_client(self, addr: tuple[str, int]):
+        return self.__clients.get(addr)
 
     def stop(self, wait=False):
         self.__is_run = False
