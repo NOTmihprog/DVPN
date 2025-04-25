@@ -5,7 +5,7 @@ __copyright__ = "Copyright 2024, Planet Earth"
 __credits__ = ["mihprog", "coffe"]
 
 __license__ = "GPL"
-__version__ = "1.1.4"
+__version__ = "2.0.0"
 
 __maintainer__ = "mihprog"
 __email__ = "mih@mihprog.com"
@@ -110,8 +110,38 @@ class UAPI:
         else:
             return "no"
 
-    def get_server_status(self):
-        return self.peer.api.is_serv_online()
+    def get_servers(self):
+        return [(server.addr, server.port) for server in self.conf.servers]
+
+    def get_server_status(self, addr: tuple[str, int]):
+        client = self.peer.get_client(addr)
+        if client is None:
+            return None
+        return bool(client.get_server_status())
+
+    def get_server_key(self, addr: tuple[str, int]):
+        client = self.peer.get_client(addr)
+        if client is None:
+            return None
+        return client.get_public_key()
+
+    def get_server_last_announce(self, addr: tuple[str, int]):
+        client = self.peer.get_client(addr)
+        if client is None:
+            return None
+        return client.last_announce
+
+    def get_server_last_search(self, addr: tuple[str, int]):
+        client = self.peer.get_client(addr)
+        if client is None:
+            return None
+        return client.last_search
+
+    def get_server_last_response(self, addr: tuple[str, int]):
+        client = self.peer.get_client(addr)
+        if client is None:
+            return None
+        return client.last_response
 
     def get_local_addr(self):
         return self.peer.get_local_addr()
