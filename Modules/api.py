@@ -67,6 +67,8 @@ class API:
         request = packet.get("req")
         peer_id = packet.get("peer_id")
         addr = packet.get("addr")
+        if addr is not None:
+            addr = (addr[0], addr[1])
         match request:
             case "peer_id":
                 return self.__peer_storage.peer_id
