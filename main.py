@@ -111,7 +111,11 @@ class UAPI:
             return "no"
 
     def get_servers(self):
-        return [(server.addr, server.port) for server in self.conf.servers]
+        servers = []
+        for server in self.conf.servers:
+            server_conf = self.conf.servers.get(server)
+            servers.append((server_conf.addr, server_conf.port))
+        return servers
 
     def get_server_status(self, addr: tuple[str, int]):
         client = self.peer.get_client(addr)
