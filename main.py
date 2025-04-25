@@ -16,7 +16,6 @@ import ipaddress
 import json
 import os
 import sys
-import uuid
 import logging
 import time
 import colorama
@@ -29,14 +28,15 @@ from Peer.peer import Peer
 from TUN.tun import TUNControl
 from Modules.crypto import SymmetricCrypto
 from Modules.router import Router
-from Modules.utils import Pipe, EventPipe, ConnectorUnix, ConnectorInet, PeerLogsHandler, ModuleInitError
+from Modules.utils import Pipe, EventPipe, ConnectorUnix, ConnectorInet, PeerLogsHandler, ModuleInitError, PeerId
+from Peer.utils import PingUtils
 
 from Modules.peer_storage import PeerConfigStorage
 from Modules.api import API
 
 
 class UAPI:
-    def __init__(self, conf: config.Config, peer_storage, log_queue=None):
+    def __init__(self, conf: config.Config, peer_storage: PeerConfigStorage, log_queue=None):
         self.conf = conf
         self.__peer_storage = peer_storage
         self.log_queue = log_queue
@@ -47,15 +47,21 @@ class UAPI:
 
             peer_pipe, _peer_pipe = Pipe()
 
-            self.peer = Peer(peer_storage=self.__peer_storage, serv_addr=self.conf.peer.server_addr,
-                             event_pipe=self.event_pipe, serv_port=self.conf.peer.server_port,
+            servers = []
+            for server in self.conf.servers:
+                server_conf = conf.servers.get(server)
+                servers.append(((server_conf.addr, server_conf.port), server_conf.key))
+
+            self.peer = Peer(peer_storage=self.__peer_storage,event_pipe=self.event_pipe,
                              local_addr=self.conf.peer.bind_addr, local_ports=self.conf.peer.bind_port_range,
-                             pipe=_peer_pipe)
+                             pipe=_peer_pipe, servers=servers)
 
             crypto_pipe, _crypto_pipe = Pipe()
             self.crypto = SymmetricCrypto(peer_storage=self.__peer_storage, pipe_in=_crypto_pipe, pipe_out=peer_pipe)
 
             self.router = Router(pipe=crypto_pipe)
+
+            self.ping_utils = PingUtils(self.__peer_storage, self.router.register_rote(0), self.event_pipe)
 
             if self.conf.net is not None:
                 net0_pipe = self.router.register_rote(1)
@@ -89,19 +95,12 @@ class UAPI:
         except Exception as e:
             logging.info(f"{self.__class__.__name__} | ROUTER stop error: {e}")
 
-    def get_endpoint(self, peer_id):
-        return self.peer.api.get_peer_endpoint(peer_id)
-
     def get_peer_status(self, peer_id):
-        return self.peer.api.is_peer_online(peer_id)
+        return self.__peer_storage.get_peer_endpoint(peer_id) is not None
 
     def get_peer_ping(self, peer_id):
         if self.get_peer_status(peer_id):
-            ping = self.peer.api.get_ping(peer_id)
-            if ping is not None:
-                return ping
-            else:
-                return 0
+            return self.ping_utils.det_ping(peer_id)
         else:
             return 0
 
@@ -115,18 +114,18 @@ class UAPI:
         return self.peer.api.is_serv_online()
 
     def get_local_addr(self):
-        return self.peer.sock.getsockname()
+        return self.peer.get_local_addr()
 
 
 
 typer_app = typer.Typer()
 
 def get_peer_id_or_exit(peer_id: str, peer_storage: PeerConfigStorage) -> str:
-    if len(peer_id) < 32:
+    if len(peer_id) < config.PEER_ID_LEN:
         peer_id = peer_storage.get_full_peer_id(peer_id)
     else:
         try:
-            peer_id = bytes.fromhex(peer_id).hex()
+            PeerId.validate(peer_id)
         except ValueError:
             logging.critical(f"Peer_id {peer_id} invalid")
             sys.exit(1)
@@ -192,6 +191,10 @@ def main(ctx: typer.models.Context,
 
     if conf.net is not None and peer_storage.get_peer_addr(peer_storage.peer_id) is None:
         peer_storage.set_peer(peer_id=peer_storage.peer_id, addr=conf.net.addr)
+
+    if conf.net is not None and peer_storage.get_peer_addr(peer_storage.peer_id) != conf.net.addr:
+        conf.net.addr = peer_storage.get_peer_addr(peer_storage.peer_id)
+        conf.save()
 
     if ctx.invoked_subcommand is not None:
         ctx.meta["conf"] = conf
@@ -269,7 +272,7 @@ def main(ctx: typer.models.Context,
 
 @typer_app.command(help="Generate new peer-id")
 def gen_peer_id():
-    print(uuid.uuid4().hex)
+    print(PeerId.generate(config.PEER_ID_LEN))
 
 @typer_app.command(help="Generate new symmetric encryption key")
 def gen_key():
@@ -286,7 +289,9 @@ def set_peer(ctx: typer.models.Context,
              key: Annotated[str, typer.Option("--key", "-k",
                                               help="Optional, Crypto key len 32, format base64, generate: gen-key")]=None,
              clear: Annotated[bool, typer.Option("--clear", "-c",
-                                              help="Optional, clean not indicated parameters")] = None
+                                              help="Optional, clean not indicated parameters")] = None,
+             set_self: Annotated[bool, typer.Option("--self", "-s",
+                                                 help="Optional, set peer_id and net addr as self")] = None
              ):
 
 
@@ -334,6 +339,16 @@ def set_peer(ctx: typer.models.Context,
         return
 
     peer_storage.set_peer(peer_id, name, addr, {"key": key} if key is not None else None, force=clear)
+
+    if set_self:
+        conf = ctx.meta.get("conf")
+
+        conf.peer.peer_id = peer_id
+        if conf.net is not None and peer_storage.get_peer_addr(peer_id) is None:
+            conf.net.addr = peer_storage.get_peer_addr(peer_id)
+        conf.save()
+        peer_storage.peer_id = peer_id
+
     list_peers(ctx)
 
 @typer_app.command(name="del", help="Delete peer by id")
@@ -355,7 +370,7 @@ def list_peers(ctx: typer.models.Context):
     for peer in peer_storage.get_peers():
         crypto = peer.get("crypto")
         table.append([
-            peer.get("name"),
+            f"[{peer.get("name")}]" if peer_storage.peer_is_self(peer.get("peer_id")) else peer.get("name"),
             peer.get("peer_id"),
             peer.get("addr"),
             " ".join(list(f"{key}: {crypto[key]}" for key in crypto)) if crypto is not None else "disabled"

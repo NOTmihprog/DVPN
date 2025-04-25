@@ -1,3 +1,11 @@
+__author__ = "mihprog"
+
+__license__ = "GPL"
+__version__ = "2.0.0"
+
+__email__ = "mih@mihprog.com"
+__status__ = "Production"
+
 import threading
 import logging
 import time
@@ -30,6 +38,8 @@ class API:
 
         self.__receiver_proc.start()
         self.__ping_sender_proc.start()
+
+        self.__peer_storage.add_listener(self.event_handler)
 
         bind_addr = self.con.get_bind()
         if type(bind_addr) is tuple:
@@ -75,7 +85,7 @@ class API:
                 return self.__peer_storage.get_peer_sub_arg(peer_id, packet.get("arg"))
 
             case "peer_endpoint":
-                return self.uapi.get_endpoint(peer_id)
+                return self.__peer_storage.get_peer_endpoint(peer_id)
 
             case "peer_status":
                 return self.uapi.get_peer_status(peer_id)
