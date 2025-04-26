@@ -56,7 +56,7 @@ bind-addr = 0.0.0.0
 # local port or port range, exemple: 8647, 8647-9942, 8647-8647
 bind-port = 8647-9942
 
-[Server.main]
+[Server.msk]
 # ipv4 address
 addr = 62.109.29.213
 
@@ -64,7 +64,12 @@ addr = 62.109.29.213
 port = 6485
 
 # server encryption public key in base64 encoding
-key = vmEZ1exWYLkrsFNtSB4LACbwQ0s9B6owjxsp3jQni2XxXRCgyV2a5tJGX53T526b44b/lS1sSN+A
+key = ToltwNlL23RYIzvLk5QdJXE182oaJVYTQAspapIv2dUvGdOHSjHF8E70DWueomspO94x1p3mY5+A
+
+[Server.am]
+addr = 103.90.75.155
+port = 6485
+key = N4SIvT+yilT46KP6sggO/Kc9ZCsTX2jO+fWYo5GdXYBrDv/4A/GPUYHWv/G7IkHSw4bB/BvMDweA
 
 
 [NET]
