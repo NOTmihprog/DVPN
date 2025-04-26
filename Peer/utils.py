@@ -196,8 +196,9 @@ class Client:
         except InvalidToken:
             return None
 
-    def drop_session(self):
-        self.__send_close()
+    def drop_session(self, send_close=True):
+        if send_close:
+            self.__send_close()
         self.__session_key = None
         self.last_response = 0
 
@@ -280,7 +281,7 @@ class Client:
 
                 case "close":
                     logging.info(self.__log_prefix + f"Connection closed from server")
-                    self.drop_session()
+                    self.drop_session(send_close=False)
                     continue
                 case _:
                     logging.info(self.__log_prefix + f"Received packet | Packet type {packet_type} not exist")
@@ -288,6 +289,7 @@ class Client:
 
     def stop(self, wait=False):
         self.__is_run = False
+        self.__send_close()
         if wait:
             self.__receiver_proc.join()
             self.__sender_proc.join()

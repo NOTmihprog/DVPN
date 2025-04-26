@@ -194,6 +194,8 @@ class Peer:
     def stop(self, wait=False):
         self.__is_run = False
 
+        for client in self.__clients:
+            self.__clients[client].stop(wait)
         if wait:
             self.__receiver_proc.join()
             self.__sender_proc.join()
