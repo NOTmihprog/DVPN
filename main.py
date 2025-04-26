@@ -404,7 +404,7 @@ def list_peers(ctx: typer.models.Context):
     for peer in peer_storage.get_peers():
         crypto = peer.get("crypto")
         table.append([
-            f"[{peer.get("name")}]" if peer_storage.peer_is_self(peer.get("peer_id")) else peer.get("name"),
+            f"[{peer.get('name')}]" if peer_storage.peer_is_self(peer.get("peer_id")) else peer.get("name"),
             peer.get("peer_id"),
             peer.get("addr"),
             " ".join(list(f"{key}: {crypto[key]}" for key in crypto)) if crypto is not None else "disabled"
