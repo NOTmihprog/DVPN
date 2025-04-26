@@ -246,6 +246,31 @@ class ServerConfig:
             raise ItemNotValidError("key")
 
 
+class LocalServer:
+    @property
+    def private_key(self) -> Optional[bytes]:
+        try:
+            return base64.b64decode(self.__config.get("private-key"))
+        except ValueError:
+            return None
+    @private_key.setter
+    def private_key(self, value: bytes):
+        self.__config["private-key"] = base64.b64encode(value).decode()
+
+    @property
+    def public_key(self) -> Optional[bytes]:
+        try:
+            return base64.b64decode(self.__config.get("public-key"))
+        except ValueError:
+            return None
+    @public_key.setter
+    def public_key(self, value: bytes):
+        self.__config["public-key"] = base64.b64encode(value).decode()
+
+    def __init__(self, config):
+        self.__config = config
+
+
 class NetConfig:
     @property
     def name(self) -> str:
@@ -388,6 +413,13 @@ class Config:
         except ItemError as e:
             e.critical_exit("App", CONFIG_FILE_NAME)
 
+        try:
+            self.local_server = LocalServer(self.__config["LocalServer"])
+        except KeyError:
+            pass
+        except ItemError as e:
+            e.critical_exit("App", CONFIG_FILE_NAME)
+
         self.servers = {}
         for section in self.__config.sections():
             if section.startswith("Server."):
@@ -395,6 +427,10 @@ class Config:
                     self.servers[section.replace("Server.", "")] = (ServerConfig(self.__config[section]))
                 except ItemError as e:
                     e.critical_exit(section, CONFIG_FILE_NAME)
+
+    def create_local_server(self):
+        self.__config["LocalServer"] = {}
+        self.local_server = LocalServer(self.__config["LocalServer"])
 
     def save(self):
         try:
