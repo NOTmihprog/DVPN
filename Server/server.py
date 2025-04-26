@@ -101,8 +101,9 @@ class Server:
     def __send_close(self, addr: tuple[str, int]):
         self.__send({"type": "close"}, addr)
 
-    def drop_session(self, addr: tuple[str, int]):
-        self.__send_close(addr)
+    def drop_session(self, addr: tuple[str, int], send_close=True):
+        if send_close:
+            self.__send_close(addr)
         del self.__peer_session[addr]
         peer_id = self.__ADDR2PEER_ID.get(addr)
         if peer_id is not None:
@@ -277,7 +278,7 @@ class Server:
                         continue
 
                     case "close":
-                        self.drop_session(addr)
+                        self.drop_session(addr, send_close=False)
                         logging.info(
                             f"{self.__class__.__name__} | connection close from {addr[0]}:{addr[1]}")
                         continue
