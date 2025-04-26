@@ -284,7 +284,7 @@ class Server:
 
                     case _:
                         logging.info(f"{self.__class__.__name__} | Packet from {addr[0]}:{addr[1]}"
-                                     f" type {packet.get("type")} not found")
+                                     f" type {packet.get('type')} not found")
                         continue
 
             except Exception as e:
