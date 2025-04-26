@@ -222,7 +222,6 @@ class Server:
                 packet = self.__decrypt(packet, session)
                 if packet is None:
                     logging.info(f"{self.__class__.__name__} | Packet from {addr[0]}:{addr[1]} Invalid Data")
-                    self.drop_session(addr)
                     continue
 
                 try:

@@ -78,6 +78,7 @@ class Client:
         self.last_announce = 0
         self.last_search = 0
         self.last_response = 0
+        self.last_send_key = 0
 
         self.__log_prefix = f"{self.__class__.__name__} {self.__addr[0]}:{self.__addr[1]} | "
 
@@ -104,10 +105,13 @@ class Client:
     def __init_session(self):
         self.__iv = os.urandom(random.randint(14, 50))
         self.__private_key = X448PrivateKey.generate()
+        self.last_send_key = time.time()
         self.__send_no_encrypt(self.__private_key.public_key().public_bytes_raw() + self.__iv, self.__addr)
 
     def __reg_session(self, packet):
         if len(packet) < 75:
+            return
+        if self.last_send_key <= 0:
             return
         peer_public_key = X448PublicKey.from_public_bytes(packet[:56])
         try:
@@ -201,6 +205,7 @@ class Client:
             self.__send_close()
         self.__session_key = None
         self.last_response = 0
+        self.last_send_key = 0
 
     def __receiver(self):
         while self.__is_run:
@@ -214,7 +219,6 @@ class Client:
             packet = self.__decrypt(packet)
             if packet is None:
                 logging.info(self.__log_prefix + f"Received packet | Invalid Data")
-                self.drop_session()
                 continue
             try:
                 packet = msgpack.loads(packet)
