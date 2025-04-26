@@ -21,6 +21,7 @@ import time
 import colorama
 import config
 import typer
+import socket
 from typing_extensions import Annotated
 from tabulate import tabulate
 
@@ -28,8 +29,10 @@ from Peer.peer import Peer
 from TUN.tun import TUNControl
 from Modules.crypto import SymmetricCrypto
 from Modules.router import Router
+from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PrivateKey
 from Modules.utils import Pipe, EventPipe, ConnectorUnix, ConnectorInet, PeerLogsHandler, ModuleInitError, PeerId
 from Peer.utils import PingUtils
+from Server.server import Server
 
 from Modules.peer_storage import PeerConfigStorage
 from Modules.api import API
@@ -503,6 +506,55 @@ def import_peer(ctx: typer.models.Context,
         peer_id = peer.get("peer_id")
     peer_storage.set_peer(peer_id, peer.get("name"), peer.get("addr"), peer.get("crypto"), force=True)
     list_peers(ctx)
+
+@typer_app.command(name="server", help="Start peer detection server")
+def run_server(ctx: typer.models.Context,
+                 addr: Annotated[str, typer.Option("--addr", "-a",
+                                                       help="Server bind ipv4 addr")] = "0.0.0.0",
+                 port: Annotated[int, typer.Option("--port", "-p",
+                                                 help="Server bind port")] = 6485,
+                 ):
+    try:
+        ipaddress.IPv4Address(addr)
+    except ipaddress.AddressValueError as e:
+        logging.critical(f"addr invalid, error: {e}")
+        return
+
+    conf: config.Config = ctx.meta.get("conf")
+    try:
+        if conf.local_server.private_key is None:
+            raise AttributeError
+    except AttributeError:
+        key = Ed448PrivateKey.generate()
+        conf.create_local_server()
+        conf.local_server.private_key = key.private_bytes_raw()
+        conf.local_server.public_key = key.public_key().public_bytes_raw()
+        conf.save()
+    else:
+        key = Ed448PrivateKey.from_private_bytes(conf.local_server.private_key)
+        public_key = key.public_key()
+        if conf.local_server.public_key != public_key.public_bytes_raw():
+            conf.local_server.public_key = public_key.public_bytes_raw()
+            conf.save()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((addr, port))
+    except Exception as e:
+        logging.critical(f"Socket bind error: {e}")
+        return
+    logging.info(f"Public key: {base64.b64encode(key.public_key().public_bytes_raw()).decode()}")
+    server = Server(sock, key.private_bytes_raw(), config.PEER_ID_LEN)
+    logging.info(f"Server started listen: {addr}:{port}")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    logging.info(f"Server stopped")
+
+    server.stop()
+    sock.close()
 
 if __name__ == "__main__":
     colorama.init()
