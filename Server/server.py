@@ -289,3 +289,11 @@ class Server:
 
             except Exception as e:
                 logging.error(f"{self.__class__.__name__} | Runtime error {type(e).__name__}: {e}")
+
+
+    def stop(self, wait=False):
+        self.__is_run = False
+        if wait:
+            self.__receiver_proc.join()
+            self.__garbage_collector_proc.join()
+        logging.info(f"{self.__class__.__name__} | Full - stopped")
