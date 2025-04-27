@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 __author__ = "mihprog"
-__copyright__ = "Copyright 2024, Planet Earth"
+__copyright__ = "Copyright 2025, Planet Earth"
 __credits__ = ["mihprog", "coffe"]
 
 __license__ = "GPL"
@@ -217,7 +217,18 @@ def main(ctx: typer.models.Context,
          api_addr: Annotated[str, typer.Option("--api-addr", "-a",
                                                 help="api net socket or unix socket address,"
                                                      " UNIX socket unsupported on windows")] = None,
+         version: Annotated[bool, typer.Option("--version", "-v",
+                                               help="Print version and exit")] = None,
+
          ):
+
+    if version:
+        print(f"Version: {__version__} | Author: {__author__}\n")
+        print(f"Если вам скучно или нужна помощь: {__email__}")
+        print(f"+{'-'*47}+")
+        print(f"If you are bored or need help: {__email__}\n")
+        return
+
     conf = config.Config(config.CONFIG_FILE_PATH)
     logging.basicConfig(level=conf.app.log_level, stream=sys.stdout,
                         format=config.LOG_FORMAT)
