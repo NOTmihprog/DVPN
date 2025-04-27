@@ -368,15 +368,21 @@ class PingUtils:
                     if self.__peer_storage.get_peer_endpoint(peer_id) is None:
                         continue
 
+                    last_recv_time = self.__peer_ping_receive_time.get(peer_id)
+                    last_send_time = self.__peer_ping_send_time.get(peer_id)
+                    if last_send_time is None:
+                        last_send_time = 0
+                    if last_recv_time is not None and (time.time_ns() - last_send_time) / 1000000000 < self.ping_interval:
+                        continue
+
+                    if last_recv_time is None:
+                        last_recv_time = 0
+
                     ping_packets = self.__peer_ping_packets_send.get(peer_id)
                     if ping_packets is None:
                         ping_packets = 0
 
-                    last_recv_time = self.__peer_ping_receive_time.get(peer_id)
-                    if last_recv_time is None:
-                        last_recv_time = 0
-
-                    if ping_packets > 3 and (time.time_ns() - last_recv_time) / 1000000000 > self.ping_interval*3:
+                    if ping_packets > self.ping_interval*3 and (time.time_ns() - last_recv_time) / 1000000000 > self.ping_interval*3:
                         self.__peer_storage.del_peer_endpoint(peer_id)
                         continue
 
@@ -385,7 +391,7 @@ class PingUtils:
                     self.__peer_ping_packets_send[peer_id] = ping_packets + 1
 
                     logging.debug(f"{self.__class__.__name__} | send ping to peer {peer_id}")
-                time.sleep(15)
+                time.sleep(1)
             except Exception as e:
                 logging.error(f"{self.__class__.__name__} | Runtime error: {e}")
         logging.info(f"{self.__class__.__name__} | Thread sender - stopped")
