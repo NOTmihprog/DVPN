@@ -82,7 +82,7 @@ mask = 255.255.255.0
 
 [App]
 # Log Levels DEBUG, INFO, WARNING, ERROR, CRITICAL
-log-level = DEBUG
+log-level = INFO
 """
 
 def get_random_ip(net):
