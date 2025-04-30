@@ -1,7 +1,7 @@
 __author__ = "mihprog"
 
 __license__ = "GPL"
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 __email__ = "mih@mihprog.com"
 __status__ = "Production"

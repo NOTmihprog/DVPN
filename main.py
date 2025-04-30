@@ -5,7 +5,7 @@ __copyright__ = "Copyright 2025, Planet Earth"
 __credits__ = ["mihprog", "coffe"]
 
 __license__ = "GPL"
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 __maintainer__ = "mihprog"
 __email__ = "mih@mihprog.com"
