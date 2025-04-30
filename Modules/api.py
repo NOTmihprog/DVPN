@@ -142,20 +142,22 @@ class API:
                     return "name_not_str"
 
                 addr = packet.get("addr")
-                try:
-                    ipaddress.IPv4Address(addr)
-                except ValueError:
-                    return "addr_validate_error"
+                if addr is not None:
+                    try:
+                        ipaddress.IPv4Address(addr)
+                    except ValueError:
+                        return "addr_validate_error"
                 endpoint = packet.get("endpoint")
-                if type(endpoint) is not list:
-                    return "endpoint_not_list"
-                if len(endpoint) < 2:
-                    return "endpoint_len_not_2"
-                if type(endpoint[0]) is not str:
-                    return "endpoint_addr_not_str"
-                if type(endpoint[1]) is not int:
-                    return "endpoint_port_not_int"
-                endpoint = (endpoint[0], endpoint[1])
+                if endpoint is not None:
+                    if type(endpoint) is not list:
+                        return "endpoint_not_list"
+                    if len(endpoint) < 2:
+                        return "endpoint_len_not_2"
+                    if type(endpoint[0]) is not str:
+                        return "endpoint_addr_not_str"
+                    if type(endpoint[1]) is not int:
+                        return "endpoint_port_not_int"
+                    endpoint = (endpoint[0], endpoint[1])
 
                 crypto = packet.get("crypto")
                 if crypto is not None and type(crypto) is not dict:
