@@ -207,14 +207,16 @@ class API:
     def __handler_route(self, packet, addr):
         request = packet.get("req")
         route = packet.get("route")
-        if type(route) is not int:
-            return "not_int"
 
         match request:
             case "reg":
+                if type(route) is not int:
+                    return "not_int"
                 return self.router.add_route(addr, route)
 
             case "del":
+                if type(route) is not int:
+                    return "not_int"
                 if self.router.ROUTE2ADDR.get(route) != addr:
                     return "not_permission"
                 return self.router.del_route(route)
