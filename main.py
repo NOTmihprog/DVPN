@@ -5,7 +5,7 @@ __copyright__ = "Copyright 2025, Planet Earth"
 __credits__ = ["mihprog", "coffe"]
 
 __license__ = "GPL"
-__version__ = "2.0.2"
+__version__ = "2.0.3"
 
 __maintainer__ = "mihprog"
 __email__ = "mih@mihprog.com"
@@ -22,6 +22,7 @@ import colorama
 import config
 import typer
 import socket
+import signal
 from typing_extensions import Annotated
 from tabulate import tabulate
 
@@ -210,6 +211,8 @@ def read_input_or_exit(inp: str) -> any:
         sys.exit(1)
     return inp_data
 
+is_run = True
+
 @typer_app.callback(invoke_without_command=True)
 def main(ctx: typer.models.Context,
          disable_net: Annotated[bool, typer.Option("--disable-net", "-dn",
@@ -221,6 +224,7 @@ def main(ctx: typer.models.Context,
                                                help="Print version and exit")] = None,
 
          ):
+    global is_run
 
     if version:
         print(f"Version: {__version__} | Author: {__author__}\n")
@@ -309,14 +313,29 @@ def main(ctx: typer.models.Context,
     api = API(con, uapi, peer_storage, uapi.router.register_range(32, 255))
     uapi.event_pipe.add_listener(api.event_handler)
 
-    while True:
+    is_run = True
+
+    def signal_handler(sig, frame):
+        global is_run
+        if sig != signal.SIGINT and frame is None:
+            return
+        if is_run:
+            logging.info(' Pressed Ctrl+C, exiting.')
+            uapi.stop()
+            api.stop()
+            con.close()
+            time.sleep(1)
+            is_run = False
+        else:
+            logging.info(" Exiting in progress...")
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    while is_run:
         try:
             time.sleep(1)
         except KeyboardInterrupt:
             break
-    uapi.stop()
-    api.stop()
-    con.close()
 
 @typer_app.command(help="Generate new peer-id")
 def gen_peer_id():
@@ -525,6 +544,7 @@ def run_server(ctx: typer.models.Context,
                  port: Annotated[int, typer.Option("--port", "-p",
                                                  help="Server bind port")] = 6485,
                  ):
+    global is_run
     try:
         ipaddress.IPv4Address(addr)
     except ipaddress.AddressValueError as e:
@@ -557,17 +577,31 @@ def run_server(ctx: typer.models.Context,
     logging.info(f"Public key: {base64.b64encode(key.public_key().public_bytes_raw()).decode()}")
     server = Server(sock, key.private_bytes_raw(), config.PEER_ID_LEN)
     logging.info(f"Server started listen: {addr}:{port}")
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
-    logging.info(f"Server stopped")
 
-    server.stop()
-    sock.close()
+    is_run = True
+
+    def signal_handler(sig, frame):
+        global is_run
+        if sig != signal.SIGINT and frame is None:
+            return
+        if is_run:
+            logging.info(' Pressed Ctrl+C, exiting.')
+            server.stop()
+            sock.close()
+            time.sleep(1)
+            is_run = False
+        else:
+            logging.info(" Exiting in progress...")
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    while is_run:
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            break
+    logging.info(f"Server stopped")
 
 if __name__ == "__main__":
     colorama.init()
-
     typer_app()
