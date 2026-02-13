@@ -405,7 +405,7 @@ def set_peer(ctx: typer.models.Context,
         logging.critical(f"addr invalid, error: {e}")
         return
 
-    peer_storage.set_peer(peer_id, name, addr, {"key": key} if key is not None else None, force=clear)
+    peer_storage.set_peer(peer_id, name, addr, crypto={"key": key} if key is not None else None, force=clear)
 
     if set_self:
         conf = ctx.meta.get("conf")
