@@ -309,32 +309,44 @@ class NetConfig:
         self.__config["mask"] = str(value)
 
 
-    def __init__(self, config):
+    def __init__(self, config, addr: str=None, mask: str=None, mtu: int=None, name: str=None):
         self.__config = config
 
-        if self.name is None:
-            raise ItemNotFoundError("tun-name")
+        if name is None:
+            if self.name is None:
+                raise ItemNotFoundError("tun-name")
+        else:
+            self.name = name
 
-        if self.mtu is None:
-            raise ItemNotFoundError("mtu")
+        if mtu is None:
+            if self.mtu is None:
+                raise ItemNotFoundError("mtu")
+        else:
+            self.mtu = mtu
 
-        self.addr = config.get("addr")
-        if self.addr is None:
-            raise ItemNotFoundError("Addr")
-        try:
-            ipaddress.IPv4Address(self.addr)
-        except ValueError:
-            ItemNotValidError("addr")
-
-        if self.mask is None:
-            raise ItemNotFoundError("Mask")
-        try:
-            ipaddress.IPv4Address(self.mask)
-        except ValueError:
+        if addr is None:
+            self.addr = config.get("addr")
+            if self.addr is None:
+                raise ItemNotFoundError("Addr")
             try:
-                int(self.mask)
+                ipaddress.IPv4Address(self.addr)
             except ValueError:
-                ItemNotValidError("mask")
+                ItemNotValidError("addr")
+        else:
+            self.addr = addr
+
+        if mask is None:
+            if self.mask is None:
+                raise ItemNotFoundError("Mask")
+            try:
+                ipaddress.IPv4Address(self.mask)
+            except ValueError:
+                try:
+                    int(self.mask)
+                except ValueError:
+                    ItemNotValidError("mask")
+        else:
+            self.mask = mask
 
 
 class AppConfig:
@@ -436,6 +448,16 @@ class Config:
     def create_local_server(self):
         self.__config["LocalServer"] = {}
         self.local_server = LocalServer(self.__config["LocalServer"])
+
+    def create_net(self, addr: str, mask: str, mtu: int=1350, tun_name: str="dnet"):
+        self.__config["NET"] = {}
+        try:
+            ipaddress.IPv4Network(f"{addr}/{mask}", strict=False)
+        except ipaddress.NetmaskValueError:
+            raise ValueError(f"mask {mask} not valid")
+        except ipaddress.AddressValueError:
+            raise ValueError(f"addr {addr} not valid")
+        self.net = NetConfig(self.__config["NET"], addr=addr, mask=mask, mtu=mtu, name=tun_name)
 
     def save(self):
         try:
