@@ -26,3 +26,6 @@ mv ./dvpn-linux* ./dvpn
 chmod +x ./dvpn
 sudo ./dvpn
 ```
+
+### Windows
+1. ...
