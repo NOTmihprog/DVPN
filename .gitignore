@@ -9,3 +9,7 @@
 /testTUI.py
 /.idea
 /.venv
+/target
+/config.toml
+/peers.json
+/peers.json.tmp

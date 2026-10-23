@@ -12,3 +12,34 @@
 > в которых участники сети знают друг друга, **не выкладывайте peer_id в открытый доступ**,
 > это может привести в тому что кто угодно сможет получить доступ к вашей сети и представляться каким угодно пиром из вашей сети, <br>
 > Если вашей целью является именно анонимность используйте [Yggdrasil](https://yggdrasil-network.github.io/) + [wireguard](https://www.wireguard.com/) или [i2p](https://geti2p.net/en/), [tor](https://www.torproject.org/).
+> ### Сборка
+> ```shell
+> cargo build --release        # бинарник: target/release/dvpn
+> ```
+> На Windows рядом с `dvpn.exe` нужен `wintun.dll` ([wintun.net](https://www.wintun.net/)), запуск от администратора.
+> На Linux для TUN нужны права root или `CAP_NET_ADMIN`.
+
+> ### Быстрый старт
+> `config.toml` и `peers.json` хранятся рядом с бинарником (или в `--dir <путь>` / `DVPN_DIR`), при первом запуске создаётся конфиг по умолчанию.
+> ```shell
+> dvpn server                                   # сервер обнаружения, печатает свой публичный ключ
+> dvpn set -p <peer_id> -n name -a 10.10.33.2 -k $(dvpn gen-key)
+> dvpn export > peers.txt                       # передать список пиров участникам сети
+> dvpn import -i peers.txt
+> sudo dvpn                                     # запуск узла
+> ```
+> Серверы указываются в `config.toml`:
+> ```toml
+> [servers.msk]
+> addr = "62.109.29.213"
+> port = 6485
+> key = "<публичный ключ из вывода dvpn server>"
+> ```
+
+> ### Переход с версии 2.x (Python)
+> Версия 3 несовместима по протоколу с 2.x: серверы обнаружения тоже нужно обновить до 3.x,
+> ключи серверов теперь Ed25519 (новые ключи печатает `dvpn server`).
+> * `config.ini` → `config.toml` (те же параметры, ключи через `_`: `peer_id`, `bind_addr`, `tun_name`, ...).
+> * `peers.cnf` → `peers.json`: сделайте `python main.py export` в старой версии и `dvpn import` в новой
+>   (старый формат экспорта с `crypto.key` поддерживается). Ключи шифрования пиров остаются прежними.
+> * API (msgpack поверх UDP/unix-сокета) сохранён; `peer_crypto_status` теперь возвращает `xchacha20poly1305`.
