@@ -13,10 +13,17 @@
 //! Peer <-> peer:
 //! ```text
 //! SEALED     [0x10][nonce 24][xchacha20poly1305([route][payload])][tag 16]
-//!            key = recipient's key, AAD = [0x10]|sender_id|recipient_id
+//!            key = recipient's key, AAD = [0x10]|recipient_id
 //! PLAIN      [0x11][route][payload]      only accepted when the recipient has no key
 //! ```
 //! Routes: 0 = control (ping/pong), 1 = IP packet for the TUN device, 32..=255 = API clients.
+//! The sender of a packet is identified by its UDP source address. Control packets also carry
+//! the sender id, which lets a peer whose NAT mapping changed be found at its new address:
+//! ```text
+//! CONTROL    [kind][echo_ts u64][session u64][seq u64][sender_id 32][random padding]
+//! ```
+//! `echo_ts` is the ping send time (echoed back in the pong, for RTT); (`session`, `seq`) is
+//! random-per-run plus monotonic, so replayed control packets cannot move an endpoint.
 
 use std::net::SocketAddr;
 
@@ -42,6 +49,9 @@ pub const ROUTE_API_MAX: u8 = 255;
 
 pub const CONTROL_PING: u8 = 0;
 pub const CONTROL_PONG: u8 = 1;
+pub const CONTROL_LEN: usize = 1 + 8 + 8 + 8 + 32;
+/// Packets from unknown addresses larger than this are not even tried (only control packets matter).
+pub const ROAM_MAX_LEN: usize = 256;
 
 pub const MAX_DATAGRAM: usize = 65507;
 

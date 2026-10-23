@@ -11,6 +11,8 @@ use crate::storage::{PeerStorage, PeerUpdate};
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(15);
 const SEARCH_INTERVAL: Duration = Duration::from_secs(15);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
+/// A link that answered within this time is not replaced by a tracker-reported endpoint.
+const LIVE_LINK: Duration = Duration::from_secs(20);
 
 fn unix_now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
@@ -149,6 +151,10 @@ impl TrackerClient {
                             log::info!("{} Received packet | Peer {peer_id} not found in peer_storage", self.log_prefix);
                         } else if storage.endpoint(&peer_id) == Some(addr) {
                             log::debug!("{} Peer {peer_id} receive endpoint {addr}", self.log_prefix);
+                        } else if storage.link_alive(&peer_id, LIVE_LINK) {
+                            // The direct link works; behind some NATs the peer's real port differs
+                            // from what the tracker sees, so don't break a working link.
+                            log::debug!("{} Peer {peer_id} endpoint {addr} ignored, link alive", self.log_prefix);
                         } else {
                             if storage.is_self(&peer_id) {
                                 log::info!("{} New self endpoint {addr}", self.log_prefix);

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use parking_lot::{Mutex, RwLock};
@@ -92,11 +92,13 @@ struct Peer {
     cipher: Option<PeerCipher>,
     endpoint: Option<SocketAddr>,
     link: Link,
+    /// Freshest (session, seq) seen in the peer's control packets; survives endpoint changes.
+    seq: Option<(u64, u64)>,
 }
 
 impl Peer {
     fn new(rec: PeerRecord) -> Self {
-        let mut p = Peer { rec, cipher: None, endpoint: None, link: Link::new() };
+        let mut p = Peer { rec, cipher: None, endpoint: None, link: Link::new(), seq: None };
         p.load_cipher();
         p
     }
@@ -378,6 +380,31 @@ impl PeerStorage {
             && p.endpoint.is_some() {
                 f(&mut p.link);
             }
+    }
+
+    /// Whether we heard from the peer at its current endpoint within `within`.
+    pub fn link_alive(&self, id: &PeerId, within: Duration) -> bool {
+        let inner = self.inner.read();
+        inner.peers.get(id).is_some_and(|p| p.endpoint.is_some() && p.link.last_seen.is_some_and(|t| t.elapsed() < within))
+    }
+
+    /// Records a control packet's (session, seq); false if it is not newer than what we saw (replay).
+    pub fn accept_seq(&self, id: &PeerId, session: u64, seq: u64) -> bool {
+        let mut inner = self.inner.write();
+        let Some(p) = inner.peers.get_mut(id) else { return false };
+        let fresh = match p.seq {
+            Some((s, n)) => s != session || seq > n,
+            None => true,
+        };
+        if fresh {
+            p.seq = Some((session, seq));
+        }
+        fresh
+    }
+
+    pub fn own_cipher(&self) -> Option<PeerCipher> {
+        let inner = self.inner.read();
+        inner.peers[&inner.self_id].cipher.clone()
     }
 
     pub fn rtt_ms(&self, id: &PeerId) -> Option<f64> {

@@ -61,17 +61,18 @@ impl PeerCipher {
         PeerCipher(XChaCha20Poly1305::new(key.into()))
     }
 
-    fn aad(sender: &PeerId, recipient: &PeerId) -> [u8; 65] {
-        let mut aad = [0u8; 65];
+    /// The sender is not bound here: a packet must be decryptable before we know who sent it,
+    /// so that a peer whose NAT changed its port can be recognized (see `node` roaming).
+    fn aad(recipient: &PeerId) -> [u8; 33] {
+        let mut aad = [0u8; 33];
         aad[0] = SEALED;
-        aad[1..33].copy_from_slice(sender.as_bytes());
-        aad[33..].copy_from_slice(recipient.as_bytes());
+        aad[1..].copy_from_slice(recipient.as_bytes());
         aad
     }
 
     /// `buf[SEALED_HDR..SEALED_HDR + plain_len]` holds the plaintext; the header is written in
     /// front of it and the tag after it. `buf` needs `TAG_LEN` spare bytes. Returns packet length.
-    pub fn seal(&self, buf: &mut [u8], plain_len: usize, sender: &PeerId, recipient: &PeerId) -> usize {
+    pub fn seal(&self, buf: &mut [u8], plain_len: usize, recipient: &PeerId) -> usize {
         let nonce: [u8; 24] = random_bytes();
         buf[0] = SEALED;
         buf[1..SEALED_HDR].copy_from_slice(&nonce);
@@ -80,7 +81,7 @@ impl PeerCipher {
             .0
             .encrypt_inout_detached(
                 &XNonce::from(nonce),
-                &Self::aad(sender, recipient),
+                &Self::aad(recipient),
                 InOutBuf::from(&mut buf[SEALED_HDR..end]),
             )
             .expect("plaintext within AEAD limits");
@@ -89,7 +90,7 @@ impl PeerCipher {
     }
 
     /// Decrypts a SEALED packet in place, returning the plaintext range inside `packet`.
-    pub fn open(&self, packet: &mut [u8], sender: &PeerId, recipient: &PeerId) -> Option<Range<usize>> {
+    pub fn open(&self, packet: &mut [u8], recipient: &PeerId) -> Option<Range<usize>> {
         if packet.len() < SEALED_HDR + TAG_LEN || packet[0] != SEALED {
             return None;
         }
@@ -99,7 +100,7 @@ impl PeerCipher {
         self.0
             .decrypt_inout_detached(
                 &nonce,
-                &Self::aad(sender, recipient),
+                &Self::aad(recipient),
                 InOutBuf::from(&mut packet[SEALED_HDR..end]),
                 &tag,
             )
@@ -302,11 +303,11 @@ mod tests {
         let (a, b) = (PeerId::generate(), PeerId::generate());
         let mut buf = vec![0u8; 256];
         buf[SEALED_HDR..SEALED_HDR + 5].copy_from_slice(b"\x01data");
-        let n = c.seal(&mut buf, 5, &a, &b);
+        let n = c.seal(&mut buf, 5, &b);
         let mut pkt = buf[..n].to_vec();
-        let r = c.open(&mut pkt.clone(), &b, &a);
-        assert!(r.is_none(), "swapped sender/recipient must fail");
-        let r = c.open(&mut pkt, &a, &b).unwrap();
+        let r = c.open(&mut pkt.clone(), &a);
+        assert!(r.is_none(), "wrong recipient must fail");
+        let r = c.open(&mut pkt, &b).unwrap();
         assert_eq!(&pkt[r], b"\x01data");
     }
 
@@ -339,13 +340,13 @@ mod bench {
     #[ignore]
     fn bench_peer_cipher() {
         let c = PeerCipher::new(&random_bytes());
-        let (a, b) = (PeerId::generate(), PeerId::generate());
+        let b = PeerId::generate();
         let mut buf = vec![0u8; 2048];
         let n = 100_000;
         let t = std::time::Instant::now();
         for _ in 0..n {
-            let len = c.seal(&mut buf, 1400, &a, &b);
-            c.open(&mut buf[..len], &a, &b).unwrap();
+            let len = c.seal(&mut buf, 1400, &b);
+            c.open(&mut buf[..len], &b).unwrap();
         }
         let dt = t.elapsed().as_secs_f64();
         println!("rust: {:.0} pkt/s encrypt+decrypt, {:.2} Gbit/s", n as f64 / dt, n as f64 * 1400.0 * 8.0 / dt / 1e9);
