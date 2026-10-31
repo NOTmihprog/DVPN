@@ -130,7 +130,6 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             s.set_peer(b, PeerUpdate { addr: Some(Some(ip)), ..Default::default() }); // shared addr
-            s.set_peer(b, PeerUpdate { key: Some(Some("not a key".into())), ..Default::default() }); // bad key
             tx.send(()).unwrap();
         });
         rx.recv_timeout(Duration::from_secs(10)).expect("logging under the storage lock deadlocked");

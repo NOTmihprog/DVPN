@@ -24,8 +24,8 @@ use crate::crypto::encode_b64;
 use crate::identity::NodeId;
 use crate::logger::node;
 use crate::node::{ApiPacket, Node};
-use crate::proto::{MAX_DATAGRAM, ROUTE_API_MAX, ROUTE_API_MIN};
-use crate::storage::{Event, PeerRecord, PeerUpdate, ResolveError, normalize_key};
+use crate::proto::{KIND_API_MAX, KIND_API_MIN, MAX_DATAGRAM};
+use crate::storage::{Event, PeerRecord, PeerUpdate, ResolveError};
 
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const CONN_TIMEOUT: Duration = Duration::from_secs(45);
@@ -178,10 +178,6 @@ fn sub_args_value(rec: &PeerRecord) -> Value {
     rec.sub_args.as_ref().map_or(Value::Nil, |m| json_to_mp(&Json::Object(m.clone())))
 }
 
-fn crypto_value(rec: &PeerRecord) -> Value {
-    rec.key.as_ref().map_or(Value::Nil, |k| map(vec![("key", Value::from(k.as_str()))]))
-}
-
 fn event_value(e: &Event) -> Value {
     match e {
         Event::Peer { action, record, endpoint } => map(vec![
@@ -190,7 +186,6 @@ fn event_value(e: &Event) -> Value {
             ("name", opt_str(record.name.clone())),
             ("addr", opt_str(record.addr.map(|a| a.to_string()))),
             ("endpoint", addr_value(*endpoint)),
-            ("crypto", crypto_value(record)),
             ("sub_args", sub_args_value(record)),
         ]),
         Event::Server { addr, connected } => {
@@ -423,7 +418,6 @@ impl Api {
             "peer_exist" => peer.is_some_and(|id| storage.exists(&id)).into(),
             "peer_name" => opt_str(rec().and_then(|(r, _)| r.name)),
             "peer_addr" => opt_str(rec().and_then(|(r, _)| r.addr.map(|a| a.to_string()))),
-            "peer_crypto" => rec().map_or(Value::Nil, |(r, _)| crypto_value(&r)),
             "peer_sub_args" => rec().map_or(Value::Nil, |(r, _)| sub_args_value(&r)),
             "peer_sub_arg" => {
                 let arg = field(p, "arg").and_then(Value::as_str).unwrap_or_default();
@@ -432,8 +426,9 @@ impl Api {
             "peer_endpoint" => addr_value(rec().and_then(|(_, e)| e)),
             "peer_status" => rec().is_some_and(|(_, e)| e.is_some()).into(),
             "peer_ping" => peer.and_then(|id| storage.rtt_ms(&id)).unwrap_or(0.0).into(),
+            // Encryption is always on; this tells whether a Noise session is up.
             "peer_crypto_status" => {
-                if peer.is_some_and(|id| storage.has_cipher(&id)) { "xchacha20poly1305" } else { "no" }.into()
+                if peer.is_some_and(|id| self.node.links.current(&id).is_some()) { "noise_ikpsk2" } else { "no" }.into()
             }
             "servers" => Value::Array(self.node.clients.iter().map(|c| addr_value(Some(c.addr))).collect()),
             "server_status" => client().map_or(Value::Nil, |c| c.is_connected().into()),
@@ -485,17 +480,6 @@ impl Api {
                 None => return err("endpoint_validate_error"),
             },
         };
-        let key_val = field(p, "key").or_else(|| field(p, "crypto").and_then(|c| field(c, "key")));
-        if field(p, "crypto").is_some_and(|c| !c.is_map()) {
-            return err("crypto_not_dict");
-        }
-        let key = match key_val {
-            None => None,
-            Some(v) => match v.as_str().map(normalize_key) {
-                Some(Ok(k)) => Some(k),
-                _ => return err("key_validate_error"),
-            },
-        };
         let sub_args = match field(p, "sub_args") {
             None => None,
             Some(v) if v.is_map() => match mp_to_json(v) {
@@ -509,7 +493,6 @@ impl Api {
             PeerUpdate {
                 name: pick(name, force),
                 addr: pick(addr, force),
-                key: pick(key, force),
                 endpoint: pick(endpoint, force),
                 sub_args: pick(sub_args, force),
             },
@@ -540,7 +523,7 @@ impl Api {
         match field(p, "req").and_then(Value::as_str) {
             Some("reg") => {
                 let Some(r) = route else { return err("not_int") };
-                if !(ROUTE_API_MIN as u64..=ROUTE_API_MAX as u64).contains(&r) {
+                if !(KIND_API_MIN as u64..=KIND_API_MAX as u64).contains(&r) {
                     return err("out_of_range");
                 }
                 let r = r as u8;

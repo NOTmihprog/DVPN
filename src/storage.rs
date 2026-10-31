@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 
-use crate::crypto::{PeerCipher, decode_key32, encode_b64};
 use crate::identity::NodeId;
 use crate::logger::node;
 
@@ -23,22 +22,14 @@ pub struct PeerRecord {
     pub name: Option<String>,
     #[serde(default)]
     pub addr: Option<Ipv4Addr>,
-    /// 32 bytes base64. Packets sent *to* this peer are encrypted with it.
-    #[serde(default)]
-    pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_args: Option<Map<String, Value>>,
 }
 
 impl PeerRecord {
     pub fn new(peer_id: NodeId) -> Self {
-        PeerRecord { peer_id, name: None, addr: None, key: None, sub_args: None }
+        PeerRecord { peer_id, name: None, addr: None, sub_args: None }
     }
-}
-
-/// Validates and normalizes a base64 key to url-safe form.
-pub fn normalize_key(key: &str) -> anyhow::Result<String> {
-    Ok(encode_b64(&decode_key32(key)?))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +56,6 @@ impl std::error::Error for ResolveError {}
 pub struct PeerUpdate {
     pub name: Option<Option<String>>,
     pub addr: Option<Option<Ipv4Addr>>,
-    pub key: Option<Option<String>>,
     pub endpoint: Option<Option<SocketAddr>>,
     pub sub_args: Option<Option<Map<String, Value>>>,
 }
@@ -111,34 +101,13 @@ impl Link {
 
 struct Peer {
     rec: PeerRecord,
-    cipher: Option<PeerCipher>,
     endpoint: Option<SocketAddr>,
     link: Link,
-    /// Freshest (session, seq) seen in the peer's control packets; survives endpoint changes.
-    seq: Option<(u64, u64)>,
 }
 
 impl Peer {
     fn new(rec: PeerRecord) -> Self {
-        let mut p = Peer { rec, cipher: None, endpoint: None, link: Link::new(), seq: None };
-        p.load_cipher();
-        p
-    }
-
-    fn load_cipher(&mut self) {
-        self.cipher = match &self.rec.key {
-            None => None,
-            Some(k) => match decode_key32(k) {
-                Ok(k) => Some(PeerCipher::new(&k)),
-                Err(e) => {
-                    log::warn!(
-                        "PeerStorage | Peer {} key load error: {e}, encryption disabled",
-                        node(self.rec.peer_id)
-                    );
-                    None
-                }
-            },
-        };
+        Peer { rec, endpoint: None, link: Link::new() }
     }
 }
 
@@ -188,46 +157,28 @@ impl Inner {
 pub struct Route {
     pub peer_id: NodeId,
     pub endpoint: SocketAddr,
-    pub cipher: Option<PeerCipher>,
-}
-
-pub struct Inbound {
-    pub peer_id: NodeId,
-    pub peer_addr: Option<Ipv4Addr>,
-    pub own_cipher: Option<PeerCipher>,
 }
 
 /// Everything the packet path reads, rebuilt (under the write lock) whenever peers,
-/// addresses, keys or endpoints change, so per-packet lookups take no lock and clone no cipher.
+/// addresses or endpoints change, so per-packet lookups take no lock.
 #[derive(Default)]
 struct PacketView {
     by_addr: HashMap<Ipv4Addr, Arc<Route>>,
     by_id: HashMap<NodeId, Arc<Route>>,
-    by_endpoint: HashMap<SocketAddr, Arc<Inbound>>,
-    own_cipher: Option<PeerCipher>,
+    /// LAN address of each peer, for checking the source of packets it sends us.
+    addrs: HashMap<NodeId, Ipv4Addr>,
 }
 
 impl PacketView {
     fn build(inner: &Inner) -> Self {
-        let own_cipher = inner.peers[&inner.self_id].cipher.clone();
         let by_id: HashMap<NodeId, Arc<Route>> = inner
             .peers
             .iter()
-            .filter_map(|(id, p)| {
-                let endpoint = p.endpoint?;
-                Some((*id, Arc::new(Route { peer_id: *id, endpoint, cipher: p.cipher.clone() })))
-            })
+            .filter_map(|(id, p)| Some((*id, Arc::new(Route { peer_id: *id, endpoint: p.endpoint? }))))
             .collect();
         let by_addr = inner.by_addr.iter().filter_map(|(a, id)| Some((*a, by_id.get(id)?.clone()))).collect();
-        let by_endpoint = inner
-            .by_endpoint
-            .iter()
-            .map(|(ep, id)| {
-                let inb = Inbound { peer_id: *id, peer_addr: inner.peers[id].rec.addr, own_cipher: own_cipher.clone() };
-                (*ep, Arc::new(inb))
-            })
-            .collect();
-        PacketView { by_addr, by_id, by_endpoint, own_cipher }
+        let addrs = inner.peers.iter().filter_map(|(id, p)| Some((*id, p.rec.addr?))).collect();
+        PacketView { by_addr, by_id, addrs }
     }
 }
 
@@ -317,7 +268,7 @@ impl PeerStorage {
     }
 
     pub fn set_peer(&self, id: NodeId, u: PeerUpdate) {
-        let persist = u.name.is_some() || u.addr.is_some() || u.key.is_some() || u.sub_args.is_some();
+        let persist = u.name.is_some() || u.addr.is_some() || u.sub_args.is_some();
         let event = {
             let mut inner = self.inner.write();
             let action = if inner.peers.contains_key(&id) {
@@ -333,10 +284,6 @@ impl PeerStorage {
             }
             if let Some(sub_args) = u.sub_args {
                 p.rec.sub_args = sub_args;
-            }
-            if let Some(key) = u.key {
-                p.rec.key = key;
-                p.load_cipher();
             }
             let addr_changed = u.addr.is_some_and(|a| a != p.rec.addr);
             if let Some(addr) = u.addr {
@@ -421,10 +368,6 @@ impl PeerStorage {
         self.inner.read().peers.get(id).and_then(|p| p.endpoint)
     }
 
-    pub fn has_cipher(&self, id: &NodeId) -> bool {
-        self.inner.read().peers.get(id).is_some_and(|p| p.cipher.is_some())
-    }
-
     /// A full node key (known or not), or a prefix that matches exactly one known key.
     /// The prefix may use the standard base64 alphabet (`+/`) too.
     pub fn resolve(&self, s: &str) -> Result<NodeId, ResolveError> {
@@ -479,24 +422,6 @@ impl PeerStorage {
             .is_some_and(|p| p.endpoint.is_some() && p.link.last_seen.is_some_and(|t| t.elapsed() < within))
     }
 
-    /// Records a control packet's (session, seq); false if it is not newer than what we saw (replay).
-    pub fn accept_seq(&self, id: &NodeId, session: u64, seq: u64) -> bool {
-        let mut inner = self.inner.write();
-        let Some(p) = inner.peers.get_mut(id) else { return false };
-        let fresh = match p.seq {
-            Some((s, n)) => s != session || seq > n,
-            None => true,
-        };
-        if fresh {
-            p.seq = Some((session, seq));
-        }
-        fresh
-    }
-
-    pub fn own_cipher(&self) -> Option<PeerCipher> {
-        self.view.load().own_cipher.clone()
-    }
-
     pub fn rtt_ms(&self, id: &NodeId) -> Option<f64> {
         self.inner.read().peers.get(id).and_then(|p| p.endpoint.and(p.link.rtt_ms))
     }
@@ -511,16 +436,15 @@ impl PeerStorage {
         self.view.load().by_id.get(id).cloned()
     }
 
-    /// For a datagram from `from`: who sent it and our own cipher (if we require encryption).
-    pub fn inbound(&self, from: &SocketAddr) -> Option<Arc<Inbound>> {
-        self.view.load().by_endpoint.get(from).cloned()
+    /// The LAN address `id` may send from.
+    pub fn peer_addr(&self, id: &NodeId) -> Option<Ipv4Addr> {
+        self.view.load().addrs.get(id).copied()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::generate_key;
 
     #[test]
     fn set_and_route() {
@@ -529,16 +453,15 @@ mod tests {
         let other = NodeId::random();
         let ip = Ipv4Addr::new(10, 0, 0, 2);
         let ep: SocketAddr = "1.2.3.4:5000".parse().unwrap();
-        s.set_peer(other, PeerUpdate { addr: Some(Some(ip)), key: Some(Some(generate_key())), ..Default::default() });
+        s.set_peer(other, PeerUpdate { addr: Some(Some(ip)), ..Default::default() });
         assert!(s.route_by_addr(ip).is_none(), "no endpoint yet");
+        assert_eq!(s.peer_addr(&other), Some(ip), "the address is known without an endpoint");
         s.set_peer(other, PeerUpdate { endpoint: Some(Some(ep)), ..Default::default() });
         let r = s.route_by_addr(ip).unwrap();
-        assert_eq!(r.peer_id, other);
-        assert!(r.cipher.is_some());
-        assert_eq!(s.inbound(&ep).unwrap().peer_id, other);
+        assert_eq!((r.peer_id, r.endpoint), (other, ep));
 
         s.del_endpoint(&other);
-        assert!(s.inbound(&ep).is_none());
+        assert!(s.route_by_id(&other).is_none());
         assert_eq!(s.others(), vec![other]);
         assert!(s.del_peer(&other));
         assert!(s.route_by_addr(ip).is_none());
@@ -552,22 +475,18 @@ mod tests {
         let (ip, ip2) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
         let ep: SocketAddr = "1.2.3.4:5000".parse().unwrap();
         s.set_peer(other, PeerUpdate { addr: Some(Some(ip)), endpoint: Some(Some(ep)), ..Default::default() });
-        assert!(s.route_by_addr(ip).unwrap().cipher.is_none());
-
-        s.set_peer(other, PeerUpdate { key: Some(Some(generate_key())), ..Default::default() });
-        assert!(s.route_by_addr(ip).unwrap().cipher.is_some(), "key change must reach the view");
+        assert!(s.route_by_addr(ip).is_some());
 
         s.set_peer(other, PeerUpdate { addr: Some(Some(ip2)), ..Default::default() });
         assert!(s.route_by_addr(ip).is_none());
-        assert_eq!(s.inbound(&ep).unwrap().peer_addr, Some(ip2));
+        assert_eq!(s.route_by_addr(ip2).unwrap().peer_id, other);
+        assert_eq!(s.peer_addr(&other), Some(ip2));
 
-        assert!(s.own_cipher().is_none() && s.inbound(&ep).unwrap().own_cipher.is_none());
-        s.set_peer(me, PeerUpdate { key: Some(Some(generate_key())), ..Default::default() });
-        assert!(s.own_cipher().is_some() && s.inbound(&ep).unwrap().own_cipher.is_some());
-
-        assert!(s.route_by_id(&other).is_some());
+        let ep2: SocketAddr = "5.6.7.8:9000".parse().unwrap();
+        s.set_peer(other, PeerUpdate { endpoint: Some(Some(ep2)), ..Default::default() });
+        assert_eq!(s.route_by_id(&other).unwrap().endpoint, ep2, "roaming reaches the view");
         s.del_endpoint(&other);
-        assert!(s.route_by_id(&other).is_none() && s.inbound(&ep).is_none());
+        assert!(s.route_by_id(&other).is_none() && s.route_by_addr(ip2).is_none());
     }
 
     #[test]
@@ -608,44 +527,36 @@ mod tests {
         let ep: SocketAddr = "1.2.3.4:5000".parse().unwrap();
         s.set_peer(a, PeerUpdate { endpoint: Some(Some(ep)), ..Default::default() });
         s.set_peer(b, PeerUpdate { endpoint: Some(Some(ep)), ..Default::default() });
-        assert_eq!(s.inbound(&ep).unwrap().peer_id, b);
-        assert!(s.endpoint(&a).is_none());
+        assert_eq!(s.route_by_id(&b).unwrap().endpoint, ep);
+        assert!(s.endpoint(&a).is_none() && s.route_by_id(&a).is_none());
     }
 }
 
 #[cfg(test)]
 mod bench {
     use super::*;
-    use crate::crypto::generate_key;
 
-    fn populated(n: u8) -> (Arc<PeerStorage>, Vec<Ipv4Addr>, Vec<SocketAddr>) {
+    fn populated(n: u8) -> (Arc<PeerStorage>, Vec<Ipv4Addr>, Vec<NodeId>) {
         let s = Arc::new(PeerStorage::load(NodeId::random(), None).unwrap());
-        let (mut ips, mut eps) = (Vec::new(), Vec::new());
+        let (mut ips, mut ids) = (Vec::new(), Vec::new());
         for i in 0..n {
             let ip = Ipv4Addr::new(10, 0, 0, i + 2);
             let ep: SocketAddr = format!("192.0.2.{}:{}", i + 1, 5000 + i as u16).parse().unwrap();
-            s.set_peer(
-                NodeId::random(),
-                PeerUpdate {
-                    addr: Some(Some(ip)),
-                    key: Some(Some(generate_key())),
-                    endpoint: Some(Some(ep)),
-                    ..Default::default()
-                },
-            );
+            let id = NodeId::random();
+            s.set_peer(id, PeerUpdate { addr: Some(Some(ip)), endpoint: Some(Some(ep)), ..Default::default() });
             ips.push(ip);
-            eps.push(ep);
+            ids.push(id);
         }
-        (s, ips, eps)
+        (s, ips, ids)
     }
 
-    /// Hot-path lookups: `route_by_addr` (TUN -> net) and `inbound` (net -> TUN).
+    /// Hot-path lookups: `route_by_addr` (TUN -> net) and `peer_addr` (net -> TUN source check).
     /// Run: cargo test --release storage::bench -- --ignored --nocapture
     #[test]
     #[ignore]
     fn bench_route_lookup() {
         const N: usize = 2_000_000;
-        let (s, ips, eps) = populated(64);
+        let (s, ips, ids) = populated(64);
 
         let t = std::time::Instant::now();
         for i in 0..N {
@@ -656,10 +567,10 @@ mod bench {
 
         let t = std::time::Instant::now();
         for i in 0..N {
-            assert!(s.inbound(&eps[i % eps.len()]).is_some());
+            assert!(s.peer_addr(&ids[i % ids.len()]).is_some());
         }
         let inb = t.elapsed().as_secs_f64();
-        println!("inbound,       1 thread : {:6.1} ns/lookup", inb * 1e9 / N as f64);
+        println!("peer_addr,     1 thread : {:6.1} ns/lookup", inb * 1e9 / N as f64);
 
         // 4 readers while a writer keeps moving one endpoint (roaming / tracker updates).
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));

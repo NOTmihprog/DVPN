@@ -1,24 +1,17 @@
-use std::ops::Range;
-
 use anyhow::{Context, bail};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use chacha20poly1305::aead::inout::InOutBuf;
-use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, KeyInit, Nonce, Tag, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, KeyInit, Nonce, Tag};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::identity::NodeId;
-use crate::proto::{
-    ANNOUNCE_SIG_CTX, HELLO, HELLO_ACK, HELLO_ACK_LEN, HELLO_LEN, HELLO_SIG_CTX, KEYS_CTX, SEALED, TRACKER,
-};
+use crate::proto::{ANNOUNCE_SIG_CTX, HELLO, HELLO_ACK, HELLO_ACK_LEN, HELLO_LEN, HELLO_SIG_CTX, KEYS_CTX, TRACKER};
 use crate::replay::ReplayWindow;
 
-pub const TAG_LEN: usize = 16;
-/// `[SEALED][nonce 24]`
-pub const SEALED_HDR: usize = 1 + 24;
+const TAG_LEN: usize = 16;
 /// `[TRACKER][counter 8]`
 const TRACKER_HDR: usize = 1 + 8;
 
@@ -46,63 +39,6 @@ pub fn decode_key32(s: &str) -> anyhow::Result<[u8; 32]> {
 /// Canonical text form of keys and blobs everywhere (PLAN §3): base64url without padding.
 pub fn encode_b64(b: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(b)
-}
-
-pub fn generate_key() -> String {
-    encode_b64(&random_bytes::<32>())
-}
-
-/// Per-peer symmetric key. Everyone who sends to a peer encrypts with that peer's key, so
-/// nonces are random (XChaCha, 24 bytes) rather than counters that several senders could reuse.
-#[derive(Clone)]
-pub struct PeerCipher(XChaCha20Poly1305);
-
-impl PeerCipher {
-    pub fn new(key: &[u8; 32]) -> Self {
-        PeerCipher(XChaCha20Poly1305::new(key.into()))
-    }
-
-    /// The sender is not bound here: a packet must be decryptable before we know who sent it,
-    /// so that a peer whose NAT changed its port can be recognized (see `node` roaming).
-    fn aad(recipient: &NodeId) -> [u8; 33] {
-        let mut aad = [0u8; 33];
-        aad[0] = SEALED;
-        aad[1..].copy_from_slice(recipient.as_bytes());
-        aad
-    }
-
-    /// `buf[SEALED_HDR..SEALED_HDR + plain_len]` holds the plaintext; the header is written in
-    /// front of it and the tag after it. `buf` needs `TAG_LEN` spare bytes. Returns packet length.
-    pub fn seal(&self, buf: &mut [u8], plain_len: usize, recipient: &NodeId) -> usize {
-        let nonce: [u8; 24] = random_bytes();
-        buf[0] = SEALED;
-        buf[1..SEALED_HDR].copy_from_slice(&nonce);
-        let end = SEALED_HDR + plain_len;
-        let tag = self
-            .0
-            .encrypt_inout_detached(
-                &XNonce::from(nonce),
-                &Self::aad(recipient),
-                InOutBuf::from(&mut buf[SEALED_HDR..end]),
-            )
-            .expect("plaintext within AEAD limits");
-        buf[end..end + TAG_LEN].copy_from_slice(&tag);
-        end + TAG_LEN
-    }
-
-    /// Decrypts a SEALED packet in place, returning the plaintext range inside `packet`.
-    pub fn open(&self, packet: &mut [u8], recipient: &NodeId) -> Option<Range<usize>> {
-        if packet.len() < SEALED_HDR + TAG_LEN || packet[0] != SEALED {
-            return None;
-        }
-        let end = packet.len() - TAG_LEN;
-        let nonce = XNonce::try_from(&packet[1..SEALED_HDR]).ok()?;
-        let tag = Tag::try_from(&packet[end..]).ok()?;
-        self.0
-            .decrypt_inout_detached(&nonce, &Self::aad(recipient), InOutBuf::from(&mut packet[SEALED_HDR..end]), &tag)
-            .ok()?;
-        Some(SEALED_HDR..end)
-    }
 }
 
 /// An established tracker session. Each direction has its own key, so plain counters are safe nonces.
@@ -280,20 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn peer_seal_open() {
-        let c = PeerCipher::new(&random_bytes());
-        let (a, b) = (NodeId::random(), NodeId::random());
-        let mut buf = vec![0u8; 256];
-        buf[SEALED_HDR..SEALED_HDR + 5].copy_from_slice(b"\x01data");
-        let n = c.seal(&mut buf, 5, &b);
-        let mut pkt = buf[..n].to_vec();
-        let r = c.open(&mut pkt.clone(), &a);
-        assert!(r.is_none(), "wrong recipient must fail");
-        let r = c.open(&mut pkt, &b).unwrap();
-        assert_eq!(&pkt[r], b"\x01data");
-    }
-
-    #[test]
     fn b64_variants() {
         let k = random_bytes::<32>();
         let text = encode_b64(&k);
@@ -303,26 +225,5 @@ mod tests {
         // older forms keep parsing: padded url-safe (v3 configs) and standard
         assert_eq!(decode_key32(&URL_SAFE.encode(k)).unwrap(), k);
         assert_eq!(decode_key32(&STANDARD.encode(k)).unwrap(), k);
-    }
-}
-
-#[cfg(test)]
-mod bench {
-    use super::*;
-
-    #[test]
-    #[ignore]
-    fn bench_peer_cipher() {
-        let c = PeerCipher::new(&random_bytes());
-        let b = NodeId::random();
-        let mut buf = vec![0u8; 2048];
-        let n = 100_000;
-        let t = std::time::Instant::now();
-        for _ in 0..n {
-            let len = c.seal(&mut buf, 1400, &b);
-            c.open(&mut buf[..len], &b).unwrap();
-        }
-        let dt = t.elapsed().as_secs_f64();
-        println!("rust: {:.0} pkt/s encrypt+decrypt, {:.2} Gbit/s", n as f64 / dt, n as f64 * 1400.0 * 8.0 / dt / 1e9);
     }
 }

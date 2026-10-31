@@ -115,8 +115,9 @@ TKEY=$(sed -n 's/^public_key = "\(.*\)"/\1/p' trk/config.toml)
 ok "tracker up"
 
 # ---- nodes ----------------------------------------------------------------------------
-# setup NAME OVERLAY_ADDR: config with the tracker, own address and key, export own record.
+# setup NAME OVERLAY_ADDR: config with the tracker and the group psk, own address, export own record.
 # Every command gets --dir, otherwise dvpn would write config.toml next to the binary.
+PSK=$("$D" --dir "$W/trk" gen-key)
 setup() {
     mkdir "$1"
     "$D" --dir "$W/$1" list >/dev/null
@@ -126,10 +127,13 @@ setup() {
 addr = "203.0.113.1"
 port = 6485
 key = "$TKEY"
+
+[group]
+psk = "$PSK"
 TOML
     key=$("$D" --dir "$W/$1" show-key)
     [ ${#key} -eq 43 ] || fail "$1: show-key printed '$key', want a 43-char key"
-    "$D" --dir "$W/$1" set -p "$key" -n "$1" -a "$2" -k "$("$D" --dir "$W/$1" gen-key)" >/dev/null
+    "$D" --dir "$W/$1" set -p "$key" -n "$1" -a "$2" >/dev/null
     "$D" --dir "$W/$1" export-peer -o "$W/$1.peer"
 }
 setup a 10.10.33.1
@@ -189,5 +193,15 @@ if command -v iperf3 >/dev/null; then
 else
     echo "skip: iperf3 not found"
 fi
+
+# Roaming: nat1 gets a new public address, so A's packets suddenly come from elsewhere
+# (removing the address also drops nat1's masquerade mappings). C must follow A to the new
+# endpoint on the first authenticated packet, without waiting for the tracker.
+nsx nat1 ip addr add 203.0.113.13/24 dev wan0
+nsx nat1 ip addr del 203.0.113.11/24 dev wan0
+wait_for 10 nsx a ping -c1 -W1 10.10.33.3 || fail "a -> c lost after nat1 changed its address"
+grep -q 'at new endpoint 203.0.113.13:' "$W/node-c.log" || fail "c did not roam to a's new endpoint"
+nsx a ping -c3 -i0.2 -W1 10.10.33.3 >/dev/null || fail "a -> c: packet loss after roaming"
+ok "a <-> c survives a NAT address change (roaming)"
 
 echo "PASS"

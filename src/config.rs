@@ -9,6 +9,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::crypto::{decode_b64, decode_key32, encode_b64};
 use crate::identity::Identity;
+use crate::link::Group;
 
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const PEERS_FILE_NAME: &str = "peers.json";
@@ -49,6 +50,11 @@ addr = "{addr}"
 # netmask as "255.255.255.0" or prefix length "24"
 mask = "255.255.255.0"
 
+# Shared by every node of the network; without it sessions cannot be established.
+# Generate once with `dvpn gen-key` and copy to all nodes. (Real groups with invites: stage 3.)
+# [group]
+# psk = "..."
+
 [app]
 # Log Levels DEBUG, INFO, WARNING, ERROR, CRITICAL
 log_level = "INFO"
@@ -76,6 +82,8 @@ pub struct Config {
     path: PathBuf,
     doc: DocumentMut,
     pub identity: Identity,
+    /// `[group] psk`, set by hand until real groups (stage 3).
+    pub group: Option<Group>,
     pub peer: PeerConfig,
     pub net: Option<NetConfig>,
     pub servers: Vec<ServerConfig>,
@@ -257,7 +265,15 @@ impl Config {
             None => None,
         };
 
-        Ok(Config { path, doc, identity, peer, net, servers, log_level, local_server_key })
+        let group = match section(&doc, "group").and_then(|t| t.get("psk")) {
+            Some(item) => {
+                let s = item.as_str().ok_or_else(|| anyhow!("[group] psk is not a string in {file}"))?;
+                Some(Group::from_psk(decode_key32(s).map_err(|e| anyhow!("[group] psk: {e} in {file}"))?))
+            }
+            None => None,
+        };
+
+        Ok(Config { path, doc, identity, group, peer, net, servers, log_level, local_server_key })
     }
 
     pub fn set_net_addr(&mut self, addr: Ipv4Addr) {

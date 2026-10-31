@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -8,45 +7,25 @@ use rand::RngExt;
 use tokio::sync::mpsc;
 use tun_rs::AsyncDevice;
 
-use crate::crypto::{SEALED_HDR, TAG_LEN};
 use crate::identity::NodeId;
+use crate::link::{Links, Received};
 use crate::logger::node;
+use crate::noise::TAG_LEN;
 use crate::packet::{self, IpInfo};
 use crate::proto::{
-    CONTROL_LEN, CONTROL_PING, CONTROL_PONG, HELLO_ACK, MAX_DATAGRAM, PLAIN, ROAM_MAX_LEN, ROUTE_API_MIN,
-    ROUTE_CONTROL, ROUTE_NET, SEALED, TRACKER,
+    CONTROL_LEN, CONTROL_PING, CONTROL_PONG, DATA, DATA_HDR, HELLO_ACK, HS_INIT, HS_RESP, KIND_API_MIN, KIND_CONTROL,
+    KIND_IP, MAX_DATAGRAM, TRACKER,
 };
-use crate::storage::{Event, PeerStorage, PeerUpdate, Route};
+use crate::storage::{Event, PeerStorage, PeerUpdate};
 use crate::tracker_client::{Output, TrackerClient};
 use crate::transport::Transport;
 
+/// While there is no session, a handshake is sent this often (it also punches NATs).
 const PUNCH_INTERVAL: Duration = Duration::from_secs(1);
+/// Retry interval for a rekey handshake while the old session still works.
+const REKEY_RETRY: Duration = Duration::from_secs(5);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const LINK_TIMEOUT: Duration = Duration::from_secs(45);
-
-struct Control {
-    kind: u8,
-    echo_ts: u64,
-    session: u64,
-    seq: u64,
-    sender: NodeId,
-}
-
-impl Control {
-    fn parse(p: &[u8]) -> Option<Self> {
-        if p.len() < CONTROL_LEN {
-            return None;
-        }
-        let u64_at = |i: usize| u64::from_le_bytes(p[i..i + 8].try_into().unwrap());
-        Some(Control {
-            kind: p[0],
-            echo_ts: u64_at(1),
-            session: u64_at(9),
-            seq: u64_at(17),
-            sender: NodeId::try_from(&p[25..CONTROL_LEN]).ok()?,
-        })
-    }
-}
 
 /// A packet for an API client: (route, from peer, payload).
 pub type ApiPacket = (u8, NodeId, Vec<u8>);
@@ -54,34 +33,20 @@ pub type ApiPacket = (u8, NodeId, Vec<u8>);
 pub struct Node {
     pub storage: Arc<PeerStorage>,
     pub transport: Arc<Transport>,
+    pub links: Links,
     pub clients: Vec<Arc<TrackerClient>>,
     clients_by_addr: HashMap<SocketAddr, Arc<TrackerClient>>,
     tun: Option<Arc<AsyncDevice>>,
-    self_id: NodeId,
     self_addr: Option<Ipv4Addr>,
     api_tx: OnceLock<mpsc::Sender<ApiPacket>>,
     epoch: Instant,
-    /// Identifies this run in control packets; with `seq` it makes them replay-detectable.
-    session: u64,
-    seq: AtomicU64,
-}
-
-/// Frames `buf[SEALED_HDR..SEALED_HDR + plain_len]` (route byte + payload) for `route`,
-/// returning the range of `buf` to put on the wire.
-fn frame(buf: &mut [u8], plain_len: usize, route: &Route) -> std::ops::Range<usize> {
-    match &route.cipher {
-        Some(c) => 0..c.seal(buf, plain_len, &route.peer_id),
-        None => {
-            buf[SEALED_HDR - 1] = PLAIN;
-            SEALED_HDR - 1..SEALED_HDR + plain_len
-        }
-    }
 }
 
 impl Node {
     pub fn new(
         storage: Arc<PeerStorage>,
         transport: Arc<Transport>,
+        links: Links,
         clients: Vec<TrackerClient>,
         tun: Option<AsyncDevice>,
         self_addr: Option<Ipv4Addr>,
@@ -89,17 +54,15 @@ impl Node {
         let clients: Vec<_> = clients.into_iter().map(Arc::new).collect();
         let clients_by_addr = clients.iter().map(|c| (c.addr, c.clone())).collect();
         Arc::new(Node {
-            self_id: storage.self_id(),
             storage,
             transport,
+            links,
             clients,
             clients_by_addr,
             tun: tun.map(Arc::new),
             self_addr,
             api_tx: OnceLock::new(),
             epoch: Instant::now(),
-            session: rand::random(),
-            seq: AtomicU64::new(1),
         })
     }
 
@@ -113,22 +76,40 @@ impl Node {
 
     pub fn start(self: &Arc<Self>) {
         tokio::spawn(self.clone().udp_loop());
-        tokio::spawn(self.clone().ping_loop());
+        tokio::spawn(self.clone().link_loop());
         tokio::spawn(self.clone().tracker_loop());
         if self.tun.is_some() {
             tokio::spawn(self.clone().tun_loop());
         }
     }
 
-    /// Sends `payload` on `route` to a peer with a known endpoint. Not for the TUN hot path.
-    pub async fn send_routed(&self, peer_id: &NodeId, route: u8, payload: &[u8]) -> bool {
-        let Some(r) = self.storage.route_by_id(peer_id) else { return false };
-        let mut buf = vec![0u8; SEALED_HDR + 1 + payload.len() + TAG_LEN];
-        buf[SEALED_HDR] = route;
-        buf[SEALED_HDR + 1..SEALED_HDR + 1 + payload.len()].copy_from_slice(payload);
-        let range = frame(&mut buf, 1 + payload.len(), &r);
-        self.transport.send_to(&buf[range], r.endpoint).await;
+    /// Sends a handshake to `peer`'s endpoint unless one went out less than `min_interval` ago.
+    async fn handshake(&self, peer: NodeId, min_interval: Duration) {
+        let Some(route) = self.storage.route_by_id(&peer) else { return };
+        if let Some(p) = self.links.initiate(peer, min_interval) {
+            log::debug!("Link | handshake to {}", node(peer));
+            self.transport.send_to(&p, route.endpoint).await;
+        }
+    }
+
+    /// Sends `[kind][body]` to `peer` over its session. Not for the TUN hot path.
+    pub async fn send_kind(&self, peer: &NodeId, kind: u8, body: &[u8]) -> bool {
+        let Some(route) = self.storage.route_by_id(peer) else { return false };
+        let Some(session) = self.links.current(peer) else {
+            self.handshake(*peer, PUNCH_INTERVAL).await;
+            return false;
+        };
+        let mut buf = vec![0u8; DATA_HDR + 1 + body.len() + TAG_LEN];
+        buf[DATA_HDR] = kind;
+        buf[DATA_HDR + 1..DATA_HDR + 1 + body.len()].copy_from_slice(body);
+        let Some(len) = session.seal(&mut buf, 1 + body.len()) else { return false };
+        self.transport.send_to(&buf[..len], route.endpoint).await;
         true
+    }
+
+    /// For API clients: `payload` on API route `route` (32..=255).
+    pub async fn send_routed(&self, peer: &NodeId, route: u8, payload: &[u8]) -> bool {
+        self.send_kind(peer, route, payload).await
     }
 
     async fn send_tracker(&self, client: &TrackerClient, out: Output) {
@@ -154,60 +135,68 @@ impl Node {
         }
     }
 
-    fn control_payload(&self, kind: u8, echo_ts: u64) -> Vec<u8> {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+    /// Control body (after the kind byte): `[PING|PONG][echo_ts u64][random padding]`.
+    fn control(sub: u8, echo_ts: u64) -> Vec<u8> {
         // Random padding so keepalives don't all have the same size on the wire.
         let pad = rand::rng().random_range(16..96);
-        let mut p = Vec::with_capacity(CONTROL_LEN + pad);
-        p.push(kind);
+        let len = CONTROL_LEN - 1;
+        let mut p = Vec::with_capacity(len + pad);
+        p.push(sub);
         p.extend_from_slice(&echo_ts.to_le_bytes());
-        p.extend_from_slice(&self.session.to_le_bytes());
-        p.extend_from_slice(&seq.to_le_bytes());
-        p.extend_from_slice(self.self_id.as_bytes());
-        p.resize(CONTROL_LEN + pad, 0);
-        rand::fill(&mut p[CONTROL_LEN..]);
+        p.resize(len + pad, 0);
+        rand::fill(&mut p[len..]);
         p
     }
 
-    async fn ping_loop(self: Arc<Self>) {
+    async fn send_ping(&self, peer: NodeId) {
+        let ts = self.epoch.elapsed().as_nanos() as u64;
+        if self.send_kind(&peer, KIND_CONTROL, &Self::control(CONTROL_PING, ts)).await {
+            self.storage.update_link(&peer, |l| l.last_ping = Some(Instant::now()));
+            log::debug!("Ping | send ping to peer {}", node(peer));
+        }
+    }
+
+    /// Once a second: link timeouts, handshakes (first contact, NAT punching, rekeying) and
+    /// keepalive pings that also measure RTT.
+    async fn link_loop(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tick.tick().await;
+            self.links.expire();
             for (id, link) in self.storage.links() {
                 if link.last_seen.unwrap_or(link.since).elapsed() > LINK_TIMEOUT {
-                    log::info!("Ping | peer {} link timeout, endpoint dropped", node(id));
+                    log::info!("Link | peer {} timed out, endpoint dropped", node(id));
                     self.storage.del_endpoint(&id);
+                    self.links.drop_peer(&id);
                     continue;
                 }
-                // Until the first reply we are punching through NATs, so ping often.
-                let interval = if link.last_seen.is_some() { KEEPALIVE_INTERVAL } else { PUNCH_INTERVAL };
-                if link.last_ping.is_some_and(|t| t.elapsed() < interval) {
-                    continue;
+                let has_session = self.links.current(&id).is_some();
+                if self.links.needs_handshake(&id) {
+                    self.handshake(id, if has_session { REKEY_RETRY } else { PUNCH_INTERVAL }).await;
                 }
-                let ts = self.epoch.elapsed().as_nanos() as u64;
-                if self.send_routed(&id, ROUTE_CONTROL, &self.control_payload(CONTROL_PING, ts)).await {
-                    self.storage.update_link(&id, |l| l.last_ping = Some(Instant::now()));
-                    log::debug!("Ping | send ping to peer {}", node(id));
+                if has_session && link.last_ping.is_none_or(|t| t.elapsed() >= KEEPALIVE_INTERVAL) {
+                    self.send_ping(id).await;
                 }
             }
         }
     }
 
-    async fn handle_control(&self, peer: NodeId, c: Control) {
-        match c.kind {
+    async fn handle_control(&self, peer: NodeId, c: &[u8]) {
+        if c.len() < CONTROL_LEN - 1 {
+            return;
+        }
+        let echo_ts = u64::from_le_bytes(c[1..9].try_into().unwrap());
+        self.storage.update_link(&peer, |l| l.last_seen = Some(Instant::now()));
+        match c[0] {
             CONTROL_PING => {
-                self.storage.update_link(&peer, |l| l.last_seen = Some(Instant::now()));
-                self.send_routed(&peer, ROUTE_CONTROL, &self.control_payload(CONTROL_PONG, c.echo_ts)).await;
+                self.send_kind(&peer, KIND_CONTROL, &Self::control(CONTROL_PONG, echo_ts)).await;
                 log::debug!("Ping | receive ping from {}", node(peer));
             }
             CONTROL_PONG => {
                 let now = self.epoch.elapsed().as_nanos() as u64;
-                let Some(rtt) = now.checked_sub(c.echo_ts) else { return };
+                let Some(rtt) = now.checked_sub(echo_ts) else { return };
                 let ms = rtt as f64 / 1e6;
-                self.storage.update_link(&peer, |l| {
-                    l.last_seen = Some(Instant::now());
-                    l.rtt_ms = Some(ms);
-                });
+                self.storage.update_link(&peer, |l| l.rtt_ms = Some(ms));
                 self.storage.emit(Event::Ping { peer_id: peer, ms });
                 log::debug!("Ping | receive pong from {} ping: {ms:.3}", node(peer));
             }
@@ -229,99 +218,74 @@ impl Node {
                         self.send_tracker(c, out).await;
                     }
                 }
-                SEALED | PLAIN => self.handle_peer_packet(&mut buf[..n], from).await,
+                HS_INIT | HS_RESP | DATA => self.handle_peer_packet(&mut buf[..n], from).await,
                 _ => {}
             }
         }
     }
 
-    async fn handle_peer_packet(&self, packet: &mut [u8], from: SocketAddr) {
-        let known = self.storage.inbound(&from);
-        let roam_cipher;
-        let own_cipher = match &known {
-            Some(inb) => inb.own_cipher.as_ref(),
-            // Unknown address: maybe a peer whose NAT gave it a new port. Only small (control)
-            // packets are worth a decryption attempt.
-            None if packet.len() <= ROAM_MAX_LEN => {
-                roam_cipher = self.storage.own_cipher();
-                roam_cipher.as_ref()
-            }
-            None => return,
-        };
-        let range = match (own_cipher, packet[0]) {
-            (Some(c), SEALED) => match c.open(packet, &self.self_id) {
-                Some(r) => r,
-                None => {
-                    if known.is_some() {
-                        log::debug!("Peer | packet from {from} decrypt error");
-                    }
-                    return;
-                }
-            },
-            (None, PLAIN) => 1..packet.len(),
-            _ => {
-                log::debug!("Peer | packet from {from} encryption mismatch");
-                return;
-            }
-        };
-        if range.is_empty() {
-            return;
+    /// The peer proved its identity with a packet from `from`: that is where it is now
+    /// (roaming, NAT port change). Unauthenticated packets never move an endpoint.
+    fn roam(&self, peer: NodeId, from: SocketAddr) {
+        if self.storage.route_by_id(&peer).map(|r| r.endpoint) != Some(from) {
+            log::info!("Link | peer {} at new endpoint {from}", node(peer));
+            self.storage.set_peer(peer, PeerUpdate { endpoint: Some(Some(from)), ..Default::default() });
         }
-        let route = packet[range.start];
-        let payload = &packet[range.start + 1..range.end];
+    }
 
-        let Some(inb) = known else {
-            let Some(c) = Control::parse(payload).filter(|_| route == ROUTE_CONTROL) else { return };
-            if c.sender == self.self_id || !self.storage.exists(&c.sender) {
-                return;
-            }
-            if !self.storage.accept_seq(&c.sender, c.session, c.seq) {
-                log::debug!("Peer | replayed control packet from {from} dropped");
-                return;
-            }
-            log::info!("Peer | Peer {} new endpoint {from} (roaming)", node(c.sender));
-            self.storage.set_peer(c.sender, PeerUpdate { endpoint: Some(Some(from)), ..Default::default() });
-            self.handle_control(c.sender, c).await;
-            return;
-        };
-
-        match route {
-            ROUTE_NET => {
-                let Some(tun) = &self.tun else { return };
-                // A peer may only inject packets from its own LAN address.
-                let from_peer = matches!(
-                    packet::parse(payload),
-                    Some(IpInfo { src: IpAddr::V4(src), .. }) if inb.peer_addr == Some(src)
-                );
-                if !from_peer {
-                    log::debug!("Peer | packet from {} with foreign source dropped", node(inb.peer_id));
-                    return;
-                }
-                if let Err(e) = tun.send(payload).await {
-                    log::warn!("TUN | write error: {e}");
+    async fn handle_peer_packet(&self, packet: &mut [u8], from: SocketAddr) {
+        let storage = &self.storage;
+        match self.links.receive(packet, || storage.others()) {
+            None => {}
+            Some(Received::Handshake { peer, reply }) => {
+                self.roam(peer, from);
+                storage.update_link(&peer, |l| l.last_seen = Some(Instant::now()));
+                match reply {
+                    Some(r) => self.transport.send_to(&r, from).await,
+                    None => {
+                        log::debug!("Link | session with {} established", node(peer));
+                        // confirms the session to the responder and measures RTT
+                        self.send_ping(peer).await;
+                    }
                 }
             }
-            ROUTE_CONTROL => {
-                let Some(c) = Control::parse(payload) else { return };
-                if c.sender != inb.peer_id || !self.storage.accept_seq(&c.sender, c.session, c.seq) {
-                    return;
+            Some(Received::Data { session, plain }) => {
+                let peer = session.peer;
+                self.roam(peer, from);
+                let Some((&kind, body)) = packet[plain].split_first() else { return };
+                match kind {
+                    KIND_IP => {
+                        let Some(tun) = &self.tun else { return };
+                        // A peer may only inject packets from its own LAN address.
+                        let own = matches!(
+                            packet::parse(body),
+                            Some(IpInfo { src: IpAddr::V4(src), .. }) if storage.peer_addr(&peer) == Some(src)
+                        );
+                        if !own {
+                            log::debug!("Link | packet from {} with foreign source dropped", node(peer));
+                            return;
+                        }
+                        if let Err(e) = tun.send(body).await {
+                            log::warn!("TUN | write error: {e}");
+                        }
+                    }
+                    KIND_CONTROL => self.handle_control(peer, body).await,
+                    k if k >= KIND_API_MIN => {
+                        if let Some(tx) = self.api_tx.get() {
+                            let _ = tx.try_send((k, peer, body.to_vec()));
+                        }
+                    }
+                    k => log::debug!("Link | unknown kind {k} from {}", node(peer)),
                 }
-                self.handle_control(inb.peer_id, c).await;
             }
-            route if route >= ROUTE_API_MIN => {
-                if let Some(tx) = self.api_tx.get() {
-                    let _ = tx.try_send((route, inb.peer_id, payload.to_vec()));
-                }
-            }
-            route => log::debug!("Peer | route {route} from {} not found", node(inb.peer_id)),
         }
     }
 
     async fn tun_loop(self: Arc<Self>) {
         let tun = self.tun.clone().unwrap();
         let Some(self_addr) = self.self_addr else { return };
-        // Layout: [SEALED][nonce][ROUTE_NET][ip packet][tag]; the IP packet is read in place.
-        const OFF: usize = SEALED_HDR + 1;
+        // Layout: [DATA header][KIND_IP][ip packet][tag]; the IP packet is read in place.
+        const OFF: usize = DATA_HDR + 1;
         let mut buf = vec![0u8; OFF + MAX_DATAGRAM + TAG_LEN];
         log::info!("TUN | Thread receiver - started");
         loop {
@@ -344,9 +308,14 @@ impl Node {
                 log::trace!("TUN | Packet to {dst} peer not found");
                 continue;
             };
-            buf[SEALED_HDR] = ROUTE_NET;
-            let range = frame(&mut buf, n + 1, &route);
-            self.transport.send_to(&buf[range], route.endpoint).await;
+            let Some(session) = self.links.current(&route.peer_id) else {
+                self.handshake(route.peer_id, PUNCH_INTERVAL).await;
+                continue;
+            };
+            buf[DATA_HDR] = KIND_IP;
+            if let Some(len) = session.seal(&mut buf, n + 1) {
+                self.transport.send_to(&buf[..len], route.endpoint).await;
+            }
         }
         log::info!("TUN | Thread receiver - stopped");
     }

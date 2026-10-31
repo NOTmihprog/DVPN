@@ -1,4 +1,4 @@
-//! Wire protocol (v3). Every UDP datagram starts with one type byte.
+//! Wire protocol. Every UDP datagram starts with one type byte (until obfuscation, stage 2.5).
 //!
 //! Tracker (peer <-> discovery server):
 //! ```text
@@ -12,20 +12,18 @@
 //! Session keys: HKDF-SHA256(salt = nonce, ikm = x25519 shared, info = KEYS_CTX|client_eph|server_eph),
 //! 64 bytes split into client->server and server->client keys, counters are replay-checked.
 //!
-//! Peer <-> peer:
+//! Peer <-> peer (v4, logical layout before the obfuscation layer of stage 2.5):
 //! ```text
-//! SEALED     [0x10][nonce 24][xchacha20poly1305([route][payload])][tag 16]
-//!            key = recipient's key, AAD = [0x10]|recipient_id
-//! PLAIN      [0x11][route][payload]      only accepted when the recipient has no key
+//! HS_INIT  [0x20][sender_idx u32 LE][Noise message 1]
+//! HS_RESP  [0x21][sender_idx u32 LE][receiver_idx u32 LE][Noise message 2]
+//! DATA     [0x23][receiver_idx u32 LE][counter u64 LE][chacha20poly1305([kind][body])][tag 16]
 //! ```
-//! Routes: 0 = control (ping/pong), 1 = IP packet for the TUN device, 32..=255 = API clients.
-//! The sender of a packet is identified by its UDP source address. Control packets also carry
-//! the sender id, which lets a peer whose NAT mapping changed be found at its new address:
+//! Indices are random per session; the receiver finds the session by `receiver_idx`, so the
+//! sender's address plays no role in authentication. The DATA header is the AEAD's associated
+//! data. Kinds: 0 = control (ping/pong), 1 = IP packet for the TUN device, 32..=255 = API clients.
 //! ```text
-//! CONTROL    [kind][echo_ts u64][session u64][seq u64][sender_id 32][random padding]
+//! CONTROL  [0][PING|PONG][echo_ts u64 LE][random padding]
 //! ```
-//! `echo_ts` is the ping send time (echoed back in the pong, for RTT); (`session`, `seq`) is
-//! random-per-run plus monotonic, so replayed control packets cannot move an endpoint.
 
 use std::net::SocketAddr;
 
@@ -37,8 +35,13 @@ use crate::identity::NodeId;
 pub const HELLO: u8 = 0x01;
 pub const HELLO_ACK: u8 = 0x02;
 pub const TRACKER: u8 = 0x03;
-pub const SEALED: u8 = 0x10;
-pub const PLAIN: u8 = 0x11;
+
+pub const HS_INIT: u8 = 0x20;
+pub const HS_RESP: u8 = 0x21;
+pub const DATA: u8 = 0x23;
+pub const HS_INIT_HDR: usize = 1 + 4;
+pub const HS_RESP_HDR: usize = 1 + 4 + 4;
+pub const DATA_HDR: usize = 1 + 4 + 8;
 
 pub const HELLO_LEN: usize = 128;
 pub const HELLO_ACK_LEN: usize = 1 + 32 + 64;
@@ -47,16 +50,14 @@ pub const KEYS_CTX: &[u8] = b"dvpn/3 tracker keys";
 /// Signature context of `Announce` (signed by the node key over the session transcript).
 pub const ANNOUNCE_SIG_CTX: &[u8] = b"dvpn/4 announce";
 
-pub const ROUTE_CONTROL: u8 = 0;
-pub const ROUTE_NET: u8 = 1;
-pub const ROUTE_API_MIN: u8 = 32;
-pub const ROUTE_API_MAX: u8 = 255;
+pub const KIND_CONTROL: u8 = 0;
+pub const KIND_IP: u8 = 1;
+pub const KIND_API_MIN: u8 = 32;
+pub const KIND_API_MAX: u8 = 255;
 
 pub const CONTROL_PING: u8 = 0;
 pub const CONTROL_PONG: u8 = 1;
-pub const CONTROL_LEN: usize = 1 + 8 + 8 + 8 + 32;
-/// Packets from unknown addresses larger than this are not even tried (only control packets matter).
-pub const ROAM_MAX_LEN: usize = 256;
+pub const CONTROL_LEN: usize = 1 + 1 + 8;
 
 pub const MAX_DATAGRAM: usize = 65507;
 

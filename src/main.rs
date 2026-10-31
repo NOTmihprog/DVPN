@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
 
-use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use log::LevelFilter;
@@ -16,7 +15,7 @@ use dvpn::config::{Config, PEERS_FILE_NAME, SOCKET_DEFAULT_ADDR};
 use dvpn::crypto::{decode_b64, encode_b64, random_bytes};
 use dvpn::identity::Identity;
 use dvpn::identity::NodeId;
-use dvpn::storage::{PeerRecord, PeerStorage, PeerUpdate, normalize_key};
+use dvpn::storage::{PeerRecord, PeerStorage, PeerUpdate};
 use dvpn::tracker_client::TrackerClient;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -58,7 +57,7 @@ struct OutputArgs {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate a new node private key (base64url; for now also usable as a peer encryption key)
+    /// Generate a random 32-byte key (base64url): a node private key or a group psk
     GenKey,
     /// Print the node public key (node id) from config.toml / DVPN_PRIVATE_KEY
     ShowKey {
@@ -77,9 +76,6 @@ enum Command {
         /// IPv4 address in the LAN network, "None" to clear
         #[arg(short = 'a', long)]
         addr: Option<String>,
-        /// Crypto key, 32 bytes in base64, generate: gen-key, "None" to clear
-        #[arg(short = 'k', long)]
-        key: Option<String>,
         /// Clear parameters that are not given
         #[arg(short = 'c', long)]
         clear: bool,
@@ -168,15 +164,14 @@ fn list_peers(storage: &PeerStorage) {
                 if r.peer_id == self_id { format!("[{name}]") } else { name },
                 r.peer_id.to_string(),
                 r.addr.map_or_else(|| "None".into(), |a| a.to_string()),
-                r.key.map_or_else(|| "disabled".into(), |k| format!("key: {k}")),
             ]
         })
         .collect();
-    println!("\n{}\n", github_table(&["Name", "PeerID", "Addr", "encryption"], &rows));
+    println!("\n{}\n", github_table(&["Name", "Key", "Addr"], &rows));
 }
 
 fn export_value(r: &PeerRecord) -> Json {
-    serde_json::json!({ "name": r.name, "peer_id": r.peer_id, "addr": r.addr, "key": r.key })
+    serde_json::json!({ "name": r.name, "peer_id": r.peer_id, "addr": r.addr })
 }
 
 fn write_output(args: &OutputArgs, data: &Json) {
@@ -206,31 +201,14 @@ fn read_input(inp: &Option<PathBuf>) -> Json {
     serde_json::from_str(decoded.as_deref().unwrap_or(text)).unwrap_or_else(|_| die("Load error"))
 }
 
-/// Accepts the v3 export format and v2 exports (`crypto: {key}`, `id`).
-fn parse_import(mut v: Json) -> anyhow::Result<PeerRecord> {
-    if let Some(obj) = v.as_object_mut() {
-        if !obj.contains_key("key")
-            && let Some(k) = obj.get("crypto").and_then(|c| c.get("key")).cloned()
-        {
-            obj.insert("key".into(), k);
-        }
-        obj.remove("crypto");
-    }
-    let mut r: PeerRecord = serde_json::from_value(v)?;
-    r.key = r.key.as_deref().map(normalize_key).transpose().context("key")?;
-    Ok(r)
+fn parse_import(v: Json) -> anyhow::Result<PeerRecord> {
+    Ok(serde_json::from_value(v)?)
 }
 
 fn store_import(storage: &PeerStorage, r: PeerRecord) {
     storage.set_peer(
         r.peer_id,
-        PeerUpdate {
-            name: Some(r.name),
-            addr: Some(r.addr),
-            key: Some(r.key),
-            endpoint: None,
-            sub_args: r.sub_args.map(Some),
-        },
+        PeerUpdate { name: Some(r.name), addr: Some(r.addr), endpoint: None, sub_args: r.sub_args.map(Some) },
     );
 }
 
@@ -239,33 +217,16 @@ fn cli_field(v: Option<String>) -> Option<Option<String>> {
     v.map(|s| if s == "None" || s.is_empty() { None } else { Some(s) })
 }
 
-fn cmd_set(
-    storage: &PeerStorage,
-    peer_id: String,
-    name: Option<String>,
-    addr: Option<String>,
-    key: Option<String>,
-    clear: bool,
-) {
+fn cmd_set(storage: &PeerStorage, peer_id: String, name: Option<String>, addr: Option<String>, clear: bool) {
     let id = resolve_peer_id(&peer_id, storage);
     let addr = cli_field(addr)
         .map(|a| a.map(|s| s.parse::<Ipv4Addr>().unwrap_or_else(|e| die(format!("addr invalid, error: {e}")))));
-    let key =
-        cli_field(key).map(|k| k.map(|s| normalize_key(&s).unwrap_or_else(|e| die(format!("key {s} invalid: {e}")))));
     let name = cli_field(name);
     fn pick<T>(f: Option<Option<T>>, clear: bool) -> Option<Option<T>> {
         if clear { Some(f.flatten()) } else { f }
     }
-    storage.set_peer(
-        id,
-        PeerUpdate {
-            name: pick(name, clear),
-            addr: pick(addr, clear),
-            key: pick(key, clear),
-            endpoint: None,
-            sub_args: None,
-        },
-    );
+    storage
+        .set_peer(id, PeerUpdate { name: pick(name, clear), addr: pick(addr, clear), endpoint: None, sub_args: None });
     list_peers(storage);
 }
 
@@ -324,10 +285,14 @@ async fn run_node(conf: Config, storage: Arc<PeerStorage>, api_addr: Option<Stri
         Err(e) => die(format!("TUN | Tun init error: {e}")),
     });
 
+    let Some(group) = conf.group.clone() else {
+        die("[group] psk is required to run a node: generate one with `dvpn gen-key`, the same on every node")
+    };
     let identity = Arc::new(conf.identity.clone());
+    let links = dvpn::link::Links::new(identity.clone(), group);
     let clients =
         conf.servers.iter().map(|s| TrackerClient::new(s.name.clone(), s.addr, s.key, identity.clone())).collect();
-    let node = node::Node::new(storage, transport, clients, tun, conf.net.as_ref().map(|n| n.addr));
+    let node = node::Node::new(storage, transport, links, clients, tun, conf.net.as_ref().map(|n| n.addr));
     node.start();
     let _api = api::Api::start(node.clone(), api_sock);
 
@@ -415,7 +380,7 @@ fn main() {
         }
         Some(Command::GenKey | Command::ShowKey { key: Some(_) }) => unreachable!(),
         Some(Command::ShowKey { key: None }) => println!("{}", conf.identity.id()),
-        Some(Command::Set { peer_id, name, addr, key, clear }) => cmd_set(&storage, peer_id, name, addr, key, clear),
+        Some(Command::Set { peer_id, name, addr, clear }) => cmd_set(&storage, peer_id, name, addr, clear),
         Some(Command::Del { peer_id }) => {
             let id = resolve_peer_id(&peer_id, &storage);
             if storage.is_self(&id) {

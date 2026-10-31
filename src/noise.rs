@@ -214,6 +214,7 @@ impl Transport {
 }
 
 /// Initiator after sending message 1, waiting for message 2.
+#[derive(Clone)]
 pub struct Initiator {
     sym: Symmetric,
     e: StaticSecret,
