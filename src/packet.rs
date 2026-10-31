@@ -144,6 +144,32 @@ pub(crate) mod tests {
         assert!(parse(&v6(a, b, 64, 0)).is_some(), "empty payload, exact length");
     }
 
+    proptest::proptest! {
+        #[test]
+        fn roundtrip_v4(src: [u8; 4], dst: [u8; 4], ttl: u8, payload in 0usize..1500, extra in 0usize..16) {
+            let mut p = v4(src, dst, ttl, payload);
+            p.resize(p.len() + extra, 0);
+            let i = parse(&p).unwrap();
+            proptest::prop_assert_eq!(i, IpInfo { src: src.into(), dst: dst.into(), ttl, len: 20 + payload });
+        }
+
+        #[test]
+        fn roundtrip_v6(src: [u8; 16], dst: [u8; 16], hop: u8, payload in 1usize..1500, extra in 0usize..16) {
+            let (s6, d6) = (Ipv6Addr::from(src), Ipv6Addr::from(dst));
+            let mut p = v6(s6, d6, hop, payload);
+            p.resize(p.len() + extra, 0);
+            let i = parse(&p).unwrap();
+            proptest::prop_assert_eq!(i, IpInfo { src: s6.into(), dst: d6.into(), ttl: hop, len: 40 + payload });
+        }
+
+        #[test]
+        fn never_reads_past_buffer(data: Vec<u8>) {
+            if let Some(i) = parse(&data) {
+                proptest::prop_assert!(i.len <= data.len());
+            }
+        }
+    }
+
     #[test]
     fn rejects_other_versions() {
         assert!(parse(&[]).is_none());
