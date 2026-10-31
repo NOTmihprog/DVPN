@@ -551,6 +551,9 @@ mod tests {
         assert!(handshake(&a, &b));
         assert!(deliver(&b, data(&a, &b.id, b"confirm").unwrap()).is_some());
         let in_flight = data(&a, &b.id, b"old").unwrap();
+        // handshake timestamps are whitened to ~16.7 ms; a second init inside the same window
+        // carries the same timestamp and is (rightly) treated as a replay
+        std::thread::sleep(Duration::from_millis(40));
         assert!(handshake(&a, &b), "rekey");
         let fresh = data(&a, &b.id, b"new").unwrap();
         assert_eq!(deliver(&b, fresh).unwrap().1[1..], *b"new");

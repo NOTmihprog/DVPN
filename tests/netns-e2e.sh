@@ -184,28 +184,26 @@ if command -v tcpdump >/dev/null; then
     ok "no plaintext on the wan"
     if command -v python3 >/dev/null; then
         # peer datagrams only (the tracker on port 6485 is not masked until stage 3)
-        stats=$(python3 -I - "$W/wan.pcap" <<'PY'
-import struct, sys
+        # tcpdump decodes the link layer (it differs between hosts and containers); -x prints the
+        # IP packet in hex, the UDP payload starts after the IP and UDP headers.
+        stats=$(tcpdump -r "$W/wan.pcap" -nn -x 'udp and not port 6485' 2>/dev/null | python3 -I -c '
+import sys
 from collections import Counter
-data = open(sys.argv[1], "rb").read()
-off, first, sizes = 24, Counter(), Counter()
-while off + 16 <= len(data):
-    caplen = struct.unpack_from("<I", data, off + 8)[0]
-    pkt = data[off + 16 : off + 16 + caplen]
-    off += 16 + caplen
-    if len(pkt) < 14 + 20 + 8 or pkt[12:14] != b"\x08\x00":
+first, sizes, pkts, cur = Counter(), Counter(), [], None
+for line in sys.stdin:
+    if not line.startswith((" ", "\t")):
+        cur = bytearray(); pkts.append(cur); continue
+    if cur is not None and ":" in line:
+        cur.extend(bytes.fromhex(line.split(":", 1)[1].replace(" ", "").strip()))
+for p in pkts:
+    if len(p) < 29 or p[0] >> 4 != 4:
         continue
-    ihl = (pkt[14] & 15) * 4
-    sport, dport, ulen = struct.unpack_from(">HHH", pkt, 14 + ihl)
-    if 6485 in (sport, dport):
-        continue
-    payload = pkt[14 + ihl + 8 :]
-    first[payload[0]] += 1
-    sizes[ulen] += 1
+    ihl = (p[0] & 15) * 4
+    first[p[ihl + 8]] += 1
+    sizes[len(p)] += 1
 n = sum(first.values())
 print(n, first.most_common(1)[0][1] if n else 0, len(sizes))
-PY
-)
+')
         set -- $stats
         [ "${1:-0}" -ge 40 ] || fail "too few peer datagrams captured ($stats)"
         [ $(( $2 * 100 / $1 )) -lt 15 ] || fail "peer datagrams share a first byte too often ($2 of $1)"
