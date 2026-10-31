@@ -11,6 +11,7 @@ anyhow = "1"
 arc-swap = "1.9"
 base64 = "0.23"
 blake2 = "0.11"
+chacha20 = "0.10"
 chacha20poly1305 = "0.11"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 # Elligator2 for handshake ephemerals (fork of curve25519-dalek by the arti obfs4 author); exact pin: alpha

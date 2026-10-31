@@ -10,6 +10,7 @@ pub mod link;
 pub mod logger;
 pub mod node;
 pub mod noise;
+pub mod obfs;
 pub mod packet;
 pub mod proto;
 pub mod replay;

@@ -19,6 +19,7 @@ use rand::RngExt;
 use crate::elligator;
 use crate::identity::{Identity, NodeId};
 use crate::noise::{self, HandshakePayload, Initiator, Responder, TAG_LEN, Tai64n};
+use crate::obfs::{MAX_PAD, Obfs, Profile};
 use crate::proto::{DATA, DATA_HDR, HS_INIT, HS_INIT_HDR, HS_RESP, HS_RESP_HDR};
 use crate::replay::ReplayWindow;
 
@@ -58,6 +59,7 @@ pub struct Session {
     pub local_idx: u32,
     remote_idx: u32,
     transport: noise::Transport,
+    obfs: Arc<Obfs>,
     counter: AtomicU64,
     replay: Mutex<ReplayWindow>,
     created: Instant,
@@ -67,13 +69,21 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(peer: NodeId, local_idx: u32, remote_idx: u32, transport: noise::Transport, initiator: bool) -> Self {
+    fn new(
+        peer: NodeId,
+        local_idx: u32,
+        remote_idx: u32,
+        transport: noise::Transport,
+        obfs: Arc<Obfs>,
+        initiator: bool,
+    ) -> Self {
         let jitter = rand::rng().random_range(Duration::ZERO..REKEY_JITTER);
         Session {
             peer,
             local_idx,
             remote_idx,
             transport,
+            obfs,
             counter: AtomicU64::new(0),
             replay: Mutex::new(ReplayWindow::default()),
             created: Instant::now(),
@@ -82,29 +92,33 @@ impl Session {
         }
     }
 
-    /// Builds a DATA packet in `buf`: the plaintext must already be at
-    /// `buf[DATA_HDR..DATA_HDR + plain_len]` and `buf` must have `TAG_LEN` more bytes after it.
-    /// Returns the packet length, or `None` once the session has used up its counters.
+    /// Builds a wire DATA packet in `buf`: the plaintext must already be at
+    /// `buf[DATA_HDR..DATA_HDR + plain_len]`; `buf` needs `TAG_LEN` more bytes after it, plus up to
+    /// `MAX_PAD` for padding (less room just means less padding). Returns the wire length, or
+    /// `None` once the session has used up its counters.
     pub fn seal(&self, buf: &mut [u8], plain_len: usize) -> Option<usize> {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         if n >= REJECT_AFTER_MESSAGES {
             return None;
         }
+        let len = DATA_HDR + plain_len + TAG_LEN;
+        let pad = self.obfs.pad_len(DATA, len, buf.len() - len);
         buf[0] = DATA;
-        buf[1..5].copy_from_slice(&self.remote_idx.to_le_bytes());
-        buf[5..DATA_HDR].copy_from_slice(&n.to_le_bytes());
+        buf[1..3].copy_from_slice(&pad.to_le_bytes());
+        buf[3..7].copy_from_slice(&self.remote_idx.to_le_bytes());
+        buf[7..DATA_HDR].copy_from_slice(&n.to_le_bytes());
         let (hdr, rest) = buf.split_at_mut(DATA_HDR);
         let tag = self.transport.seal(n, hdr, &mut rest[..plain_len]);
         rest[plain_len..plain_len + TAG_LEN].copy_from_slice(&tag);
-        Some(DATA_HDR + plain_len + TAG_LEN)
+        Some(self.obfs.finish(buf, len, pad))
     }
 
-    /// Decrypts a DATA packet for this session in place; returns the plaintext range.
-    pub fn open(&self, packet: &mut [u8]) -> Option<Range<usize>> {
+    /// Decrypts an unmasked DATA packet (padding removed) in place; returns the plaintext range.
+    fn open(&self, packet: &mut [u8]) -> Option<Range<usize>> {
         if packet.len() < DATA_HDR + TAG_LEN {
             return None;
         }
-        let n = u64::from_le_bytes(packet[5..DATA_HDR].try_into().unwrap());
+        let n = u64::from_le_bytes(packet[7..DATA_HDR].try_into().unwrap());
         if n >= REJECT_AFTER_MESSAGES || !self.replay.lock().check(n) {
             return None;
         }
@@ -145,9 +159,9 @@ fn with_decoded_ephemeral(msg: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Receiver index of a DATA packet.
-pub fn data_receiver_idx(packet: &[u8]) -> Option<u32> {
-    packet.get(1..5).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+/// Receiver index of an unmasked DATA packet.
+fn data_receiver_idx(packet: &[u8]) -> Option<u32> {
+    packet.get(3..7).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
 }
 
 struct Pending {
@@ -221,12 +235,25 @@ pub enum Received {
 pub struct Links {
     identity: Arc<Identity>,
     group: Group,
+    obfs: Arc<Obfs>,
     inner: RwLock<Inner>,
 }
 
 impl Links {
     pub fn new(identity: Arc<Identity>, group: Group) -> Self {
-        Links { identity, group, inner: RwLock::new(Inner::default()) }
+        let obfs = Arc::new(Obfs::new(&group.psk, Profile::default()));
+        Links { identity, group, obfs, inner: RwLock::new(Inner::default()) }
+    }
+
+    /// Pads and masks a finished handshake packet in `out` (header with a zero pad field).
+    fn finish_handshake(&self, ty: u8, mut out: Vec<u8>) -> Vec<u8> {
+        let len = out.len();
+        let pad = self.obfs.pad_len(ty, len, MAX_PAD);
+        out[1..3].copy_from_slice(&pad.to_le_bytes());
+        out.resize(len + pad as usize, 0);
+        let n = self.obfs.finish(&mut out, len, pad);
+        out.truncate(n);
+        out
     }
 
     fn payload(&self) -> Vec<u8> {
@@ -245,8 +272,8 @@ impl Links {
         }
         st.last_init_sent = Some(Instant::now());
         let idx = inner.fresh_idx();
-        let mut out = Vec::with_capacity(HS_INIT_HDR + noise::INIT_OVERHEAD + 64);
-        out.push(HS_INIT);
+        let mut out = Vec::with_capacity(HS_INIT_HDR + noise::INIT_OVERHEAD + 64 + MAX_PAD);
+        out.extend_from_slice(&[HS_INIT, 0, 0]);
         out.extend_from_slice(&idx.to_le_bytes());
         let remote = peer.x25519_public().to_bytes();
         let (e, repr) = elligator::ephemeral();
@@ -255,7 +282,8 @@ impl Links {
                 .ok()?;
         out[HS_INIT_HDR..HS_INIT_HDR + 32].copy_from_slice(&repr);
         inner.pending.insert(idx, Pending { peer, initiator: ini, sent: Instant::now() });
-        Some(out)
+        drop(inner);
+        Some(self.finish_handshake(HS_INIT, out))
     }
 
     fn lookup_member(&self, x25519: &[u8; 32], members: impl FnOnce() -> Vec<NodeId>) -> Option<NodeId> {
@@ -272,7 +300,7 @@ impl Links {
     }
 
     fn handle_init(&self, packet: &[u8], members: impl FnOnce() -> Vec<NodeId>) -> Option<Received> {
-        let sender_idx = u32::from_le_bytes(packet.get(1..HS_INIT_HDR)?.try_into().unwrap());
+        let sender_idx = u32::from_le_bytes(packet.get(3..HS_INIT_HDR)?.try_into().unwrap());
         let msg = with_decoded_ephemeral(&packet[HS_INIT_HDR..])?;
         let (resp, rs, payload) = Responder::read(self.identity.x25519_secret(), &msg).ok()?;
         let peer = self.lookup_member(&rs, members)?;
@@ -288,20 +316,21 @@ impl Links {
         }
         st.last_init_ts = Some(p.timestamp);
         let idx = inner.fresh_idx();
-        let mut out = Vec::with_capacity(HS_RESP_HDR + noise::RESP_OVERHEAD + 64);
-        out.push(HS_RESP);
+        let mut out = Vec::with_capacity(HS_RESP_HDR + noise::RESP_OVERHEAD + 64 + MAX_PAD);
+        out.extend_from_slice(&[HS_RESP, 0, 0]);
         out.extend_from_slice(&idx.to_le_bytes());
         out.extend_from_slice(&sender_idx.to_le_bytes());
         let (e, repr) = elligator::ephemeral();
         let transport = resp.reply(&self.group.psk, e, &self.payload(), &mut out).ok()?;
         out[HS_RESP_HDR..HS_RESP_HDR + 32].copy_from_slice(&repr);
-        inner.install(Arc::new(Session::new(peer, idx, sender_idx, transport, false)));
-        Some(Received::Handshake { peer, reply: Some(out) })
+        inner.install(Arc::new(Session::new(peer, idx, sender_idx, transport, self.obfs.clone(), false)));
+        drop(inner);
+        Some(Received::Handshake { peer, reply: Some(self.finish_handshake(HS_RESP, out)) })
     }
 
     fn handle_resp(&self, packet: &[u8]) -> Option<Received> {
-        let sender_idx = u32::from_le_bytes(packet.get(1..5)?.try_into().unwrap());
-        let receiver_idx = u32::from_le_bytes(packet.get(5..HS_RESP_HDR)?.try_into().unwrap());
+        let sender_idx = u32::from_le_bytes(packet.get(3..7)?.try_into().unwrap());
+        let receiver_idx = u32::from_le_bytes(packet.get(7..HS_RESP_HDR)?.try_into().unwrap());
         // Verify before removing the pending handshake: the index travels in clear, so a forged
         // HS_RESP must not be able to cancel it.
         let (peer, ini) = {
@@ -316,7 +345,7 @@ impl Links {
         }
         let mut inner = self.inner.write();
         inner.pending.remove(&receiver_idx)?;
-        inner.install(Arc::new(Session::new(peer, receiver_idx, sender_idx, transport, true)));
+        inner.install(Arc::new(Session::new(peer, receiver_idx, sender_idx, transport, self.obfs.clone(), true)));
         Some(Received::Handshake { peer, reply: None })
     }
 
@@ -334,11 +363,14 @@ impl Links {
         Some(Received::Data { session, plain })
     }
 
-    /// Handles a HS_INIT, HS_RESP or DATA packet. `members` lists the nodes allowed to connect
-    /// (called only when an unknown initiator key shows up). Packets that do not authenticate
-    /// give `None`.
+    /// Handles a wire packet from a peer: unmasks it, then processes the HS_INIT, HS_RESP or DATA
+    /// inside. `members` lists the nodes allowed to connect (called only when an unknown
+    /// initiator key shows up). Packets that do not authenticate give `None`. `Data::plain`
+    /// indexes into `packet`.
     pub fn receive(&self, packet: &mut [u8], members: impl FnOnce() -> Vec<NodeId>) -> Option<Received> {
-        match *packet.first()? {
+        let len = self.obfs.open(packet)?;
+        let packet = &mut packet[..len];
+        match packet[0] {
             HS_INIT => self.handle_init(packet, members),
             HS_RESP => self.handle_resp(packet),
             DATA => self.handle_data(packet),
@@ -418,7 +450,7 @@ mod tests {
 
     fn data(from: &Side, to: &NodeId, body: &[u8]) -> Option<Vec<u8>> {
         let s = from.links.current(to)?;
-        let mut buf = vec![0u8; DATA_HDR + 1 + body.len() + TAG_LEN];
+        let mut buf = vec![0u8; DATA_HDR + 1 + body.len() + TAG_LEN + MAX_PAD];
         buf[DATA_HDR] = KIND_IP;
         buf[DATA_HDR + 1..DATA_HDR + 1 + body.len()].copy_from_slice(body);
         let n = s.seal(&mut buf, 1 + body.len())?;
@@ -486,9 +518,14 @@ mod tests {
         t[3] ^= 1; // header is authenticated too
         assert!(deliver(&b, t).is_none());
         let mut t = data(&a, &b.id, b"z").unwrap();
-        let last = t.len() - 1;
-        t[last] ^= 1;
+        t[DATA_HDR + 1 + 1 + TAG_LEN - 1] ^= 1; // last tag byte; padding follows
         assert!(deliver(&b, t).is_none());
+        let mut t = data(&a, &b.id, b"padded").unwrap();
+        let pad_start = DATA_HDR + 1 + 6 + TAG_LEN;
+        if t.len() > pad_start {
+            t[pad_start] ^= 1; // padding is not authenticated, but carries nothing either
+            assert!(deliver(&b, t).is_some());
+        }
     }
 
     #[test]
@@ -499,8 +536,7 @@ mod tests {
             panic!()
         };
         let mut forged = resp.clone();
-        let last = forged.len() - 1;
-        forged[last] ^= 1;
+        forged[60] ^= 1; // inside the encrypted payload (the tail may be padding)
         assert!(a.links.receive(&mut forged, Vec::new).is_none());
         assert!(a.links.receive(&mut resp.clone(), Vec::new).is_some(), "genuine reply still accepted");
     }

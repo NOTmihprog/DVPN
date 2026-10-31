@@ -171,16 +171,47 @@ after=$(nat2nat)
 [ $((after - before)) -ge 5 ] || fail "a -> b is not a direct nat1 -> nat2 flow ($before -> $after packets)"
 ok "a -> b goes directly nat1 -> nat2 ($((after - before)) packets)"
 
-# The overlay must be encrypted: a marked ICMP payload must not show up on the wan.
+# The overlay must be encrypted and masked: a marked ICMP payload must not show up on the
+# wan, peer datagrams must have no constant first byte, and equal pings must not give equal sizes.
 if command -v tcpdump >/dev/null; then
-    nsx wan timeout 4 tcpdump -i br0 -nn -U -w "$W/wan.pcap" udp >/dev/null 2>&1 &
+    nsx wan timeout 5 tcpdump -i br0 -nn -U -w "$W/wan.pcap" udp >/dev/null 2>&1 &
     tpid=$!
     sleep 1
-    nsx a ping -c3 -i0.2 -p 6476706e2d6532652d 10.10.33.2 >/dev/null || fail "a -> b during capture"
+    nsx a ping -c30 -i0.1 -p 6476706e2d6532652d 10.10.33.2 >/dev/null || fail "a -> b during capture"
     wait $tpid || true
     [ -s "$W/wan.pcap" ] || fail "capture is empty"
     ! grep -q dvpn-e2e- "$W/wan.pcap" || fail "plaintext overlay payload seen on the wan"
     ok "no plaintext on the wan"
+    if command -v python3 >/dev/null; then
+        # peer datagrams only (the tracker on port 6485 is not masked until stage 3)
+        stats=$(python3 -I - "$W/wan.pcap" <<'PY'
+import struct, sys
+from collections import Counter
+data = open(sys.argv[1], "rb").read()
+off, first, sizes = 24, Counter(), Counter()
+while off + 16 <= len(data):
+    caplen = struct.unpack_from("<I", data, off + 8)[0]
+    pkt = data[off + 16 : off + 16 + caplen]
+    off += 16 + caplen
+    if len(pkt) < 14 + 20 + 8 or pkt[12:14] != b"\x08\x00":
+        continue
+    ihl = (pkt[14] & 15) * 4
+    sport, dport, ulen = struct.unpack_from(">HHH", pkt, 14 + ihl)
+    if 6485 in (sport, dport):
+        continue
+    payload = pkt[14 + ihl + 8 :]
+    first[payload[0]] += 1
+    sizes[ulen] += 1
+n = sum(first.values())
+print(n, first.most_common(1)[0][1] if n else 0, len(sizes))
+PY
+)
+        set -- $stats
+        [ "${1:-0}" -ge 40 ] || fail "too few peer datagrams captured ($stats)"
+        [ $(( $2 * 100 / $1 )) -lt 15 ] || fail "peer datagrams share a first byte too often ($2 of $1)"
+        [ "$3" -ge 10 ] || fail "peer datagram sizes barely vary ($3 distinct sizes in $1 packets)"
+        ok "peer datagrams masked on the wan: $1 packets, top first byte $2x, $3 sizes"
+    fi
 else
     echo "skip: tcpdump not found (plaintext check)"
 fi

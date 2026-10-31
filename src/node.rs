@@ -11,10 +11,10 @@ use crate::identity::NodeId;
 use crate::link::{Links, Received};
 use crate::logger::node;
 use crate::noise::TAG_LEN;
+use crate::obfs::MAX_PAD;
 use crate::packet::{self, IpInfo};
 use crate::proto::{
-    CONTROL_LEN, CONTROL_PING, CONTROL_PONG, DATA, DATA_HDR, HELLO_ACK, HS_INIT, HS_RESP, KIND_API_MIN, KIND_CONTROL,
-    KIND_IP, MAX_DATAGRAM, TRACKER,
+    CONTROL_LEN, CONTROL_PING, CONTROL_PONG, DATA_HDR, KIND_API_MIN, KIND_CONTROL, KIND_IP, MAX_DATAGRAM,
 };
 use crate::storage::{Event, PeerStorage, PeerUpdate};
 use crate::tracker_client::{Output, TrackerClient};
@@ -24,7 +24,10 @@ use crate::transport::Transport;
 const PUNCH_INTERVAL: Duration = Duration::from_secs(1);
 /// Retry interval for a rekey handshake while the old session still works.
 const REKEY_RETRY: Duration = Duration::from_secs(5);
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// Keepalive pings go out at a random point of this range, so they have no fixed period (§4.4).
+const KEEPALIVE: std::ops::Range<Duration> = Duration::from_secs(12)..Duration::from_secs(18);
+/// The link loop runs at random intervals around a second, for the same reason.
+const LINK_TICK: std::ops::Range<Duration> = Duration::from_millis(700)..Duration::from_millis(1300);
 const LINK_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// A packet for an API client: (route, from peer, payload).
@@ -99,7 +102,7 @@ impl Node {
             self.handshake(*peer, PUNCH_INTERVAL).await;
             return false;
         };
-        let mut buf = vec![0u8; DATA_HDR + 1 + body.len() + TAG_LEN];
+        let mut buf = vec![0u8; DATA_HDR + 1 + body.len() + TAG_LEN + MAX_PAD];
         buf[DATA_HDR] = kind;
         buf[DATA_HDR + 1..DATA_HDR + 1 + body.len()].copy_from_slice(body);
         let Some(len) = session.seal(&mut buf, 1 + body.len()) else { return false };
@@ -159,9 +162,9 @@ impl Node {
     /// Once a second: link timeouts, handshakes (first contact, NAT punching, rekeying) and
     /// keepalive pings that also measure RTT.
     async fn link_loop(self: Arc<Self>) {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
-            tick.tick().await;
+            let tick = rand::rng().random_range(LINK_TICK); // ThreadRng must not live across .await
+            tokio::time::sleep(tick).await;
             self.links.expire();
             for (id, link) in self.storage.links() {
                 if link.last_seen.unwrap_or(link.since).elapsed() > LINK_TIMEOUT {
@@ -174,7 +177,8 @@ impl Node {
                 if self.links.needs_handshake(&id) {
                     self.handshake(id, if has_session { REKEY_RETRY } else { PUNCH_INTERVAL }).await;
                 }
-                if has_session && link.last_ping.is_none_or(|t| t.elapsed() >= KEEPALIVE_INTERVAL) {
+                let keepalive = rand::rng().random_range(KEEPALIVE);
+                if has_session && link.last_ping.is_none_or(|t| t.elapsed() >= keepalive) {
                     self.send_ping(id).await;
                 }
             }
@@ -211,15 +215,13 @@ impl Node {
             if n == 0 {
                 continue;
             }
-            match buf[0] {
-                HELLO_ACK | TRACKER => {
-                    if let Some(c) = self.clients_by_addr.get(&from) {
-                        let out = c.handle(&buf[..n], &self.storage);
-                        self.send_tracker(c, out).await;
-                    }
+            // Peer packets have no readable type byte, so trackers are told apart by address.
+            match self.clients_by_addr.get(&from) {
+                Some(c) => {
+                    let out = c.handle(&buf[..n], &self.storage);
+                    self.send_tracker(c, out).await;
                 }
-                HS_INIT | HS_RESP | DATA => self.handle_peer_packet(&mut buf[..n], from).await,
-                _ => {}
+                None => self.handle_peer_packet(&mut buf[..n], from).await,
             }
         }
     }
@@ -286,7 +288,7 @@ impl Node {
         let Some(self_addr) = self.self_addr else { return };
         // Layout: [DATA header][KIND_IP][ip packet][tag]; the IP packet is read in place.
         const OFF: usize = DATA_HDR + 1;
-        let mut buf = vec![0u8; OFF + MAX_DATAGRAM + TAG_LEN];
+        let mut buf = vec![0u8; OFF + MAX_DATAGRAM + TAG_LEN + MAX_PAD];
         log::info!("TUN | Thread receiver - started");
         loop {
             let n = match tun.recv(&mut buf[OFF..OFF + MAX_DATAGRAM - 64]).await {

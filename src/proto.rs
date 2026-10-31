@@ -1,4 +1,4 @@
-//! Wire protocol. Every UDP datagram starts with one type byte (until obfuscation, stage 2.5).
+//! Wire protocol. Tracker datagrams start with a type byte; peer datagrams are masked (`obfs.rs`).
 //!
 //! Tracker (peer <-> discovery server):
 //! ```text
@@ -12,15 +12,16 @@
 //! Session keys: HKDF-SHA256(salt = nonce, ikm = x25519 shared, info = KEYS_CTX|client_eph|server_eph),
 //! 64 bytes split into client->server and server->client keys, counters are replay-checked.
 //!
-//! Peer <-> peer (v4, logical layout before the obfuscation layer of stage 2.5):
+//! Peer <-> peer, logical layout (on the wire padded and header-masked by `obfs.rs`):
 //! ```text
-//! HS_INIT  [0x20][sender_idx u32 LE][Noise message 1]
-//! HS_RESP  [0x21][sender_idx u32 LE][receiver_idx u32 LE][Noise message 2]
-//! DATA     [0x23][receiver_idx u32 LE][counter u64 LE][chacha20poly1305([kind][body])][tag 16]
+//! HS_INIT  [0x20][pad u16][sender_idx u32 LE][Noise message 1]
+//! HS_RESP  [0x21][pad u16][sender_idx u32 LE][receiver_idx u32 LE][Noise message 2]
+//! DATA     [0x23][pad u16][receiver_idx u32 LE][counter u64 LE][chacha20poly1305([kind][body])][tag 16]
 //! ```
-//! Indices are random per session; the receiver finds the session by `receiver_idx`, so the
-//! sender's address plays no role in authentication. The DATA header is the AEAD's associated
-//! data. Kinds: 0 = control (ping/pong), 1 = IP packet for the TUN device, 32..=255 = API clients.
+//! Noise messages start with the Elligator2 representative of the ephemeral key. Indices are
+//! random per session; the receiver finds the session by `receiver_idx`, so the sender's
+//! address plays no role in authentication. The DATA header (padding length included) is the
+//! AEAD's associated data. Kinds: 0 = control (ping/pong), 1 = IP packet for the TUN device, 32..=255 = API clients.
 //! ```text
 //! CONTROL  [0][PING|PONG][echo_ts u64 LE][random padding]
 //! ```
@@ -39,9 +40,9 @@ pub const TRACKER: u8 = 0x03;
 pub const HS_INIT: u8 = 0x20;
 pub const HS_RESP: u8 = 0x21;
 pub const DATA: u8 = 0x23;
-pub const HS_INIT_HDR: usize = 1 + 4;
-pub const HS_RESP_HDR: usize = 1 + 4 + 4;
-pub const DATA_HDR: usize = 1 + 4 + 8;
+pub const HS_INIT_HDR: usize = 1 + 2 + 4;
+pub const HS_RESP_HDR: usize = 1 + 2 + 4 + 4;
+pub const DATA_HDR: usize = 1 + 2 + 4 + 8;
 
 pub const HELLO_LEN: usize = 128;
 pub const HELLO_ACK_LEN: usize = 1 + 32 + 64;
