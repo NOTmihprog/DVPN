@@ -41,3 +41,19 @@ jobs:
           for t in $(cargo +nightly fuzz list); do
             cargo +nightly fuzz run "$t" -- -max_total_time=60
           done
+
+  netns:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install tools
+        run: |
+          SUDO=$(command -v sudo || true)
+          $SUDO apt-get update && $SUDO apt-get install -y iproute2 nftables iputils-ping iperf3 tcpdump
+      - name: build
+        run: cargo build --locked
+      # needs unprivileged user namespaces and /dev/net/tun on the runner
+      - name: netns e2e
+        run: tests/netns-e2e.sh
