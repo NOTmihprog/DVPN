@@ -113,13 +113,18 @@ mod tests {
     #[test]
     fn dirty_keys_give_the_same_shared_secret() {
         let (a, _) = ephemeral();
-        let (b, _) = ephemeral();
-        let ab = a.secret.diffie_hellman(&PublicKey::from(b.public));
-        let ba = b.secret.diffie_hellman(&PublicKey::from(a.public));
-        assert_eq!(ab.as_bytes(), ba.as_bytes());
-        let b_clean = PublicKey::from(&b.secret);
-        assert_ne!(b_clean.to_bytes(), b.public, "low-order component present");
-        assert_eq!(a.secret.diffie_hellman(&b_clean).as_bytes(), ab.as_bytes());
+        let mut dirty = 0;
+        for _ in 0..32 {
+            let (b, _) = ephemeral();
+            let ab = a.secret.diffie_hellman(&PublicKey::from(b.public));
+            let ba = b.secret.diffie_hellman(&PublicKey::from(a.public));
+            assert_eq!(ab.as_bytes(), ba.as_bytes());
+            let b_clean = PublicKey::from(&b.secret);
+            assert_eq!(a.secret.diffie_hellman(&b_clean).as_bytes(), ab.as_bytes());
+            // the random low-order component is the identity 1/8 of the time
+            dirty += usize::from(b_clean.to_bytes() != b.public);
+        }
+        assert!(dirty >= 16, "low-order component present in only {dirty}/32 keys");
     }
 
     /// Representatives on the wire should look uniform: every bit, including the two top
