@@ -9,7 +9,6 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::crypto::{decode_b64, decode_key32, encode_b64};
 use crate::identity::Identity;
-use crate::peer_id::PeerId;
 
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const PEERS_FILE_NAME: &str = "peers.json";
@@ -29,9 +28,6 @@ private_key = "{private_key}"
 "#;
 
 const DEFAULT_CONFIG: &str = r#"[peer]
-# Peer-Id string len = 32, generate: dvpn gen-peer-id
-peer_id = "{peer_id}"
-
 # local bind ip
 bind_addr = "0.0.0.0"
 
@@ -59,7 +55,6 @@ log_level = "INFO"
 "#;
 
 pub struct PeerConfig {
-    pub peer_id: PeerId,
     pub bind_addr: Ipv4Addr,
     pub port_range: (u16, u16),
 }
@@ -152,10 +147,10 @@ fn section<'a>(doc: &'a DocumentMut, name: &str) -> Option<&'a Table> {
 }
 
 fn parse_peer(t: &Table) -> anyhow::Result<PeerConfig> {
-    let peer_id = get_str(t, "peer_id")?.parse().context("peer_id")?;
     let bind_addr = get_str(t, "bind_addr")?.parse().context("bind_addr")?;
     let port_range = parse_port_range(&get_str_or_int(t, "bind_port")?).context("bind_port")?;
-    Ok(PeerConfig { peer_id, bind_addr, port_range })
+    // a v3 `peer_id` key is ignored: the node id is the [identity] public key now
+    Ok(PeerConfig { bind_addr, port_range })
 }
 
 fn parse_net(t: &Table) -> anyhow::Result<NetConfig> {
@@ -202,8 +197,7 @@ impl Config {
         let path = dir.join(CONFIG_FILE_NAME);
         if !path.exists() {
             let addr = random_host(Ipv4Addr::new(10, 10, 33, 0), 24);
-            let text =
-                DEFAULT_CONFIG.replace("{peer_id}", PeerId::generate().as_str()).replace("{addr}", &addr.to_string());
+            let text = DEFAULT_CONFIG.replace("{addr}", &addr.to_string());
             write_private(&path, &text).with_context(|| format!("create {}", path.display()))?;
         }
         let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -266,11 +260,6 @@ impl Config {
         Ok(Config { path, doc, identity, peer, net, servers, log_level, local_server_key })
     }
 
-    pub fn set_peer_id(&mut self, id: PeerId) {
-        self.peer.peer_id = id;
-        self.doc["peer"]["peer_id"] = value(id.as_str());
-    }
-
     pub fn set_net_addr(&mut self, addr: Ipv4Addr) {
         if let Some(net) = &mut self.net {
             net.addr = addr;
@@ -319,21 +308,20 @@ mod tests {
 
     #[test]
     fn default_config_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("dvpn-test-{}", PeerId::generate()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir();
         let mut conf = Config::load(&dir).unwrap();
         assert!(conf.net.is_some());
-        let id = PeerId::generate();
-        conf.set_peer_id(id);
+        let addr = Ipv4Addr::new(10, 10, 33, 77);
+        conf.set_net_addr(addr);
         conf.save();
         let text = std::fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap();
         assert!(text.contains("# local bind ip"), "comments must survive save");
-        assert_eq!(Config::load(&dir).unwrap().peer.peer_id, id);
+        assert_eq!(Config::load(&dir).unwrap().net.unwrap().addr, addr);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("dvpn-test-{}", PeerId::generate()));
+        let dir = std::env::temp_dir().join(format!("dvpn-test-{}", encode_b64(&crate::crypto::random_bytes::<9>())));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -368,7 +356,7 @@ mod tests {
     fn identity_added_to_config_without_one() {
         let dir = temp_dir();
         let path = dir.join(CONFIG_FILE_NAME);
-        let old = DEFAULT_CONFIG.replace("{peer_id}", PeerId::generate().as_str()).replace("{addr}", "10.10.33.7");
+        let old = DEFAULT_CONFIG.replace("{addr}", "10.10.33.7");
         std::fs::write(&path, &old).unwrap();
         #[cfg(unix)]
         {

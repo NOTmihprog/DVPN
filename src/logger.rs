@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
-use crate::peer_id::{PEER_ID_LEN, PeerId};
+use crate::identity::{NODE_ID_TEXT_LEN, NodeId};
 use crate::storage::PeerStorage;
 
 const RESET: &str = "\x1b[0m";
@@ -53,15 +53,22 @@ impl Logger {
         let mut out = String::with_capacity(msg.len() + 32);
         let mut i = 0;
         let mut last = 0;
-        while i + PEER_ID_LEN <= b.len() {
-            let boundary_before = i == 0 || !b[i - 1].is_ascii_alphanumeric();
-            let boundary_after = b.get(i + PEER_ID_LEN).is_none_or(|c| !c.is_ascii_alphanumeric());
-            if boundary_before && boundary_after && PeerId::is_valid(&b[i..i + PEER_ID_LEN]) {
-                let id = PeerId::try_from(&b[i..i + PEER_ID_LEN]).unwrap();
+        // Stopgap until log call sites format ids themselves (stage 1.5): any 43-char base64url
+        // token that parses as a node key and is known to the storage gets its name attached.
+        let is_b64 = |c: &u8| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_';
+        while i + NODE_ID_TEXT_LEN <= b.len() {
+            let boundary_before = i == 0 || !is_b64(&b[i - 1]);
+            let boundary_after = b.get(i + NODE_ID_TEXT_LEN).is_none_or(|c| !is_b64(c));
+            let token = &b[i..i + NODE_ID_TEXT_LEN];
+            let id = (boundary_before && boundary_after && token.iter().all(is_b64))
+                .then(|| msg[i..i + NODE_ID_TEXT_LEN].parse::<NodeId>().ok())
+                .flatten()
+                .filter(|id| storage.exists(id));
+            if let Some(id) = id {
                 let name = storage.name(&id).unwrap_or_else(|| "None".into());
                 out.push_str(&msg[last..i]);
                 out.push_str(&format!("{YELLOW}{name}{DARK_GREEN}({GREY}{id}{DARK_GREEN}){WHITE}"));
-                i += PEER_ID_LEN;
+                i += NODE_ID_TEXT_LEN;
                 last = i;
             } else {
                 i += 1;

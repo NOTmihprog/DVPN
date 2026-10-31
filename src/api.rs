@@ -21,8 +21,8 @@ use tokio::net::UnixDatagram;
 use tokio::sync::mpsc;
 
 use crate::crypto::encode_b64;
+use crate::identity::NodeId;
 use crate::node::{ApiPacket, Node};
-use crate::peer_id::PeerId;
 use crate::proto::{MAX_DATAGRAM, ROUTE_API_MAX, ROUTE_API_MIN};
 use crate::storage::{Event, PeerRecord, PeerUpdate, normalize_key};
 
@@ -185,7 +185,7 @@ fn event_value(e: &Event) -> Value {
     match e {
         Event::Peer { action, record, endpoint } => map(vec![
             ("action", action.as_str().into()),
-            ("peer_id", record.peer_id.as_str().into()),
+            ("peer_id", record.peer_id.to_string().into()),
             ("name", opt_str(record.name.clone())),
             ("addr", opt_str(record.addr.map(|a| a.to_string()))),
             ("endpoint", addr_value(*endpoint)),
@@ -195,7 +195,7 @@ fn event_value(e: &Event) -> Value {
         Event::Server { addr, connected } => {
             map(vec![("server", addr_value(Some(*addr))), ("status", (*connected).into())])
         }
-        Event::Ping { peer_id, ms } => map(vec![("peer_id", peer_id.as_str().into()), ("ping", (*ms).into())]),
+        Event::Ping { peer_id, ms } => map(vec![("peer_id", peer_id.to_string().into()), ("ping", (*ms).into())]),
     }
 }
 
@@ -304,7 +304,7 @@ impl Api {
                 ("type", "net".into()),
                 ("rou", route.into()),
                 ("pack", Value::Binary(data)),
-                ("peer_id", peer_id.as_str().into()),
+                ("peer_id", peer_id.to_string().into()),
             ]);
             self.sock.send(&v, &owner).await;
         }
@@ -389,7 +389,7 @@ impl Api {
     async fn handle_net(&self, p: &Value, from: &ApiAddr) {
         let route = field(p, "rou").and_then(Value::as_u64).and_then(|r| u8::try_from(r).ok());
         let data = field(p, "pack").and_then(|v| v.as_slice());
-        let peer = field(p, "peer_id").and_then(Value::as_str).and_then(|s| s.parse::<PeerId>().ok());
+        let peer = field(p, "peer_id").and_then(Value::as_str).and_then(|s| s.parse::<NodeId>().ok());
         let (Some(route), Some(data), Some(peer)) = (route, data, peer) else { return };
         if self.state.lock().route_owner.get(&route) != Some(from) {
             log::debug!("API | conn {from} drop packet to {peer}: route {route} not owned");
@@ -400,7 +400,7 @@ impl Api {
         }
     }
 
-    fn peer_arg(&self, p: &Value) -> Option<PeerId> {
+    fn peer_arg(&self, p: &Value) -> Option<NodeId> {
         field(p, "peer_id")?.as_str()?.parse().ok()
     }
 
@@ -411,8 +411,8 @@ impl Api {
         let rec = || peer.and_then(|id| storage.get(&id));
         let client = || field(p, "addr").and_then(parse_addr).and_then(|a| self.node.client(&a).cloned());
         match req {
-            "peer_id" => storage.self_id().as_str().into(),
-            "peers" => Value::Array(storage.ids().iter().map(|i| i.as_str().into()).collect()),
+            "peer_id" => storage.self_id().to_string().into(),
+            "peers" => Value::Array(storage.ids().iter().map(|i| i.to_string().into()).collect()),
             "peer_exist" => peer.is_some_and(|id| storage.exists(&id)).into(),
             "peer_name" => opt_str(rec().and_then(|(r, _)| r.name)),
             "peer_addr" => opt_str(rec().and_then(|(r, _)| r.addr.map(|a| a.to_string()))),

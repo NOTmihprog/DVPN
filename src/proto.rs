@@ -29,7 +29,7 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::peer_id::PeerId;
+use crate::identity::NodeId;
 
 pub const HELLO: u8 = 0x01;
 pub const HELLO_ACK: u8 = 0x02;
@@ -62,16 +62,16 @@ pub const SEARCH_BATCH: usize = 32;
 pub enum TrackerMsg {
     /// Client -> server: "I am `peer_id`, at the address you see this packet from".
     Announce {
-        peer_id: PeerId,
+        peer_id: NodeId,
     },
     /// Client -> server: "I want to connect to these peers".
     Search {
-        peers: Vec<PeerId>,
+        peers: Vec<NodeId>,
     },
     /// Server -> client: `peer_id` is reachable at `addr`. Sent for our own id in reply to
     /// an announce, and for a searched peer once both sides searched for each other.
     Found {
-        peer_id: PeerId,
+        peer_id: NodeId,
         addr: SocketAddr,
     },
     Close,

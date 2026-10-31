@@ -129,8 +129,7 @@ key = "$TKEY"
 TOML
     key=$("$D" --dir "$W/$1" show-key)
     [ ${#key} -eq 43 ] || fail "$1: show-key printed '$key', want a 43-char key"
-    id=$(sed -n 's/^peer_id = "\(.*\)"/\1/p' "$1/config.toml")
-    "$D" --dir "$W/$1" set -p "$id" -n "$1" -a "$2" -k "$("$D" --dir "$W/$1" gen-key)" >/dev/null
+    "$D" --dir "$W/$1" set -p "$key" -n "$1" -a "$2" -k "$("$D" --dir "$W/$1" gen-key)" >/dev/null
     "$D" --dir "$W/$1" export-peer -o "$W/$1.peer"
 }
 setup a 10.10.33.1

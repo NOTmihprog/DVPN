@@ -12,12 +12,12 @@ use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 
 use crate::crypto::{PeerCipher, decode_key32, encode_b64};
-use crate::peer_id::PeerId;
+use crate::identity::NodeId;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerRecord {
     #[serde(alias = "id")]
-    pub peer_id: PeerId,
+    pub peer_id: NodeId,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -30,7 +30,7 @@ pub struct PeerRecord {
 }
 
 impl PeerRecord {
-    pub fn new(peer_id: PeerId) -> Self {
+    pub fn new(peer_id: NodeId) -> Self {
         PeerRecord { peer_id, name: None, addr: None, key: None, sub_args: None }
     }
 }
@@ -71,7 +71,7 @@ impl Action {
 pub enum Event {
     Peer { action: Action, record: PeerRecord, endpoint: Option<SocketAddr> },
     Server { addr: SocketAddr, connected: bool },
-    Ping { peer_id: PeerId, ms: f64 },
+    Ping { peer_id: NodeId, ms: f64 },
 }
 
 /// Liveness of the direct link to a peer, reset whenever its endpoint changes.
@@ -120,11 +120,11 @@ impl Peer {
 }
 
 struct Inner {
-    self_id: PeerId,
-    order: Vec<PeerId>,
-    peers: HashMap<PeerId, Peer>,
-    by_endpoint: HashMap<SocketAddr, PeerId>,
-    by_addr: HashMap<Ipv4Addr, PeerId>,
+    self_id: NodeId,
+    order: Vec<NodeId>,
+    peers: HashMap<NodeId, Peer>,
+    by_endpoint: HashMap<SocketAddr, NodeId>,
+    by_addr: HashMap<Ipv4Addr, NodeId>,
 }
 
 impl Inner {
@@ -139,7 +139,7 @@ impl Inner {
         }
     }
 
-    fn set_endpoint(&mut self, id: PeerId, endpoint: Option<SocketAddr>) {
+    fn set_endpoint(&mut self, id: NodeId, endpoint: Option<SocketAddr>) {
         let Some(p) = self.peers.get_mut(&id) else { return };
         if p.endpoint == endpoint {
             return;
@@ -163,13 +163,13 @@ impl Inner {
 
 /// A route to a peer, as needed by the packet path.
 pub struct Route {
-    pub peer_id: PeerId,
+    pub peer_id: NodeId,
     pub endpoint: SocketAddr,
     pub cipher: Option<PeerCipher>,
 }
 
 pub struct Inbound {
-    pub peer_id: PeerId,
+    pub peer_id: NodeId,
     pub peer_addr: Option<Ipv4Addr>,
     pub own_cipher: Option<PeerCipher>,
 }
@@ -179,7 +179,7 @@ pub struct Inbound {
 #[derive(Default)]
 struct PacketView {
     by_addr: HashMap<Ipv4Addr, Arc<Route>>,
-    by_id: HashMap<PeerId, Arc<Route>>,
+    by_id: HashMap<NodeId, Arc<Route>>,
     by_endpoint: HashMap<SocketAddr, Arc<Inbound>>,
     own_cipher: Option<PeerCipher>,
 }
@@ -187,7 +187,7 @@ struct PacketView {
 impl PacketView {
     fn build(inner: &Inner) -> Self {
         let own_cipher = inner.peers[&inner.self_id].cipher.clone();
-        let by_id: HashMap<PeerId, Arc<Route>> = inner
+        let by_id: HashMap<NodeId, Arc<Route>> = inner
             .peers
             .iter()
             .filter_map(|(id, p)| {
@@ -218,12 +218,17 @@ pub struct PeerStorage {
 
 impl PeerStorage {
     /// Loads peers from `path` (JSON array); `None` keeps everything in memory.
-    pub fn load(self_id: PeerId, path: Option<PathBuf>) -> anyhow::Result<Self> {
+    pub fn load(self_id: NodeId, path: Option<PathBuf>) -> anyhow::Result<Self> {
         let mut records: Vec<PeerRecord> = Vec::new();
         if let Some(p) = &path {
             match std::fs::read(p) {
                 Ok(data) => {
-                    records = serde_json::from_slice(&data).with_context(|| format!("parse {}", p.display()))?
+                    records = serde_json::from_slice(&data).with_context(|| {
+                        format!(
+                            "parse {} (v3 files with 32-char peer ids are not supported, peers are node keys now)",
+                            p.display()
+                        )
+                    })?
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => log::warn!("PeerStorage | read file({}) error: {e}", p.display()),
@@ -280,25 +285,15 @@ impl PeerStorage {
         }
     }
 
-    pub fn self_id(&self) -> PeerId {
+    pub fn self_id(&self) -> NodeId {
         self.inner.read().self_id
     }
 
-    pub fn set_self_id(&self, id: PeerId) {
-        let mut inner = self.inner.write();
-        inner.self_id = id;
-        if !inner.peers.contains_key(&id) {
-            inner.order.push(id);
-            inner.peers.insert(id, Peer::new(PeerRecord::new(id)));
-        }
-        self.publish(&inner);
-    }
-
-    pub fn is_self(&self, id: &PeerId) -> bool {
+    pub fn is_self(&self, id: &NodeId) -> bool {
         self.inner.read().self_id == *id
     }
 
-    pub fn set_peer(&self, id: PeerId, u: PeerUpdate) {
+    pub fn set_peer(&self, id: NodeId, u: PeerUpdate) {
         let persist = u.name.is_some() || u.addr.is_some() || u.key.is_some() || u.sub_args.is_some();
         let event = {
             let mut inner = self.inner.write();
@@ -342,7 +337,7 @@ impl PeerStorage {
         }
     }
 
-    pub fn del_peer(&self, id: &PeerId) -> bool {
+    pub fn del_peer(&self, id: &NodeId) -> bool {
         let rec = {
             let mut inner = self.inner.write();
             inner.set_endpoint(*id, None);
@@ -357,7 +352,7 @@ impl PeerStorage {
         true
     }
 
-    pub fn del_endpoint(&self, id: &PeerId) -> bool {
+    pub fn del_endpoint(&self, id: &NodeId) -> bool {
         let rec = {
             let mut inner = self.inner.write();
             if !inner.peers.contains_key(id) {
@@ -371,7 +366,7 @@ impl PeerStorage {
         true
     }
 
-    pub fn get(&self, id: &PeerId) -> Option<(PeerRecord, Option<SocketAddr>)> {
+    pub fn get(&self, id: &NodeId) -> Option<(PeerRecord, Option<SocketAddr>)> {
         let inner = self.inner.read();
         inner.peers.get(id).map(|p| (p.rec.clone(), p.endpoint))
     }
@@ -381,42 +376,42 @@ impl PeerStorage {
         inner.order.iter().map(|id| (inner.peers[id].rec.clone(), inner.peers[id].endpoint)).collect()
     }
 
-    pub fn ids(&self) -> Vec<PeerId> {
+    pub fn ids(&self) -> Vec<NodeId> {
         self.inner.read().order.clone()
     }
 
-    pub fn exists(&self, id: &PeerId) -> bool {
+    pub fn exists(&self, id: &NodeId) -> bool {
         self.inner.read().peers.contains_key(id)
     }
 
-    pub fn name(&self, id: &PeerId) -> Option<String> {
+    pub fn name(&self, id: &NodeId) -> Option<String> {
         self.inner.read().peers.get(id).and_then(|p| p.rec.name.clone())
     }
 
-    pub fn endpoint(&self, id: &PeerId) -> Option<SocketAddr> {
+    pub fn endpoint(&self, id: &NodeId) -> Option<SocketAddr> {
         self.inner.read().peers.get(id).and_then(|p| p.endpoint)
     }
 
-    pub fn has_cipher(&self, id: &PeerId) -> bool {
+    pub fn has_cipher(&self, id: &NodeId) -> bool {
         self.inner.read().peers.get(id).is_some_and(|p| p.cipher.is_some())
     }
 
-    /// Resolves a (possibly shortened) peer id.
-    pub fn find(&self, prefix: &str) -> Option<PeerId> {
+    /// Resolves a (possibly shortened) node key.
+    pub fn find(&self, prefix: &str) -> Option<NodeId> {
         if prefix.is_empty() {
             return None;
         }
-        self.inner.read().order.iter().find(|id| id.as_str().starts_with(prefix)).copied()
+        self.inner.read().order.iter().find(|id| id.to_string().starts_with(prefix)).copied()
     }
 
     /// Everyone except ourselves.
-    pub fn others(&self) -> Vec<PeerId> {
+    pub fn others(&self) -> Vec<NodeId> {
         let inner = self.inner.read();
         inner.order.iter().filter(|id| **id != inner.self_id).copied().collect()
     }
 
     /// Peers with an endpoint and their link state (for the ping loop).
-    pub fn links(&self) -> Vec<(PeerId, Link)> {
+    pub fn links(&self) -> Vec<(NodeId, Link)> {
         let inner = self.inner.read();
         inner
             .order
@@ -426,7 +421,7 @@ impl PeerStorage {
             .collect()
     }
 
-    pub fn update_link(&self, id: &PeerId, f: impl FnOnce(&mut Link)) {
+    pub fn update_link(&self, id: &NodeId, f: impl FnOnce(&mut Link)) {
         if let Some(p) = self.inner.write().peers.get_mut(id)
             && p.endpoint.is_some()
         {
@@ -435,7 +430,7 @@ impl PeerStorage {
     }
 
     /// Whether we heard from the peer at its current endpoint within `within`.
-    pub fn link_alive(&self, id: &PeerId, within: Duration) -> bool {
+    pub fn link_alive(&self, id: &NodeId, within: Duration) -> bool {
         let inner = self.inner.read();
         inner
             .peers
@@ -444,7 +439,7 @@ impl PeerStorage {
     }
 
     /// Records a control packet's (session, seq); false if it is not newer than what we saw (replay).
-    pub fn accept_seq(&self, id: &PeerId, session: u64, seq: u64) -> bool {
+    pub fn accept_seq(&self, id: &NodeId, session: u64, seq: u64) -> bool {
         let mut inner = self.inner.write();
         let Some(p) = inner.peers.get_mut(id) else { return false };
         let fresh = match p.seq {
@@ -461,7 +456,7 @@ impl PeerStorage {
         self.view.load().own_cipher.clone()
     }
 
-    pub fn rtt_ms(&self, id: &PeerId) -> Option<f64> {
+    pub fn rtt_ms(&self, id: &NodeId) -> Option<f64> {
         self.inner.read().peers.get(id).and_then(|p| p.endpoint.and(p.link.rtt_ms))
     }
 
@@ -471,7 +466,7 @@ impl PeerStorage {
         self.view.load().by_addr.get(&dst).cloned()
     }
 
-    pub fn route_by_id(&self, id: &PeerId) -> Option<Arc<Route>> {
+    pub fn route_by_id(&self, id: &NodeId) -> Option<Arc<Route>> {
         self.view.load().by_id.get(id).cloned()
     }
 
@@ -488,9 +483,9 @@ mod tests {
 
     #[test]
     fn set_and_route() {
-        let me = PeerId::generate();
+        let me = NodeId::random();
         let s = PeerStorage::load(me, None).unwrap();
-        let other = PeerId::generate();
+        let other = NodeId::random();
         let ip = Ipv4Addr::new(10, 0, 0, 2);
         let ep: SocketAddr = "1.2.3.4:5000".parse().unwrap();
         s.set_peer(other, PeerUpdate { addr: Some(Some(ip)), key: Some(Some(generate_key())), ..Default::default() });
@@ -510,9 +505,9 @@ mod tests {
 
     #[test]
     fn packet_view_follows_changes() {
-        let me = PeerId::generate();
+        let me = NodeId::random();
         let s = PeerStorage::load(me, None).unwrap();
-        let other = PeerId::generate();
+        let other = NodeId::random();
         let (ip, ip2) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
         let ep: SocketAddr = "1.2.3.4:5000".parse().unwrap();
         s.set_peer(other, PeerUpdate { addr: Some(Some(ip)), endpoint: Some(Some(ep)), ..Default::default() });
@@ -529,10 +524,6 @@ mod tests {
         s.set_peer(me, PeerUpdate { key: Some(Some(generate_key())), ..Default::default() });
         assert!(s.own_cipher().is_some() && s.inbound(&ep).unwrap().own_cipher.is_some());
 
-        let new_self = PeerId::generate();
-        s.set_self_id(new_self);
-        assert!(s.own_cipher().is_none(), "new self id has no key yet");
-
         assert!(s.route_by_id(&other).is_some());
         s.del_endpoint(&other);
         assert!(s.route_by_id(&other).is_none() && s.inbound(&ep).is_none());
@@ -540,8 +531,8 @@ mod tests {
 
     #[test]
     fn endpoint_moves_between_peers() {
-        let s = PeerStorage::load(PeerId::generate(), None).unwrap();
-        let (a, b) = (PeerId::generate(), PeerId::generate());
+        let s = PeerStorage::load(NodeId::random(), None).unwrap();
+        let (a, b) = (NodeId::random(), NodeId::random());
         let ep: SocketAddr = "1.2.3.4:5000".parse().unwrap();
         s.set_peer(a, PeerUpdate { endpoint: Some(Some(ep)), ..Default::default() });
         s.set_peer(b, PeerUpdate { endpoint: Some(Some(ep)), ..Default::default() });
@@ -556,13 +547,13 @@ mod bench {
     use crate::crypto::generate_key;
 
     fn populated(n: u8) -> (Arc<PeerStorage>, Vec<Ipv4Addr>, Vec<SocketAddr>) {
-        let s = Arc::new(PeerStorage::load(PeerId::generate(), None).unwrap());
+        let s = Arc::new(PeerStorage::load(NodeId::random(), None).unwrap());
         let (mut ips, mut eps) = (Vec::new(), Vec::new());
         for i in 0..n {
             let ip = Ipv4Addr::new(10, 0, 0, i + 2);
             let ep: SocketAddr = format!("192.0.2.{}:{}", i + 1, 5000 + i as u16).parse().unwrap();
             s.set_peer(
-                PeerId::generate(),
+                NodeId::random(),
                 PeerUpdate {
                     addr: Some(Some(ip)),
                     key: Some(Some(generate_key())),

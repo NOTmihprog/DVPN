@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 
 use crate::crypto::{TrackerSession, server_accept};
-use crate::peer_id::PeerId;
+use crate::identity::NodeId;
 use crate::proto::{HELLO, MAX_DATAGRAM, SEARCH_BATCH, TRACKER, TrackerMsg};
 
 const TIMEOUT: Duration = Duration::from_secs(45);
@@ -17,15 +17,15 @@ const MAX_SEARCHES: usize = 4096;
 
 struct Session {
     crypto: TrackerSession,
-    peer_id: Option<PeerId>,
+    peer_id: Option<NodeId>,
     last_announce: Instant,
 }
 
 #[derive(Default)]
 struct State {
     sessions: HashMap<SocketAddr, Session>,
-    by_peer: HashMap<PeerId, SocketAddr>,
-    searches: HashMap<PeerId, HashSet<PeerId>>,
+    by_peer: HashMap<NodeId, SocketAddr>,
+    searches: HashMap<NodeId, HashSet<NodeId>>,
 }
 
 type Out = Vec<(Vec<u8>, SocketAddr)>;
@@ -51,7 +51,7 @@ impl State {
         log::info!("Server | {addr} Session dropped");
     }
 
-    fn announce(&mut self, out: &mut Out, addr: SocketAddr, peer_id: PeerId) {
+    fn announce(&mut self, out: &mut Out, addr: SocketAddr, peer_id: NodeId) {
         let s = self.sessions.get_mut(&addr).unwrap();
         s.last_announce = Instant::now();
         match s.peer_id {
@@ -75,7 +75,7 @@ impl State {
         self.send(out, addr, &TrackerMsg::Found { peer_id, addr });
     }
 
-    fn search(&mut self, out: &mut Out, addr: SocketAddr, peers: Vec<PeerId>) {
+    fn search(&mut self, out: &mut Out, addr: SocketAddr, peers: Vec<NodeId>) {
         let Some(me) = self.sessions.get(&addr).and_then(|s| s.peer_id) else { return };
         for target in peers.into_iter().take(SEARCH_BATCH) {
             if target == me {

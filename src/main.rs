@@ -15,7 +15,7 @@ use dvpn::{api, config, logger, node, tracker_server, transport};
 use dvpn::config::{Config, PEERS_FILE_NAME, SOCKET_DEFAULT_ADDR};
 use dvpn::crypto::{decode_b64, encode_b64, random_bytes};
 use dvpn::identity::Identity;
-use dvpn::peer_id::{PEER_ID_LEN, PeerId};
+use dvpn::identity::NodeId;
 use dvpn::storage::{PeerRecord, PeerStorage, PeerUpdate, normalize_key};
 use dvpn::tracker_client::TrackerClient;
 
@@ -58,8 +58,6 @@ struct OutputArgs {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate new peer-id
-    GenPeerId,
     /// Generate a new node private key (base64url; for now also usable as a peer encryption key)
     GenKey,
     /// Print the node public key (node id) from config.toml / DVPN_PRIVATE_KEY
@@ -70,7 +68,7 @@ enum Command {
     },
     /// Set or add peer or peer parameters
     Set {
-        /// Peer_id: len 32, alphanumeric, generate: gen-peer-id (a unique prefix of a known id is enough)
+        /// Node key (public, base64url; see show-key). A unique prefix of a known key is enough
         #[arg(short = 'p', long)]
         peer_id: String,
         /// Peer name, "None" to clear
@@ -85,9 +83,6 @@ enum Command {
         /// Clear parameters that are not given
         #[arg(short = 'c', long)]
         clear: bool,
-        /// Use this peer id and its LAN address as self
-        #[arg(short = 's', long = "self")]
-        set_self: bool,
     },
     /// Delete peer by id
     Del {
@@ -140,12 +135,12 @@ fn default_dir() -> PathBuf {
     std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn resolve_peer_id(s: &str, storage: &PeerStorage) -> PeerId {
-    if s.len() < PEER_ID_LEN {
-        storage.find(s).unwrap_or_else(|| die(format!("Peer_id {s} not found")))
-    } else {
-        s.parse().unwrap_or_else(|e| die(format!("Peer_id {s} invalid: {e}")))
+/// A full node key, or a prefix of one already in the storage.
+fn resolve_peer_id(s: &str, storage: &PeerStorage) -> NodeId {
+    if let Ok(id) = s.parse() {
+        return id;
     }
+    storage.find(s).unwrap_or_else(|| die(format!("Node key {s} is neither a valid key nor a known prefix")))
 }
 
 fn github_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -247,16 +242,13 @@ fn cli_field(v: Option<String>) -> Option<Option<String>> {
     v.map(|s| if s == "None" || s.is_empty() { None } else { Some(s) })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_set(
-    conf: &mut Config,
     storage: &PeerStorage,
     peer_id: String,
     name: Option<String>,
     addr: Option<String>,
     key: Option<String>,
     clear: bool,
-    set_self: bool,
 ) {
     let id = resolve_peer_id(&peer_id, storage);
     let addr = cli_field(addr)
@@ -277,15 +269,6 @@ fn cmd_set(
             sub_args: None,
         },
     );
-
-    if set_self {
-        conf.set_peer_id(id);
-        if let Some(a) = storage.get(&id).and_then(|(r, _)| r.addr) {
-            conf.set_net_addr(a);
-        }
-        conf.save();
-        storage.set_self_id(id);
-    }
     list_peers(storage);
 }
 
@@ -385,7 +368,6 @@ fn main() {
         return;
     }
     match &cli.command {
-        Some(Command::GenPeerId) => return println!("{}", PeerId::generate()),
         Some(Command::GenKey) => return println!("{}", Identity::generate().private_key_text()),
         Some(Command::ShowKey { key: Some(k) }) => {
             let id = Identity::from_private_key_text(k).unwrap_or_else(|e| {
@@ -405,7 +387,7 @@ fn main() {
         conf.net = None;
     }
 
-    let storage = PeerStorage::load(conf.peer.peer_id, Some(dir.join(PEERS_FILE_NAME)))
+    let storage = PeerStorage::load(conf.identity.id(), Some(dir.join(PEERS_FILE_NAME)))
         .unwrap_or_else(|e| die(format!("Error, {e:#}")));
     let self_id = storage.self_id();
 
@@ -432,11 +414,9 @@ fn main() {
             log::info!("Node key: {}", conf.identity.id());
             rt.block_on(run_node(conf, Arc::new(storage), cli.api_addr));
         }
-        Some(Command::GenPeerId | Command::GenKey | Command::ShowKey { key: Some(_) }) => unreachable!(),
+        Some(Command::GenKey | Command::ShowKey { key: Some(_) }) => unreachable!(),
         Some(Command::ShowKey { key: None }) => println!("{}", conf.identity.id()),
-        Some(Command::Set { peer_id, name, addr, key, clear, set_self }) => {
-            cmd_set(&mut conf, &storage, peer_id, name, addr, key, clear, set_self)
-        }
+        Some(Command::Set { peer_id, name, addr, key, clear }) => cmd_set(&storage, peer_id, name, addr, key, clear),
         Some(Command::Del { peer_id }) => {
             let id = resolve_peer_id(&peer_id, &storage);
             if storage.is_self(&id) {

@@ -71,6 +71,14 @@ impl NodeId {
     }
 }
 
+#[cfg(test)]
+impl NodeId {
+    /// A fresh valid id, for tests.
+    pub(crate) fn random() -> Self {
+        Identity::generate().id()
+    }
+}
+
 impl From<VerifyingKey> for NodeId {
     fn from(key: VerifyingKey) -> Self {
         NodeId(key.to_bytes())

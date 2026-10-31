@@ -8,7 +8,6 @@ pub mod identity;
 pub mod logger;
 pub mod node;
 pub mod packet;
-pub mod peer_id;
 pub mod proto;
 pub mod storage;
 pub mod tracker_client;

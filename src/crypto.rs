@@ -10,7 +10,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::peer_id::PeerId;
+use crate::identity::NodeId;
 use crate::proto::{HELLO, HELLO_ACK, HELLO_ACK_LEN, HELLO_LEN, HELLO_SIG_CTX, KEYS_CTX, SEALED, TRACKER};
 
 pub const TAG_LEN: usize = 16;
@@ -61,7 +61,7 @@ impl PeerCipher {
 
     /// The sender is not bound here: a packet must be decryptable before we know who sent it,
     /// so that a peer whose NAT changed its port can be recognized (see `node` roaming).
-    fn aad(recipient: &PeerId) -> [u8; 33] {
+    fn aad(recipient: &NodeId) -> [u8; 33] {
         let mut aad = [0u8; 33];
         aad[0] = SEALED;
         aad[1..].copy_from_slice(recipient.as_bytes());
@@ -70,7 +70,7 @@ impl PeerCipher {
 
     /// `buf[SEALED_HDR..SEALED_HDR + plain_len]` holds the plaintext; the header is written in
     /// front of it and the tag after it. `buf` needs `TAG_LEN` spare bytes. Returns packet length.
-    pub fn seal(&self, buf: &mut [u8], plain_len: usize, recipient: &PeerId) -> usize {
+    pub fn seal(&self, buf: &mut [u8], plain_len: usize, recipient: &NodeId) -> usize {
         let nonce: [u8; 24] = random_bytes();
         buf[0] = SEALED;
         buf[1..SEALED_HDR].copy_from_slice(&nonce);
@@ -88,7 +88,7 @@ impl PeerCipher {
     }
 
     /// Decrypts a SEALED packet in place, returning the plaintext range inside `packet`.
-    pub fn open(&self, packet: &mut [u8], recipient: &PeerId) -> Option<Range<usize>> {
+    pub fn open(&self, packet: &mut [u8], recipient: &NodeId) -> Option<Range<usize>> {
         if packet.len() < SEALED_HDR + TAG_LEN || packet[0] != SEALED {
             return None;
         }
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn peer_seal_open() {
         let c = PeerCipher::new(&random_bytes());
-        let (a, b) = (PeerId::generate(), PeerId::generate());
+        let (a, b) = (NodeId::random(), NodeId::random());
         let mut buf = vec![0u8; 256];
         buf[SEALED_HDR..SEALED_HDR + 5].copy_from_slice(b"\x01data");
         let n = c.seal(&mut buf, 5, &b);
@@ -345,7 +345,7 @@ mod bench {
     #[ignore]
     fn bench_peer_cipher() {
         let c = PeerCipher::new(&random_bytes());
-        let b = PeerId::generate();
+        let b = NodeId::random();
         let mut buf = vec![0u8; 2048];
         let n = 100_000;
         let t = std::time::Instant::now();

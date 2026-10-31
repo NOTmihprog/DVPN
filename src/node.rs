@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use tun_rs::AsyncDevice;
 
 use crate::crypto::{SEALED_HDR, TAG_LEN};
+use crate::identity::NodeId;
 use crate::packet::{self, IpInfo};
-use crate::peer_id::PeerId;
 use crate::proto::{
     CONTROL_LEN, CONTROL_PING, CONTROL_PONG, HELLO_ACK, MAX_DATAGRAM, PLAIN, ROAM_MAX_LEN, ROUTE_API_MIN,
     ROUTE_CONTROL, ROUTE_NET, SEALED, TRACKER,
@@ -28,7 +28,7 @@ struct Control {
     echo_ts: u64,
     session: u64,
     seq: u64,
-    sender: PeerId,
+    sender: NodeId,
 }
 
 impl Control {
@@ -42,13 +42,13 @@ impl Control {
             echo_ts: u64_at(1),
             session: u64_at(9),
             seq: u64_at(17),
-            sender: PeerId::try_from(&p[25..CONTROL_LEN]).ok()?,
+            sender: NodeId::try_from(&p[25..CONTROL_LEN]).ok()?,
         })
     }
 }
 
 /// A packet for an API client: (route, from peer, payload).
-pub type ApiPacket = (u8, PeerId, Vec<u8>);
+pub type ApiPacket = (u8, NodeId, Vec<u8>);
 
 pub struct Node {
     pub storage: Arc<PeerStorage>,
@@ -56,7 +56,7 @@ pub struct Node {
     pub clients: Vec<Arc<TrackerClient>>,
     clients_by_addr: HashMap<SocketAddr, Arc<TrackerClient>>,
     tun: Option<Arc<AsyncDevice>>,
-    self_id: PeerId,
+    self_id: NodeId,
     self_addr: Option<Ipv4Addr>,
     api_tx: OnceLock<mpsc::Sender<ApiPacket>>,
     epoch: Instant,
@@ -120,7 +120,7 @@ impl Node {
     }
 
     /// Sends `payload` on `route` to a peer with a known endpoint. Not for the TUN hot path.
-    pub async fn send_routed(&self, peer_id: &PeerId, route: u8, payload: &[u8]) -> bool {
+    pub async fn send_routed(&self, peer_id: &NodeId, route: u8, payload: &[u8]) -> bool {
         let Some(r) = self.storage.route_by_id(peer_id) else { return false };
         let mut buf = vec![0u8; SEALED_HDR + 1 + payload.len() + TAG_LEN];
         buf[SEALED_HDR] = route;
@@ -192,7 +192,7 @@ impl Node {
         }
     }
 
-    async fn handle_control(&self, peer: PeerId, c: Control) {
+    async fn handle_control(&self, peer: NodeId, c: Control) {
         match c.kind {
             CONTROL_PING => {
                 self.storage.update_link(&peer, |l| l.last_seen = Some(Instant::now()));
