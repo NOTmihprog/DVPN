@@ -25,7 +25,7 @@ use crate::identity::NodeId;
 use crate::logger::node;
 use crate::node::{ApiPacket, Node};
 use crate::proto::{MAX_DATAGRAM, ROUTE_API_MAX, ROUTE_API_MIN};
-use crate::storage::{Event, PeerRecord, PeerUpdate, normalize_key};
+use crate::storage::{Event, PeerRecord, PeerUpdate, ResolveError, normalize_key};
 
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const CONN_TIMEOUT: Duration = Duration::from_secs(45);
@@ -390,7 +390,7 @@ impl Api {
     async fn handle_net(&self, p: &Value, from: &ApiAddr) {
         let route = field(p, "rou").and_then(Value::as_u64).and_then(|r| u8::try_from(r).ok());
         let data = field(p, "pack").and_then(|v| v.as_slice());
-        let peer = field(p, "peer_id").and_then(Value::as_str).and_then(|s| s.parse::<NodeId>().ok());
+        let peer = self.peer_arg(p).ok();
         let (Some(route), Some(data), Some(peer)) = (route, data, peer) else { return };
         if self.state.lock().route_owner.get(&route) != Some(from) {
             log::debug!("API | conn {from} drop packet to {}: route {route} not owned", node(peer));
@@ -401,14 +401,20 @@ impl Api {
         }
     }
 
-    fn peer_arg(&self, p: &Value) -> Option<NodeId> {
-        field(p, "peer_id")?.as_str()?.parse().ok()
+    /// `peer_id`: a full node key or a unique prefix of a known one. Error codes for replies:
+    /// `peer_id_validate_error` (missing, invalid or unknown), `peer_id_ambiguous`.
+    fn peer_arg(&self, p: &Value) -> Result<NodeId, &'static str> {
+        let s = field(p, "peer_id").and_then(Value::as_str).ok_or("peer_id_validate_error")?;
+        self.node.storage.resolve(s).map_err(|e| match e {
+            ResolveError::NotFound => "peer_id_validate_error",
+            ResolveError::Ambiguous(_) => "peer_id_ambiguous",
+        })
     }
 
     fn handle_get(&self, p: &Value) -> Value {
         let storage = &self.node.storage;
         let req = field(p, "req").and_then(Value::as_str).unwrap_or_default();
-        let peer = self.peer_arg(p);
+        let peer = self.peer_arg(p).ok();
         let rec = || peer.and_then(|id| storage.get(&id));
         let client = || field(p, "addr").and_then(parse_addr).and_then(|a| self.node.client(&a).cloned());
         match req {
@@ -444,7 +450,10 @@ impl Api {
         if field(p, "req").and_then(Value::as_str) != Some("peer") {
             return Value::Nil;
         }
-        let Some(peer) = self.peer_arg(p) else { return err("peer_id_validate_error") };
+        let peer = match self.peer_arg(p) {
+            Ok(id) => id,
+            Err(code) => return err(code),
+        };
         let force = match field(p, "force") {
             None => false,
             Some(Value::Boolean(b)) => *b,
@@ -510,7 +519,10 @@ impl Api {
 
     fn handle_del(&self, p: &Value) -> Value {
         let storage = &self.node.storage;
-        let Some(peer) = self.peer_arg(p) else { return err("peer_id_validate_error") };
+        let peer = match self.peer_arg(p) {
+            Ok(id) => id,
+            Err(code) => return err(code),
+        };
         if !storage.exists(&peer) {
             return err("peer_not_exist");
         }

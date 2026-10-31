@@ -135,12 +135,9 @@ fn default_dir() -> PathBuf {
     std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// A full node key, or a prefix of one already in the storage.
+/// A full node key, or a unique prefix of one already in the storage.
 fn resolve_peer_id(s: &str, storage: &PeerStorage) -> NodeId {
-    if let Ok(id) = s.parse() {
-        return id;
-    }
-    storage.find(s).unwrap_or_else(|| die(format!("Node key {s} is neither a valid key nor a known prefix")))
+    storage.resolve(s).unwrap_or_else(|e| die(format!("Node key {s}: {e}")))
 }
 
 fn github_table(headers: &[&str], rows: &[Vec<String>]) -> String {

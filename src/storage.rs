@@ -41,6 +41,25 @@ pub fn normalize_key(key: &str) -> anyhow::Result<String> {
     Ok(encode_b64(&decode_key32(key)?))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveError {
+    /// Neither a valid key nor a prefix of a known one.
+    NotFound,
+    /// The prefix matches this many known keys.
+    Ambiguous(usize),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::NotFound => f.write_str("neither a valid node key nor a prefix of a known one"),
+            ResolveError::Ambiguous(n) => write!(f, "prefix matches {n} known keys, give more characters"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
 /// Each field: `None` = leave unchanged, `Some(v)` = set to `v` (`Some(None)` clears).
 #[derive(Default)]
 pub struct PeerUpdate {
@@ -406,12 +425,24 @@ impl PeerStorage {
         self.inner.read().peers.get(id).is_some_and(|p| p.cipher.is_some())
     }
 
-    /// Resolves a (possibly shortened) node key.
-    pub fn find(&self, prefix: &str) -> Option<NodeId> {
-        if prefix.is_empty() {
-            return None;
+    /// A full node key (known or not), or a prefix that matches exactly one known key.
+    /// The prefix may use the standard base64 alphabet (`+/`) too.
+    pub fn resolve(&self, s: &str) -> Result<NodeId, ResolveError> {
+        let s = s.trim();
+        if let Ok(id) = s.parse() {
+            return Ok(id);
         }
-        self.inner.read().order.iter().find(|id| id.to_string().starts_with(prefix)).copied()
+        if s.is_empty() {
+            return Err(ResolveError::NotFound);
+        }
+        let prefix = s.replace('+', "-").replace('/', "_");
+        let inner = self.inner.read();
+        let mut hits = inner.order.iter().filter(|id| id.to_string().starts_with(&prefix));
+        match (hits.next(), hits.count()) {
+            (None, _) => Err(ResolveError::NotFound),
+            (Some(id), 0) => Ok(*id),
+            (Some(_), more) => Err(ResolveError::Ambiguous(more + 1)),
+        }
     }
 
     /// Everyone except ourselves.
@@ -537,6 +568,37 @@ mod tests {
         assert!(s.route_by_id(&other).is_some());
         s.del_endpoint(&other);
         assert!(s.route_by_id(&other).is_none() && s.inbound(&ep).is_none());
+    }
+
+    #[test]
+    fn resolve_full_key_and_unique_prefix() {
+        let me = NodeId::random();
+        let s = PeerStorage::load(me, None).unwrap();
+        let unknown = NodeId::random();
+        assert_eq!(s.resolve(&unknown.to_string()), Ok(unknown), "full keys need not be known (set adds them)");
+        assert_eq!(s.resolve(&format!(" {me}\n")), Ok(me));
+        let text = me.to_string();
+        assert_eq!(s.resolve(&text[..6]), Ok(me));
+        // standard base64 alphabet in a prefix
+        let std_prefix = text[..20].replace('-', "+").replace('_', "/");
+        assert_eq!(s.resolve(&std_prefix), Ok(me));
+        assert_eq!(s.resolve(""), Err(ResolveError::NotFound));
+        assert_eq!(s.resolve("!!"), Err(ResolveError::NotFound));
+
+        // Add keys until two share a first character, then that character is ambiguous.
+        let mut by_first: HashMap<char, NodeId> = HashMap::from([(text.chars().next().unwrap(), me)]);
+        let (a, b) = loop {
+            let id = NodeId::random();
+            s.set_peer(id, PeerUpdate::default());
+            if let Some(prev) = by_first.insert(id.to_string().chars().next().unwrap(), id) {
+                break (prev, id);
+            }
+        };
+        let first = &a.to_string()[..1];
+        assert_eq!(s.resolve(first), Err(ResolveError::Ambiguous(2)));
+        let common = a.to_string().chars().zip(b.to_string().chars()).take_while(|(x, y)| x == y).count();
+        assert_eq!(s.resolve(&a.to_string()[..common + 1]), Ok(a));
+        assert_eq!(s.resolve(&b.to_string()[..common + 1]), Ok(b));
     }
 
     #[test]
