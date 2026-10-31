@@ -134,6 +134,7 @@ impl<'de> Deserialize<'de> for NodeId {
 }
 
 /// A node's own keys: the Ed25519 signing key and the X25519 key derived from it.
+#[derive(Clone)]
 pub struct Identity {
     signing: SigningKey,
     x25519: StaticSecret,

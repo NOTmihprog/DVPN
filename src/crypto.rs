@@ -11,7 +11,9 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::identity::NodeId;
-use crate::proto::{HELLO, HELLO_ACK, HELLO_ACK_LEN, HELLO_LEN, HELLO_SIG_CTX, KEYS_CTX, SEALED, TRACKER};
+use crate::proto::{
+    ANNOUNCE_SIG_CTX, HELLO, HELLO_ACK, HELLO_ACK_LEN, HELLO_LEN, HELLO_SIG_CTX, KEYS_CTX, SEALED, TRACKER,
+};
 
 pub const TAG_LEN: usize = 16;
 /// `[SEALED][nonce 24]`
@@ -139,6 +141,8 @@ pub struct TrackerSession {
     rx: ChaCha20Poly1305,
     tx_counter: u64,
     replay: ReplayWindow,
+    /// What a node signs to prove it owns the key it announces in this session (§11).
+    announce_msg: Vec<u8>,
 }
 
 fn counter_nonce(n: u64) -> Nonce {
@@ -162,7 +166,14 @@ impl TrackerSession {
         let c2s = ChaCha20Poly1305::new_from_slice(&okm[..32]).unwrap();
         let s2c = ChaCha20Poly1305::new_from_slice(&okm[32..]).unwrap();
         let (tx, rx) = if is_client { (c2s, s2c) } else { (s2c, c2s) };
-        TrackerSession { tx, rx, tx_counter: 0, replay: ReplayWindow::default() }
+        let announce_msg = [ANNOUNCE_SIG_CTX, client_pub, nonce, server_pub].concat();
+        TrackerSession { tx, rx, tx_counter: 0, replay: ReplayWindow::default(), announce_msg }
+    }
+
+    /// The handshake transcript `ctx|client_eph|nonce|server_eph`, unique to this session, so an
+    /// `Announce` signature cannot be replayed in another session.
+    pub fn announce_msg(&self) -> &[u8] {
+        &self.announce_msg
     }
 
     pub fn seal(&mut self, msg: &[u8]) -> Vec<u8> {

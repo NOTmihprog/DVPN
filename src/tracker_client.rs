@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
 use parking_lot::Mutex;
 
 use crate::crypto::{ClientHandshake, TrackerSession};
+use crate::identity::Identity;
 use crate::logger::node;
 use crate::proto::{HELLO_ACK, SEARCH_BATCH, TRACKER, TrackerMsg};
 use crate::storage::{PeerStorage, PeerUpdate};
@@ -42,6 +44,7 @@ pub struct Output {
 pub struct TrackerClient {
     pub addr: SocketAddr,
     pub key: VerifyingKey,
+    identity: Arc<Identity>,
     state: Mutex<State>,
     log_prefix: String,
 }
@@ -59,10 +62,10 @@ impl State {
 }
 
 impl TrackerClient {
-    pub fn new(name: String, addr: SocketAddr, key: VerifyingKey) -> Self {
+    pub fn new(name: String, addr: SocketAddr, key: VerifyingKey, identity: Arc<Identity>) -> Self {
         let log_prefix = format!("Client {name} {addr} |");
         log::info!("{log_prefix} Connection status initiated");
-        TrackerClient { addr, key, state: Mutex::new(State::default()), log_prefix }
+        TrackerClient { addr, key, identity, state: Mutex::new(State::default()), log_prefix }
     }
 
     pub fn is_connected(&self) -> bool {
@@ -97,7 +100,8 @@ impl TrackerClient {
 
         if s.last_announce.is_none_or(|t| t.elapsed() >= ANNOUNCE_INTERVAL) {
             log::debug!("{} Send announce", self.log_prefix);
-            s.send(&mut out, &TrackerMsg::Announce { peer_id: storage.self_id() });
+            let sig = self.identity.sign(s.session.as_ref().expect("checked above").announce_msg());
+            s.send(&mut out, &TrackerMsg::Announce { peer_id: self.identity.id(), sig });
             s.last_announce = Some(Instant::now());
             s.announce_ts = unix_now();
         }

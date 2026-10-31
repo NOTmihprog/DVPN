@@ -327,7 +327,9 @@ async fn run_node(conf: Config, storage: Arc<PeerStorage>, api_addr: Option<Stri
         Err(e) => die(format!("TUN | Tun init error: {e}")),
     });
 
-    let clients = conf.servers.iter().map(|s| TrackerClient::new(s.name.clone(), s.addr, s.key)).collect();
+    let identity = Arc::new(conf.identity.clone());
+    let clients =
+        conf.servers.iter().map(|s| TrackerClient::new(s.name.clone(), s.addr, s.key, identity.clone())).collect();
     let node = node::Node::new(storage, transport, clients, tun, conf.net.as_ref().map(|n| n.addr));
     node.start();
     let _api = api::Api::start(node.clone(), api_sock);

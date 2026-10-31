@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, SigningKey};
 use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 
@@ -52,8 +52,14 @@ impl State {
         log::info!("Server | {addr} Session dropped");
     }
 
-    fn announce(&mut self, out: &mut Out, addr: SocketAddr, peer_id: NodeId) {
+    fn announce(&mut self, out: &mut Out, addr: SocketAddr, peer_id: NodeId, sig: Signature) {
         let s = self.sessions.get_mut(&addr).unwrap();
+        // Only the key owner can sign this session's transcript: no announcing someone else's key,
+        // and a signature captured from another session does not verify here.
+        if peer_id.verifying_key().verify_strict(s.crypto.announce_msg(), &sig).is_err() {
+            log::info!("Server | {addr} announce of {:#} with an invalid signature ignored", node(peer_id));
+            return;
+        }
         s.last_announce = Instant::now();
         match s.peer_id {
             Some(prev) if prev != peer_id => {
@@ -120,7 +126,7 @@ impl State {
                     return out;
                 };
                 match TrackerMsg::decode(&plain) {
-                    Some(TrackerMsg::Announce { peer_id }) => self.announce(&mut out, from, peer_id),
+                    Some(TrackerMsg::Announce { peer_id, sig }) => self.announce(&mut out, from, peer_id, sig),
                     Some(TrackerMsg::Search { peers }) => self.search(&mut out, from, peers),
                     Some(TrackerMsg::Close) => {
                         self.drop_session(&mut out, from, false);
@@ -185,5 +191,80 @@ pub async fn run(sock: UdpSocket, identity: SigningKey) {
         if gc.is_finished() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{ClientHandshake, random_bytes};
+    use crate::identity::Identity;
+
+    struct Client {
+        addr: SocketAddr,
+        session: TrackerSession,
+    }
+
+    fn connect(st: &mut State, server: &SigningKey, addr: &str) -> Client {
+        let addr = addr.parse().unwrap();
+        let hs = ClientHandshake::new();
+        let out = st.handle(server, &hs.hello(), addr);
+        let session = hs.finish(&out[0].0, &server.verifying_key()).unwrap();
+        Client { addr, session }
+    }
+
+    /// Sends `msg` from `c`, returns the replies addressed to `c`.
+    fn send(st: &mut State, server: &SigningKey, c: &mut Client, msg: &TrackerMsg) -> Vec<TrackerMsg> {
+        let packet = c.session.seal(&msg.encode());
+        st.handle(server, &packet, c.addr)
+            .into_iter()
+            .filter(|(_, to)| *to == c.addr)
+            .map(|(p, _)| TrackerMsg::decode(&c.session.open(&p).unwrap()).unwrap())
+            .collect()
+    }
+
+    fn announce(id: &Identity, signed_in: &TrackerSession) -> TrackerMsg {
+        TrackerMsg::Announce { peer_id: id.id(), sig: id.sign(signed_in.announce_msg()) }
+    }
+
+    #[test]
+    fn own_key_announce_accepted() {
+        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
+        let me = Identity::generate();
+        let mut c = connect(&mut st, &server, "198.51.100.1:4000");
+        let msg = announce(&me, &c.session);
+        let replies = send(&mut st, &server, &mut c, &msg);
+        assert!(
+            matches!(replies.as_slice(), [TrackerMsg::Found { peer_id, addr }] if *peer_id == me.id() && *addr == c.addr)
+        );
+        assert_eq!(st.by_peer.get(&me.id()), Some(&c.addr));
+    }
+
+    #[test]
+    fn foreign_key_announce_rejected() {
+        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
+        let (victim, attacker) = (Identity::generate(), Identity::generate());
+        let mut c = connect(&mut st, &server, "198.51.100.2:4000");
+        // The victim's key, signed with the attacker's own key.
+        let msg = TrackerMsg::Announce { peer_id: victim.id(), sig: attacker.sign(c.session.announce_msg()) };
+        assert!(send(&mut st, &server, &mut c, &msg).is_empty());
+        assert!(!st.by_peer.contains_key(&victim.id()));
+        assert_eq!(st.sessions[&c.addr].peer_id, None);
+    }
+
+    #[test]
+    fn announce_signature_bound_to_session() {
+        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
+        let victim = Identity::generate();
+        let mut v = connect(&mut st, &server, "198.51.100.3:4000");
+        let genuine = announce(&victim, &v.session);
+        assert_eq!(send(&mut st, &server, &mut v, &genuine).len(), 1);
+
+        // An attacker who captured the victim's (decrypted) announce replays it in its own session
+        // to steal the victim's endpoint.
+        let mut a = connect(&mut st, &server, "203.0.113.66:4000");
+        assert!(send(&mut st, &server, &mut a, &genuine).is_empty());
+        assert_eq!(st.by_peer.get(&victim.id()), Some(&v.addr), "endpoint not hijacked");
+        assert_eq!(st.sessions[&a.addr].peer_id, None);
     }
 }
