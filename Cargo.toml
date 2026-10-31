@@ -13,6 +13,8 @@ base64 = "0.23"
 blake2 = "0.11"
 chacha20poly1305 = "0.11"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# Elligator2 for handshake ephemerals (fork of curve25519-dalek by the arti obfs4 author); exact pin: alpha
+curve25519-elligator2 = "=0.1.0-alpha.2"
 clap = { version = "4.6", features = ["derive", "env"] }
 ed25519-dalek = { version = "3.0", features = ["serde"] }
 hkdf = "0.13"

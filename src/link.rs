@@ -16,8 +16,9 @@ use blake2::{Blake2s256, Digest};
 use parking_lot::{Mutex, RwLock};
 use rand::RngExt;
 
+use crate::elligator;
 use crate::identity::{Identity, NodeId};
-use crate::noise::{self, Ephemeral, HandshakePayload, Initiator, Responder, TAG_LEN, Tai64n};
+use crate::noise::{self, HandshakePayload, Initiator, Responder, TAG_LEN, Tai64n};
 use crate::proto::{DATA, DATA_HDR, HS_INIT, HS_INIT_HDR, HS_RESP, HS_RESP_HDR};
 use crate::replay::ReplayWindow;
 
@@ -135,6 +136,15 @@ impl Session {
     }
 }
 
+/// A Noise message whose leading ephemeral is an Elligator2 representative on the wire, with the
+/// representative replaced by the public key it stands for.
+fn with_decoded_ephemeral(msg: &[u8]) -> Option<Vec<u8>> {
+    let repr: [u8; 32] = msg.get(..32)?.try_into().unwrap();
+    let mut out = msg.to_vec();
+    out[..32].copy_from_slice(&elligator::public(&repr));
+    Some(out)
+}
+
 /// Receiver index of a DATA packet.
 pub fn data_receiver_idx(packet: &[u8]) -> Option<u32> {
     packet.get(1..5).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
@@ -239,15 +249,11 @@ impl Links {
         out.push(HS_INIT);
         out.extend_from_slice(&idx.to_le_bytes());
         let remote = peer.x25519_public().to_bytes();
-        let ini = Initiator::start(
-            self.identity.x25519_secret(),
-            &remote,
-            &self.group.psk,
-            Ephemeral::random(),
-            &self.payload(),
-            &mut out,
-        )
-        .ok()?;
+        let (e, repr) = elligator::ephemeral();
+        let ini =
+            Initiator::start(self.identity.x25519_secret(), &remote, &self.group.psk, e, &self.payload(), &mut out)
+                .ok()?;
+        out[HS_INIT_HDR..HS_INIT_HDR + 32].copy_from_slice(&repr);
         inner.pending.insert(idx, Pending { peer, initiator: ini, sent: Instant::now() });
         Some(out)
     }
@@ -267,7 +273,8 @@ impl Links {
 
     fn handle_init(&self, packet: &[u8], members: impl FnOnce() -> Vec<NodeId>) -> Option<Received> {
         let sender_idx = u32::from_le_bytes(packet.get(1..HS_INIT_HDR)?.try_into().unwrap());
-        let (resp, rs, payload) = Responder::read(self.identity.x25519_secret(), &packet[HS_INIT_HDR..]).ok()?;
+        let msg = with_decoded_ephemeral(&packet[HS_INIT_HDR..])?;
+        let (resp, rs, payload) = Responder::read(self.identity.x25519_secret(), &msg).ok()?;
         let peer = self.lookup_member(&rs, members)?;
         let p = HandshakePayload::decode(&payload).ok()?;
         if p.group_id != self.group.id || peer == self.identity.id() {
@@ -285,7 +292,9 @@ impl Links {
         out.push(HS_RESP);
         out.extend_from_slice(&idx.to_le_bytes());
         out.extend_from_slice(&sender_idx.to_le_bytes());
-        let transport = resp.reply(&self.group.psk, Ephemeral::random(), &self.payload(), &mut out).ok()?;
+        let (e, repr) = elligator::ephemeral();
+        let transport = resp.reply(&self.group.psk, e, &self.payload(), &mut out).ok()?;
+        out[HS_RESP_HDR..HS_RESP_HDR + 32].copy_from_slice(&repr);
         inner.install(Arc::new(Session::new(peer, idx, sender_idx, transport, false)));
         Some(Received::Handshake { peer, reply: Some(out) })
     }
@@ -300,7 +309,7 @@ impl Links {
             let p = inner.pending.get(&receiver_idx)?;
             (p.peer, p.initiator.clone())
         };
-        let (transport, payload) = ini.finish(&packet[HS_RESP_HDR..]).ok()?;
+        let (transport, payload) = ini.finish(&with_decoded_ephemeral(&packet[HS_RESP_HDR..])?).ok()?;
         let p = HandshakePayload::decode(&payload).ok()?;
         if p.group_id != self.group.id {
             return None;

@@ -613,6 +613,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "curve25519-elligator2"
+version = "0.1.0-alpha.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4df656f503077758f9f06de6e111e921ec8f08f6ce203bd880bc058a47d9d3db"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "curve25519-dalek-derive",
+ "fiat-crypto 0.2.9",
+ "rustc_version",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -646,6 +661,7 @@ dependencies = [
  "chacha20poly1305 0.11.0",
  "chrono",
  "clap",
+ "curve25519-elligator2",
  "ed25519-dalek",
  "enable-ansi-support",
  "hkdf",
