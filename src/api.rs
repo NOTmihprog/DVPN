@@ -2,7 +2,8 @@
 //!
 //! Client -> node: `{"type": "init", "name": ..}` first, then `get` / `set` / `del` / `route`
 //! requests carrying an `id` (answered with `{"type": "res", "id": .., "res": ..}`), `net`
-//! packets `{"rou": route, "peer_id": .., "pack": bin}` and `ping` / `pong` / `close`.
+//! packets `{"rou": route, "key": .., "pack": bin}` and `ping` / `pong` / `close`. Nodes are
+//! named by their key (base64url) or a unique prefix of a known one, in the `key` field.
 //! Node -> client: responses, `event`s, `net` packets for registered routes, `ping`.
 
 use std::collections::HashMap;
@@ -182,7 +183,7 @@ fn event_value(e: &Event) -> Value {
     match e {
         Event::Peer { action, record, endpoint } => map(vec![
             ("action", action.as_str().into()),
-            ("peer_id", record.peer_id.to_string().into()),
+            ("key", record.peer_id.to_string().into()),
             ("name", opt_str(record.name.clone())),
             ("addr", opt_str(record.addr.map(|a| a.to_string()))),
             ("endpoint", addr_value(*endpoint)),
@@ -191,7 +192,7 @@ fn event_value(e: &Event) -> Value {
         Event::Server { addr, connected } => {
             map(vec![("server", addr_value(Some(*addr))), ("status", (*connected).into())])
         }
-        Event::Ping { peer_id, ms } => map(vec![("peer_id", peer_id.to_string().into()), ("ping", (*ms).into())]),
+        Event::Ping { peer_id, ms } => map(vec![("key", peer_id.to_string().into()), ("ping", (*ms).into())]),
     }
 }
 
@@ -300,7 +301,7 @@ impl Api {
                 ("type", "net".into()),
                 ("rou", route.into()),
                 ("pack", Value::Binary(data)),
-                ("peer_id", peer_id.to_string().into()),
+                ("key", peer_id.to_string().into()),
             ]);
             self.sock.send(&v, &owner).await;
         }
@@ -396,13 +397,13 @@ impl Api {
         }
     }
 
-    /// `peer_id`: a full node key or a unique prefix of a known one. Error codes for replies:
-    /// `peer_id_validate_error` (missing, invalid or unknown), `peer_id_ambiguous`.
+    /// `key`: a full node key or a unique prefix of a known one. Error codes for replies:
+    /// `key_validate_error` (missing, invalid or unknown), `key_ambiguous`.
     fn peer_arg(&self, p: &Value) -> Result<NodeId, &'static str> {
-        let s = field(p, "peer_id").and_then(Value::as_str).ok_or("peer_id_validate_error")?;
+        let s = field(p, "key").and_then(Value::as_str).ok_or("key_validate_error")?;
         self.node.storage.resolve(s).map_err(|e| match e {
-            ResolveError::NotFound => "peer_id_validate_error",
-            ResolveError::Ambiguous(_) => "peer_id_ambiguous",
+            ResolveError::NotFound => "key_validate_error",
+            ResolveError::Ambiguous(_) => "key_ambiguous",
         })
     }
 
@@ -413,7 +414,7 @@ impl Api {
         let rec = || peer.and_then(|id| storage.get(&id));
         let client = || field(p, "addr").and_then(parse_addr).and_then(|a| self.node.client(&a).cloned());
         match req {
-            "peer_id" => storage.self_id().to_string().into(),
+            "key" => storage.self_id().to_string().into(),
             "peers" => Value::Array(storage.ids().iter().map(|i| i.to_string().into()).collect()),
             "peer_exist" => peer.is_some_and(|id| storage.exists(&id)).into(),
             "peer_name" => opt_str(rec().and_then(|(r, _)| r.name)),

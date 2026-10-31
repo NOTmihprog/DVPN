@@ -74,7 +74,7 @@
   - [x] тесты: χ² по первым 16 байтам, разброс размеров (unit); в netns по дампу WAN — нет частого первого байта, размеры одинаковых ping различаются
 - [x] **2.6** junk/signature-пакеты (`jc/jmin/jmax`, `i1..i5` — синтаксис AWG `<b 0x..> <r N> <rc N> <rd N> <t>`) перед каждым HS_INIT, парсер профиля `[group.obfs]` (`s1/s2/s4`, неизвестные ключи — ошибка, `header_protection = false` — ошибка); `h1..h4` и `content_padding` не нужны (PLAN §4.4)
 - [x] **2.7** удалить `PLAIN`, `PeerCipher`, поле `key` у пиров; шифрование не отключается (`set -k`, `peer_crypto` убраны; `peer_crypto_status` = есть ли Noise-сессия)
-  - [ ] затем переименовать `peer_id` → `key` в `peers.json`/экспорте/API (§13), перенесено из 1.7
+  - [x] затем переименовать `peer_id` → `key` в `peers.json`/экспорте/API (§13), перенесено из 1.7 — коды ошибок `key_validate_error`/`key_ambiguous`, CLI `-p/--peer KEY`; ключи, начинающиеся с `-`, принимаются CLI
 - [x] **2.8** новый бенчмарк вместо `bench_peer_cipher` — `link::bench`: 88,0k pkt/s / 0,99 Гбит/с против 84,9k / 0,95 у v3 (1400 Б, seal+open, тот же прогон)
 - [x] **2.9** фаззинг-цели: снятие маски, разбор handshake — `peer_packet` (весь приём: obfs → HS_INIT/HS_RESP/DATA), `handshake_payload`, `obfs_template`
   - [x] найдено и исправлено: удалённое падение от одного пакета (счётчик ChaCha20 маски из байт пакета = 0xffffffff), паника на не-ASCII в `<b 0x…>`; регрессионные тесты

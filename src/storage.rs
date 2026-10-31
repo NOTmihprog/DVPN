@@ -16,7 +16,8 @@ use crate::logger::node;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerRecord {
-    #[serde(alias = "id")]
+    /// The node key; written as `key` (`peer_id` from earlier v4 builds is still read).
+    #[serde(rename = "key", alias = "peer_id")]
     pub peer_id: NodeId,
     #[serde(default)]
     pub name: Option<String>,
@@ -518,6 +519,19 @@ mod tests {
         let common = a.to_string().chars().zip(b.to_string().chars()).take_while(|(x, y)| x == y).count();
         assert_eq!(s.resolve(&a.to_string()[..common + 1]), Ok(a));
         assert_eq!(s.resolve(&b.to_string()[..common + 1]), Ok(b));
+    }
+
+    #[test]
+    fn record_json_uses_key() {
+        let id = NodeId::random();
+        let r = PeerRecord { name: Some("a".into()), addr: Some(Ipv4Addr::new(10, 0, 0, 1)), ..PeerRecord::new(id) };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["key"], id.to_string());
+        assert!(json.get("peer_id").is_none());
+        let back: PeerRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.peer_id, id);
+        let old: PeerRecord = serde_json::from_str(&format!(r#"{{"peer_id":"{id}"}}"#)).unwrap();
+        assert_eq!(old.peer_id, id, "earlier v4 builds wrote peer_id");
     }
 
     #[test]

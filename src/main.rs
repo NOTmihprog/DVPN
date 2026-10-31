@@ -62,13 +62,14 @@ enum Command {
     /// Print the node public key (node id) from config.toml / DVPN_PRIVATE_KEY
     ShowKey {
         /// Private key to derive the public key from, instead of the configured one
-        #[arg(short = 'k', long)]
+        // base64url keys may start with '-'
+        #[arg(short = 'k', long, allow_hyphen_values = true)]
         key: Option<String>,
     },
     /// Set or add peer or peer parameters
     Set {
         /// Node key (public, base64url; see show-key). A unique prefix of a known key is enough
-        #[arg(short = 'p', long)]
+        #[arg(short = 'p', long = "peer", value_name = "KEY", allow_hyphen_values = true)]
         peer_id: String,
         /// Peer name, "None" to clear
         #[arg(short = 'n', long)]
@@ -80,9 +81,10 @@ enum Command {
         #[arg(short = 'c', long)]
         clear: bool,
     },
-    /// Delete peer by id
+    /// Delete a peer
     Del {
-        #[arg(short = 'p', long)]
+        /// Node key or a unique prefix
+        #[arg(short = 'p', long = "peer", value_name = "KEY", allow_hyphen_values = true)]
         peer_id: String,
     },
     /// Show peers table
@@ -100,8 +102,8 @@ enum Command {
     },
     /// Export one peer to base64 or json
     ExportPeer {
-        /// Peer_id, default: self
-        #[arg(short = 'p', long)]
+        /// Node key or a unique prefix, default: self
+        #[arg(short = 'p', long = "peer", value_name = "KEY", allow_hyphen_values = true)]
         peer_id: Option<String>,
         #[command(flatten)]
         out: OutputArgs,
@@ -171,7 +173,7 @@ fn list_peers(storage: &PeerStorage) {
 }
 
 fn export_value(r: &PeerRecord) -> Json {
-    serde_json::json!({ "name": r.name, "peer_id": r.peer_id, "addr": r.addr })
+    serde_json::json!({ "name": r.name, "key": r.peer_id, "addr": r.addr })
 }
 
 fn write_output(args: &OutputArgs, data: &Json) {
