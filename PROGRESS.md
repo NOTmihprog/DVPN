@@ -17,14 +17,15 @@
 
 Рефакторинг на существующей кодовой базе v3, поведение не меняется.
 
-- [ ] **0.1** `packet.rs`: разбор IPv4/IPv6 (версия, src/dst, длина, TTL/Hop Limit), вынести из `node.rs`
-  - [ ] юнит-тесты на оба семейства, битые заголовки
-- [ ] **0.2** `ArcSwap<RouteSnapshot>` на горячем пути вместо `RwLock` + clone `Route` в `tun_loop` (§16.6)
-  - [ ] бенчмарк до/после
-- [ ] **0.3** netns-тест-харнесс (по образцу `yggmgr/tests/netns-e2e.sh`): трекер + 3–4 узла, NAT `iptables MASQUERADE`, ping/iperf
-  - [ ] скрипт в `tests/netns-e2e.sh`, запуск из CI
-- [ ] **0.4** каркас `cargo-fuzz` (пустые цели-заглушки) + `proptest` в dev-deps, прогон в CI (§14a)
-- [ ] **0.5** CI: `cargo test`, `clippy -D warnings`, `fmt --check`, netns-тест, сборка фаззинг-целей
+- [x] **0.1** `packet.rs`: разбор IPv4/IPv6 (версия, src/dst, длина, TTL/Hop Limit), вынести из `node.rs`
+  - [x] юнит-тесты на оба семейства, битые заголовки (+ proptest round-trip)
+- [x] **0.2** `ArcSwap<RouteSnapshot>` на горячем пути вместо `RwLock` + clone `Route` в `tun_loop` (§16.6)
+  - [x] бенчмарк до/после: 125→67 нс (1 поток), 736→110 нс (4 потока + writer) — `storage::bench`
+- [~] **0.3** netns-тест-харнесс (по образцу `yggmgr/tests/netns-e2e.sh`): трекер + 3–4 узла, NAT `iptables MASQUERADE`, ping/iperf
+  - [~] скрипт в `tests/netns-e2e.sh`: топология (2 NAT + публичный узел) и запуск трекера есть, настройка узлов и проверки ping/iperf — нет; не закоммичен
+  - [ ] запуск из CI
+- [x] **0.4** каркас `cargo-fuzz` (пустые цели-заглушки) + `proptest` в dev-deps, прогон в CI (§14a) — цели `packet_parse`, `tracker_msg`; крейт разделён на `lib.rs` + `main.rs`
+- [~] **0.5** CI: `cargo test`, `clippy -D warnings`, `fmt --check`, netns-тест, сборка фаззинг-целей — `.gitea/workflows/ci.yml` без netns-теста; на раннере Gitea ещё не проверен
 
 **Критерий приёмки:** [ ] текущие тесты + netns-тест проходят, фаззинг-каркас собирается в CI.
 
