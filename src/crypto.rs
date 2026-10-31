@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use anyhow::{Context, bail};
 use base64::Engine;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use chacha20poly1305::aead::inout::InOutBuf;
 use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, KeyInit, Nonce, Tag, XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -40,8 +40,9 @@ pub fn decode_key32(s: &str) -> anyhow::Result<[u8; 32]> {
     }
 }
 
+/// Canonical text form of keys and blobs everywhere (PLAN §3): base64url without padding.
 pub fn encode_b64(b: &[u8]) -> String {
-    URL_SAFE.encode(b)
+    URL_SAFE_NO_PAD.encode(b)
 }
 
 pub fn generate_key() -> String {
@@ -326,9 +327,13 @@ mod tests {
     #[test]
     fn b64_variants() {
         let k = random_bytes::<32>();
-        assert_eq!(decode_key32(&encode_b64(&k)).unwrap(), k);
+        let text = encode_b64(&k);
+        assert_eq!(text.len(), 43, "base64url without padding");
+        assert!(!text.contains(['=', '+', '/']));
+        assert_eq!(decode_key32(&text).unwrap(), k);
+        // older forms keep parsing: padded url-safe (v3 configs) and standard
+        assert_eq!(decode_key32(&URL_SAFE.encode(k)).unwrap(), k);
         assert_eq!(decode_key32(&STANDARD.encode(k)).unwrap(), k);
-        assert_eq!(decode_key32(encode_b64(&k).trim_end_matches('=')).unwrap(), k);
     }
 }
 

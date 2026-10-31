@@ -10,23 +10,17 @@
 use std::fmt;
 use std::str::FromStr;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
-use crate::crypto::{decode_b64, random_bytes};
+use crate::crypto::{decode_b64, encode_b64, random_bytes};
 
 pub const NODE_ID_LEN: usize = 32;
 /// Length of the canonical text form (base64url, no padding).
 pub const NODE_ID_TEXT_LEN: usize = 43;
 /// Length of the short prefix shown in logs and tables.
 pub const NODE_ID_SHORT_LEN: usize = 10;
-
-fn encode(b: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(b)
-}
 
 /// Ed25519 public key of a node. Always a valid, non-weak curve point: every constructor
 /// checks it, so `verifying_key()` and `x25519_public()` cannot fail.
@@ -103,7 +97,7 @@ impl FromStr for NodeId {
 
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&encode(&self.0))
+        f.write_str(&encode_b64(&self.0))
     }
 }
 
@@ -170,7 +164,7 @@ impl Identity {
     /// Private key text for `config.toml` / `DVPN_PRIVATE_KEY`: the seed in base64url.
     /// Deliberately not `Display`, so it cannot end up in a log line by accident.
     pub fn private_key_text(&self) -> String {
-        encode(self.signing.as_bytes())
+        encode_b64(self.signing.as_bytes())
     }
 
     /// Parses `private_key_text()` output (standard base64 and padding accepted too).

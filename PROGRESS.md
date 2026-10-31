@@ -37,7 +37,7 @@
 - [x] **1.1** `identity.rs`: `NodeId([u8;32])` (проверка точки, отказ слабым ключам), `Identity { signing, x25519, id }` — `peer_id.rs` пока живёт рядом, уходит в 1.4
   - [x] `Display`/`FromStr`/`Serialize` в base64url без паддинга (приём standard и с паддингом); в postcard — 32 байта без префикса длины
   - [x] `ed25519 → curve25519` конверсия, тест-вектор (RFC 8032 seed, X25519 посчитан libsodium) + proptest round-trip
-- [ ] **1.2** `encode_b64` → `URL_SAFE_NO_PAD`; проверить все вызовы
+- [x] **1.2** `encode_b64` → `URL_SAFE_NO_PAD`; проверить все вызовы — конфиг, `peers.json`, экспорт, API, лог трекера; декодер по-прежнему принимает паддинг и standard (тест)
 - [ ] **1.3** ключ в `config.toml` `[identity] private_key` + env `DVPN_PRIVATE_KEY`; `dvpn gen-key` / `dvpn show-key`
 - [ ] **1.4** замена `PeerId` → `NodeId` по всему коду (storage, api, tracker, node)
 - [ ] **1.5** логгер: `Display` обёртки `NodeId` (`имя(префикс)`), убрать эвристику поиска id в тексте (§3)
