@@ -14,6 +14,7 @@ use crate::identity::NodeId;
 use crate::proto::{
     ANNOUNCE_SIG_CTX, HELLO, HELLO_ACK, HELLO_ACK_LEN, HELLO_LEN, HELLO_SIG_CTX, KEYS_CTX, SEALED, TRACKER,
 };
+use crate::replay::ReplayWindow;
 
 pub const TAG_LEN: usize = 16;
 /// `[SEALED][nonce 24]`
@@ -101,37 +102,6 @@ impl PeerCipher {
             .decrypt_inout_detached(&nonce, &Self::aad(recipient), InOutBuf::from(&mut packet[SEALED_HDR..end]), &tag)
             .ok()?;
         Some(SEALED_HDR..end)
-    }
-}
-
-/// Sliding 64-packet anti-replay window over message counters.
-#[derive(Default)]
-pub struct ReplayWindow {
-    top: u64,
-    bitmap: u64,
-}
-
-impl ReplayWindow {
-    pub fn check(&self, n: u64) -> bool {
-        if n == 0 {
-            return false;
-        }
-        if n > self.top {
-            return true;
-        }
-        let back = self.top - n;
-        back < 64 && self.bitmap & (1 << back) == 0
-    }
-
-    pub fn accept(&mut self, n: u64) {
-        if n > self.top {
-            let shift = n - self.top;
-            self.bitmap = if shift >= 64 { 0 } else { self.bitmap << shift };
-            self.bitmap |= 1;
-            self.top = n;
-        } else {
-            self.bitmap |= 1 << (self.top - n);
-        }
     }
 }
 
@@ -321,18 +291,6 @@ mod tests {
         assert!(r.is_none(), "wrong recipient must fail");
         let r = c.open(&mut pkt, &b).unwrap();
         assert_eq!(&pkt[r], b"\x01data");
-    }
-
-    #[test]
-    fn replay_window() {
-        let mut w = ReplayWindow::default();
-        for n in [1, 3, 2, 70, 7, 100] {
-            assert!(w.check(n));
-            w.accept(n);
-            assert!(!w.check(n));
-        }
-        assert!(!w.check(30), "older than window");
-        assert!(w.check(99));
     }
 
     #[test]

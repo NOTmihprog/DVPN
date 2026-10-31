@@ -185,7 +185,7 @@ DVPN — приватные сети из десятков-сотен узлов
 
 **Реальность API:** в `curve25519-dalek` 5.0 `elligator_encode` есть, но он `pub(crate)` (приватный), публичного инверсного отображения и перегенерации нет. Поэтому Elligator2-слой придётся либо брать из отдельного crate (проверить `curve25519-elligator2` — его использует Tor/arti), либо реализовать поверх field-арифметики самому. Это отдельная задача с тестовыми векторами obf4/arti, её нельзя считать «просто вызвать функцию».
 
-Реализация handshake: crate `snow` для состояния handshake, затем `StatelessTransportState` (явный nonce = счётчик) — пакеты UDP приходят не по порядку. Elligator2 оборачивает эфемерный ключ до записи в пакет и снимается на приёме (в `obfs.rs`). Либо своя реализация IKpsk2 на `x25519-dalek`/`chacha20poly1305`/`blake2` (~300 строк, как `noise-protocol.go` в amneziawg-go) — меньше зависимостей, но больше риска.
+Реализация handshake (решено на этапе 2): своя реализация IKpsk2 на `x25519-dalek`/`chacha20poly1305`/`blake2` (как `noise-protocol.go` в amneziawg-go), транспорт без состояния (явный nonce = счётчик, пакеты UDP приходят не по порядку). Риск снят сверкой со `snow` в тестах: обе стороны в обе стороны, хэш handshake и транспортные ключи совпадают. Эфемерные ключи передаёт вызывающий — так Elligator2 (`curve25519-elligator2`) подставляет отображаемые ключи; кодирование/снятие — в `obfs.rs`.
 
 Payload handshake: timestamp TAI64N (защита от replay первого сообщения), `group_id`, сертификат членства (§5), версия протокола, флаги возможностей (relay, exit, IPv6).
 
@@ -685,7 +685,8 @@ API (msgpack; формат можно менять свободно — совм
 src/
   identity.rs       NodeId, Identity, кодирование base64url, ed25519→x25519
   packet.rs         разбор IPv4/IPv6
-  noise.rs          handshake (snow), Elligator2, Session, rekey, ReplayWindow (из crypto.rs)
+  noise.rs          handshake IKpsk2 (своя реализация, сверена со snow), payload (версия, флаги, TAI64N)
+  replay.rs         ReplayWindow (RFC 6479), общий для сессий и трекера
   obfs.rs           маскировка кадра: защита заголовка, паддинг, junk/signature, профиль (§4.4)
   transport.rs      единственный dual-stack сокет, кандидаты адресов
   link.rs           соседи: сессии, endpoints, keepalive, RTT, роуминг
@@ -709,7 +710,7 @@ src/
   api.rs, config.rs, logger.rs, main.rs
 ```
 
-Новые зависимости: `snow`, `blake2`, `curve25519-dalek` (Elligator2), `ipnet`, `prefix-trie`, (Linux) `rtnetlink` или вызов `ip`/`nft`.
+Новые зависимости: `blake2`, `hmac`, `curve25519-elligator2` (Elligator2), `ipnet`, `prefix-trie`, (Linux) `rtnetlink` или вызов `ip`/`nft`; `snow` — только dev-зависимость для сверки `noise.rs`.
 
 ---
 

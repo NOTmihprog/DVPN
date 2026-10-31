@@ -310,6 +310,100 @@ impl Responder {
     }
 }
 
+/// Protocol version carried in every handshake payload (PLAN §16.12).
+pub const PROTOCOL_VERSION: u8 = 4;
+
+/// Capability flags in the handshake payload.
+pub mod flags {
+    pub const RELAY: u8 = 1;
+    pub const EXIT: u8 = 1 << 1;
+    pub const IPV6: u8 = 1 << 2;
+}
+
+/// TAI64N timestamp (12 bytes, big-endian, so byte order = time order), as in WireGuard. The
+/// responder keeps the newest one per initiator and drops older or equal ones, so a captured
+/// message 1 cannot be replayed to get a response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Tai64n(pub [u8; 12]);
+
+impl Tai64n {
+    /// TAI64 label of the unix epoch (2^62 + 10 s of TAI-UTC offset), as WireGuard uses.
+    const BASE: u64 = 0x4000_0000_0000_000a;
+    /// Nanoseconds are rounded down to ~16.8 ms so the timestamp leaks less about the clock.
+    const WHITEN_MASK: u32 = !0xff_ffff;
+
+    pub fn now() -> Self {
+        let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        Self::from_unix(d.as_secs(), d.subsec_nanos())
+    }
+
+    pub fn from_unix(secs: u64, nanos: u32) -> Self {
+        let mut b = [0u8; 12];
+        b[..8].copy_from_slice(&(Self::BASE + secs).to_be_bytes());
+        b[8..].copy_from_slice(&(nanos & Self::WHITEN_MASK).to_be_bytes());
+        Tai64n(b)
+    }
+}
+
+/// Payload of handshake messages (encrypted by Noise). Layout:
+/// `[version u8][flags u8][tai64n 12][group_id 32][cert_len u16 LE][cert][extensions...]`.
+/// Bytes after the certificate are ignored, so later versions can append fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandshakePayload {
+    pub version: u8,
+    pub flags: u8,
+    pub timestamp: Tai64n,
+    pub group_id: [u8; 32],
+    /// Membership certificate (stage 3); empty until then.
+    pub cert: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadError {
+    Truncated,
+    /// A different protocol version: the session is not established.
+    Version(u8),
+}
+
+impl HandshakePayload {
+    const FIXED: usize = 1 + 1 + 12 + 32 + 2;
+
+    pub fn new(flags: u8, group_id: [u8; 32]) -> Self {
+        HandshakePayload { version: PROTOCOL_VERSION, flags, timestamp: Tai64n::now(), group_id, cert: Vec::new() }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let cert_len = u16::try_from(self.cert.len()).expect("certificate fits in u16");
+        let mut b = Vec::with_capacity(Self::FIXED + self.cert.len());
+        b.push(self.version);
+        b.push(self.flags);
+        b.extend_from_slice(&self.timestamp.0);
+        b.extend_from_slice(&self.group_id);
+        b.extend_from_slice(&cert_len.to_le_bytes());
+        b.extend_from_slice(&self.cert);
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, PayloadError> {
+        let version = *b.first().ok_or(PayloadError::Truncated)?;
+        if version != PROTOCOL_VERSION {
+            return Err(PayloadError::Version(version));
+        }
+        if b.len() < Self::FIXED {
+            return Err(PayloadError::Truncated);
+        }
+        let cert_len = u16::from_le_bytes([b[46], b[47]]) as usize;
+        let cert = b.get(Self::FIXED..Self::FIXED + cert_len).ok_or(PayloadError::Truncated)?.to_vec();
+        Ok(HandshakePayload {
+            version,
+            flags: b[1],
+            timestamp: Tai64n(b[2..14].try_into().unwrap()),
+            group_id: b[14..46].try_into().unwrap(),
+            cert,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,8 +558,39 @@ mod tests {
         snow_transport_check(&tr, &mut ts);
     }
 
+    #[test]
+    fn payload_round_trip_and_errors() {
+        let mut p = HandshakePayload::new(flags::RELAY | flags::IPV6, [9u8; 32]);
+        p.cert = vec![1, 2, 3];
+        let mut b = p.encode();
+        assert_eq!(b.len(), 48 + 3);
+        assert_eq!(HandshakePayload::decode(&b).unwrap(), p);
+        b.extend_from_slice(b"future extension");
+        assert_eq!(HandshakePayload::decode(&b).unwrap(), p, "trailing bytes ignored");
+        assert_eq!(HandshakePayload::decode(&[]), Err(PayloadError::Truncated));
+        assert_eq!(HandshakePayload::decode(&b[..47]), Err(PayloadError::Truncated));
+        assert_eq!(HandshakePayload::decode(&b[..49]), Err(PayloadError::Truncated), "cert cut short");
+        b[0] = 3;
+        assert_eq!(HandshakePayload::decode(&b), Err(PayloadError::Version(3)));
+    }
+
+    #[test]
+    fn tai64n_order_and_whitening() {
+        let a = Tai64n::from_unix(1_700_000_000, 0);
+        assert_eq!(a.0[..8], (0x4000_0000_0000_000au64 + 1_700_000_000).to_be_bytes());
+        assert_eq!(Tai64n::from_unix(1_700_000_000, 1_000), a, "sub-16ms detail is dropped");
+        assert!(Tai64n::from_unix(1_700_000_000, 20_000_000) > a);
+        assert!(Tai64n::from_unix(1_700_000_001, 0) > Tai64n::from_unix(1_700_000_000, 999_999_999));
+        assert!(Tai64n::now() > a);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn payload_decode_never_panics(b in proptest::collection::vec(any::<u8>(), 0..120)) {
+            let _ = HandshakePayload::decode(&b);
+        }
 
         #[test]
         fn responder_read_never_panics(msg in proptest::collection::vec(any::<u8>(), 0..200)) {

@@ -10,6 +10,7 @@ pub mod node;
 pub mod noise;
 pub mod packet;
 pub mod proto;
+pub mod replay;
 pub mod storage;
 pub mod tracker_client;
 pub mod tracker_server;
