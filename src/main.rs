@@ -3,6 +3,7 @@ mod config;
 mod crypto;
 mod logger;
 mod node;
+mod packet;
 mod peer_id;
 mod proto;
 mod storage;

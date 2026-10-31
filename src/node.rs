@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use tun_rs::AsyncDevice;
 
 use crate::crypto::{SEALED_HDR, TAG_LEN};
+use crate::packet::{self, IpInfo};
 use crate::peer_id::PeerId;
 use crate::proto::{
     CONTROL_LEN, CONTROL_PING, CONTROL_PONG, HELLO_ACK, MAX_DATAGRAM, PLAIN, ROAM_MAX_LEN, ROUTE_API_MIN,
@@ -283,10 +284,11 @@ impl Node {
             ROUTE_NET => {
                 let Some(tun) = &self.tun else { return };
                 // A peer may only inject packets from its own LAN address.
-                if payload.len() < 20
-                    || payload[0] >> 4 != 4
-                    || inb.peer_addr.is_none_or(|a| payload[12..16] != a.octets())
-                {
+                let from_peer = matches!(
+                    packet::parse(payload),
+                    Some(IpInfo { src: IpAddr::V4(src), .. }) if inb.peer_addr == Some(src)
+                );
+                if !from_peer {
                     log::debug!("Peer | packet from {} with foreign source dropped", inb.peer_id);
                     return;
                 }
@@ -325,11 +327,14 @@ impl Node {
                     break;
                 }
             };
-            let ip = &buf[OFF..OFF + n];
-            if n < 20 || ip[0] >> 4 != 4 || ip[12..16] != self_addr.octets() {
+            // IPv4 only until the IPv6 overlay (PLAN stage 4).
+            let Some(IpInfo { src: IpAddr::V4(src), dst: IpAddr::V4(dst), .. }) = packet::parse(&buf[OFF..OFF + n])
+            else {
+                continue;
+            };
+            if src != self_addr {
                 continue;
             }
-            let dst = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
             let Some(route) = self.storage.route_by_addr(dst) else {
                 log::trace!("TUN | Packet to {dst} peer not found");
                 continue;
