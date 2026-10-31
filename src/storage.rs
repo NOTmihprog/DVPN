@@ -476,3 +476,83 @@ mod tests {
         assert!(s.endpoint(&a).is_none());
     }
 }
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::crypto::generate_key;
+    use std::sync::Arc;
+
+    fn populated(n: u8) -> (Arc<PeerStorage>, Vec<Ipv4Addr>, Vec<SocketAddr>) {
+        let s = Arc::new(PeerStorage::load(PeerId::generate(), None).unwrap());
+        let (mut ips, mut eps) = (Vec::new(), Vec::new());
+        for i in 0..n {
+            let ip = Ipv4Addr::new(10, 0, 0, i + 2);
+            let ep: SocketAddr = format!("192.0.2.{}:{}", i + 1, 5000 + i as u16).parse().unwrap();
+            s.set_peer(
+                PeerId::generate(),
+                PeerUpdate { addr: Some(Some(ip)), key: Some(Some(generate_key())), endpoint: Some(Some(ep)), ..Default::default() },
+            );
+            ips.push(ip);
+            eps.push(ep);
+        }
+        (s, ips, eps)
+    }
+
+    /// Hot-path lookups: `route_by_addr` (TUN -> net) and `inbound` (net -> TUN).
+    /// Run: cargo test --release storage::bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_route_lookup() {
+        const N: usize = 2_000_000;
+        let (s, ips, eps) = populated(64);
+
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            assert!(s.route_by_addr(ips[i % ips.len()]).is_some());
+        }
+        let one = t.elapsed().as_secs_f64();
+        println!("route_by_addr, 1 thread : {:6.1} ns/lookup", one * 1e9 / N as f64);
+
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            assert!(s.inbound(&eps[i % eps.len()]).is_some());
+        }
+        let inb = t.elapsed().as_secs_f64();
+        println!("inbound,       1 thread : {:6.1} ns/lookup", inb * 1e9 / N as f64);
+
+        // 4 readers while a writer keeps moving one endpoint (roaming / tracker updates).
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (s, stop) = (s.clone(), stop.clone());
+            let id = s.others()[0];
+            std::thread::spawn(move || {
+                let mut port = 6000u16;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    port = port.wrapping_add(1).max(6000);
+                    let ep = SocketAddr::from(([198, 51, 100, 1], port));
+                    s.set_peer(id, PeerUpdate { endpoint: Some(Some(ep)), ..Default::default() });
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        };
+        let t = std::time::Instant::now();
+        let readers: Vec<_> = (0..4)
+            .map(|k| {
+                let (s, ips) = (s.clone(), ips.clone());
+                std::thread::spawn(move || {
+                    for i in 0..N {
+                        std::hint::black_box(s.route_by_addr(ips[(i + k) % ips.len()]));
+                    }
+                })
+            })
+            .collect();
+        for r in readers {
+            r.join().unwrap();
+        }
+        let par = t.elapsed().as_secs_f64();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        println!("route_by_addr, 4 threads + writer: {:6.1} ns/lookup (wall, per thread)", par * 1e9 / N as f64);
+    }
+}
