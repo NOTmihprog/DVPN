@@ -57,7 +57,7 @@
 
 ## Этап 2. Noise-сессии, обязательное шифрование, маскировка (§4)
 
-- [ ] **2.1** `noise.rs`: handshake `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` на `snow`
+- [~] **2.1** `noise.rs`: handshake `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` — своя реализация (решение: не `snow`), совместимость проверена со `snow` в обе стороны (payload, handshake hash, транспорт); эфемерные ключи передаёт вызывающий (под Elligator2)
   - [ ] payload: TAI64N, `group_id`, версия, флаги, (место под cert)
   - [ ] `StatelessTransportState`, счётчики, `ReplayWindow` (перенести из `crypto.rs`)
   - [ ] rekey ~120 с ± джиттер, старая сессия живёт ещё интервал

@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod identity;
 pub mod logger;
 pub mod node;
+pub mod noise;
 pub mod packet;
 pub mod proto;
 pub mod storage;

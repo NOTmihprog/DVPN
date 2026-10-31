@@ -10,11 +10,13 @@ description = "Decentralized P2P VPN for building LAN networks between peers beh
 anyhow = "1"
 arc-swap = "1.9"
 base64 = "0.23"
+blake2 = "0.11"
 chacha20poly1305 = "0.11"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 ed25519-dalek = { version = "3.0", features = ["serde"] }
 hkdf = "0.13"
+hmac = "0.13"
 log = { version = "0.4", features = ["std"] }
 parking_lot = "0.13"
 postcard = { version = "1.1", features = ["use-std"] }
@@ -39,3 +41,5 @@ strip = true
 
 [dev-dependencies]
 proptest = "1"
+# reference Noise implementation, only to cross-check noise.rs
+snow = "0.10"
