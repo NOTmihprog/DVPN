@@ -236,14 +236,18 @@ impl Node {
 
     async fn handle_peer_packet(&self, packet: &mut [u8], from: SocketAddr) {
         let known = self.storage.inbound(&from);
+        let roam_cipher;
         let own_cipher = match &known {
-            Some(inb) => inb.own_cipher.clone(),
+            Some(inb) => inb.own_cipher.as_ref(),
             // Unknown address: maybe a peer whose NAT gave it a new port. Only small (control)
             // packets are worth a decryption attempt.
-            None if packet.len() <= ROAM_MAX_LEN => self.storage.own_cipher(),
+            None if packet.len() <= ROAM_MAX_LEN => {
+                roam_cipher = self.storage.own_cipher();
+                roam_cipher.as_ref()
+            }
             None => return,
         };
-        let range = match (&own_cipher, packet[0]) {
+        let range = match (own_cipher, packet[0]) {
             (Some(c), SEALED) => match c.open(packet, &self.self_id) {
                 Some(r) => r,
                 None => {

@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -170,9 +172,44 @@ pub struct Inbound {
     pub own_cipher: Option<PeerCipher>,
 }
 
+/// Everything the packet path reads, rebuilt (under the write lock) whenever peers,
+/// addresses, keys or endpoints change, so per-packet lookups take no lock and clone no cipher.
+#[derive(Default)]
+struct PacketView {
+    by_addr: HashMap<Ipv4Addr, Arc<Route>>,
+    by_id: HashMap<PeerId, Arc<Route>>,
+    by_endpoint: HashMap<SocketAddr, Arc<Inbound>>,
+    own_cipher: Option<PeerCipher>,
+}
+
+impl PacketView {
+    fn build(inner: &Inner) -> Self {
+        let own_cipher = inner.peers[&inner.self_id].cipher.clone();
+        let by_id: HashMap<PeerId, Arc<Route>> = inner
+            .peers
+            .iter()
+            .filter_map(|(id, p)| {
+                let endpoint = p.endpoint?;
+                Some((*id, Arc::new(Route { peer_id: *id, endpoint, cipher: p.cipher.clone() })))
+            })
+            .collect();
+        let by_addr = inner.by_addr.iter().filter_map(|(a, id)| Some((*a, by_id.get(id)?.clone()))).collect();
+        let by_endpoint = inner
+            .by_endpoint
+            .iter()
+            .map(|(ep, id)| {
+                let inb = Inbound { peer_id: *id, peer_addr: inner.peers[id].rec.addr, own_cipher: own_cipher.clone() };
+                (*ep, Arc::new(inb))
+            })
+            .collect();
+        PacketView { by_addr, by_id, by_endpoint, own_cipher }
+    }
+}
+
 pub struct PeerStorage {
     path: Option<PathBuf>,
     inner: RwLock<Inner>,
+    view: ArcSwap<PacketView>,
     write_lock: Mutex<()>,
     events: broadcast::Sender<Event>,
 }
@@ -205,10 +242,16 @@ impl PeerStorage {
         inner.reindex_addr();
         Ok(PeerStorage {
             path,
+            view: ArcSwap::from_pointee(PacketView::build(&inner)),
             inner: RwLock::new(inner),
             write_lock: Mutex::new(()),
             events: broadcast::channel(1024).0,
         })
+    }
+
+    /// Call with the write lock held, after any change the packet path can see.
+    fn publish(&self, inner: &Inner) {
+        self.view.store(Arc::new(PacketView::build(inner)));
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -244,6 +287,7 @@ impl PeerStorage {
             inner.order.push(id);
             inner.peers.insert(id, Peer::new(PeerRecord::new(id)));
         }
+        self.publish(&inner);
     }
 
     pub fn is_self(&self, id: &PeerId) -> bool {
@@ -282,6 +326,7 @@ impl PeerStorage {
             if let Some(ep) = u.endpoint {
                 inner.set_endpoint(id, ep);
             }
+            self.publish(&inner);
             let p = &inner.peers[&id];
             Event::Peer { action, record: p.rec.clone(), endpoint: p.endpoint }
         };
@@ -300,6 +345,7 @@ impl PeerStorage {
             let Some(p) = inner.peers.remove(id) else { return false };
             inner.order.retain(|x| x != id);
             inner.reindex_addr();
+            self.publish(&inner);
             p.rec
         };
         self.emit(Event::Peer { action: Action::Del, record: rec, endpoint: None });
@@ -314,6 +360,7 @@ impl PeerStorage {
                 return false;
             }
             inner.set_endpoint(*id, None);
+            self.publish(&inner);
             inner.peers[id].rec.clone()
         };
         self.emit(Event::Peer { action: Action::Update, record: rec, endpoint: None });
@@ -403,8 +450,7 @@ impl PeerStorage {
     }
 
     pub fn own_cipher(&self) -> Option<PeerCipher> {
-        let inner = self.inner.read();
-        inner.peers[&inner.self_id].cipher.clone()
+        self.view.load().own_cipher.clone()
     }
 
     pub fn rtt_ms(&self, id: &PeerId) -> Option<f64> {
@@ -413,28 +459,17 @@ impl PeerStorage {
 
     // ---- packet path ----
 
-    pub fn route_by_addr(&self, dst: Ipv4Addr) -> Option<Route> {
-        let inner = self.inner.read();
-        let id = inner.by_addr.get(&dst)?;
-        let p = &inner.peers[id];
-        Some(Route { peer_id: *id, endpoint: p.endpoint?, cipher: p.cipher.clone() })
+    pub fn route_by_addr(&self, dst: Ipv4Addr) -> Option<Arc<Route>> {
+        self.view.load().by_addr.get(&dst).cloned()
     }
 
-    pub fn route_by_id(&self, id: &PeerId) -> Option<Route> {
-        let inner = self.inner.read();
-        let p = inner.peers.get(id)?;
-        Some(Route { peer_id: *id, endpoint: p.endpoint?, cipher: p.cipher.clone() })
+    pub fn route_by_id(&self, id: &PeerId) -> Option<Arc<Route>> {
+        self.view.load().by_id.get(id).cloned()
     }
 
     /// For a datagram from `from`: who sent it and our own cipher (if we require encryption).
-    pub fn inbound(&self, from: &SocketAddr) -> Option<Inbound> {
-        let inner = self.inner.read();
-        let id = *inner.by_endpoint.get(from)?;
-        Some(Inbound {
-            peer_id: id,
-            peer_addr: inner.peers[&id].rec.addr,
-            own_cipher: inner.peers[&inner.self_id].cipher.clone(),
-        })
+    pub fn inbound(&self, from: &SocketAddr) -> Option<Arc<Inbound>> {
+        self.view.load().by_endpoint.get(from).cloned()
     }
 }
 
@@ -466,6 +501,36 @@ mod tests {
     }
 
     #[test]
+    fn packet_view_follows_changes() {
+        let me = PeerId::generate();
+        let s = PeerStorage::load(me, None).unwrap();
+        let other = PeerId::generate();
+        let (ip, ip2) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
+        let ep: SocketAddr = "1.2.3.4:5000".parse().unwrap();
+        s.set_peer(other, PeerUpdate { addr: Some(Some(ip)), endpoint: Some(Some(ep)), ..Default::default() });
+        assert!(s.route_by_addr(ip).unwrap().cipher.is_none());
+
+        s.set_peer(other, PeerUpdate { key: Some(Some(generate_key())), ..Default::default() });
+        assert!(s.route_by_addr(ip).unwrap().cipher.is_some(), "key change must reach the view");
+
+        s.set_peer(other, PeerUpdate { addr: Some(Some(ip2)), ..Default::default() });
+        assert!(s.route_by_addr(ip).is_none());
+        assert_eq!(s.inbound(&ep).unwrap().peer_addr, Some(ip2));
+
+        assert!(s.own_cipher().is_none() && s.inbound(&ep).unwrap().own_cipher.is_none());
+        s.set_peer(me, PeerUpdate { key: Some(Some(generate_key())), ..Default::default() });
+        assert!(s.own_cipher().is_some() && s.inbound(&ep).unwrap().own_cipher.is_some());
+
+        let new_self = PeerId::generate();
+        s.set_self_id(new_self);
+        assert!(s.own_cipher().is_none(), "new self id has no key yet");
+
+        assert!(s.route_by_id(&other).is_some());
+        s.del_endpoint(&other);
+        assert!(s.route_by_id(&other).is_none() && s.inbound(&ep).is_none());
+    }
+
+    #[test]
     fn endpoint_moves_between_peers() {
         let s = PeerStorage::load(PeerId::generate(), None).unwrap();
         let (a, b) = (PeerId::generate(), PeerId::generate());
@@ -481,7 +546,6 @@ mod tests {
 mod bench {
     use super::*;
     use crate::crypto::generate_key;
-    use std::sync::Arc;
 
     fn populated(n: u8) -> (Arc<PeerStorage>, Vec<Ipv4Addr>, Vec<SocketAddr>) {
         let s = Arc::new(PeerStorage::load(PeerId::generate(), None).unwrap());
