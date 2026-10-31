@@ -15,7 +15,7 @@ use std::ops::{Range, RangeInclusive};
 
 use blake2::{Blake2s256, Digest};
 use chacha20::ChaCha20;
-use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+use chacha20::cipher::{KeyIvInit, StreamCipher};
 use rand::RngExt;
 
 use crate::proto::{DATA, DATA_HDR, HS_INIT, HS_INIT_HDR, HS_RESP, HS_RESP_HDR};
@@ -90,6 +90,10 @@ impl std::str::FromStr for Template {
                 "b" => {
                     let hex =
                         arg.and_then(|a| a.strip_prefix("0x")).ok_or(format!("<b> needs 0x-prefixed hex: <{tag}>"))?;
+                    // checked before slicing: a multi-byte character would split mid-char
+                    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(format!("bad hex in <{tag}>"));
+                    }
                     if hex.is_empty() || hex.len() % 2 != 0 {
                         return Err(format!("odd or empty hex in <{tag}>"));
                     }
@@ -193,10 +197,10 @@ impl Obfs {
     }
 
     fn mask(&self, sample: &[u8]) -> [u8; 16] {
-        let counter = u32::from_le_bytes(sample[..4].try_into().unwrap());
-        let nonce: [u8; 12] = sample[4..16].try_into().unwrap();
+        // Nonce only, block counter 0: a counter taken from the packet could be 0xffffffff, where
+        // the keystream ends and the cipher panics - a one-packet remote crash (found by fuzzing).
+        let nonce: [u8; 12] = sample[..12].try_into().unwrap();
         let mut c = ChaCha20::new(&self.hp_key.into(), &nonce.into());
-        c.seek(u64::from(counter) * 64);
         let mut m = [0u8; 16];
         c.apply_keystream(&mut m);
         m
@@ -306,6 +310,8 @@ mod tests {
     fn short_and_garbage_packets() {
         let o = Obfs::new(&random_bytes(), Profile::default());
         assert!(o.open(&mut [0u8; MIN_WIRE - 1]).is_none());
+        // regression (fuzzing): an all-0xff sample once overflowed the ChaCha20 block counter
+        let _ = o.open(&mut [0xffu8; 64]);
         for _ in 0..1000 {
             let mut junk: Vec<u8> = (0..rand::random_range(0..200usize)).map(|_| rand::random()).collect();
             if let Some(len) = o.open(&mut junk) {
@@ -327,6 +333,8 @@ mod tests {
         assert!(now.abs_diff(t_val) <= 2);
         assert_ne!(t.generate()[4..12], p[4..12], "random part differs between packets");
         for bad in [
+            "<b 0x\u{570b}>",
+            "<b 0x8\u{570b}4>",
             "",
             "<b 0x>",
             "<b 0x123>",

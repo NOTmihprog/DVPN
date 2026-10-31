@@ -26,3 +26,24 @@ path = "fuzz_targets/tracker_msg.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "peer_packet"
+path = "fuzz_targets/peer_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_payload"
+path = "fuzz_targets/handshake_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "obfs_template"
+path = "fuzz_targets/obfs_template.rs"
+test = false
+doc = false
+bench = false
