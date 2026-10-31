@@ -13,7 +13,8 @@ use serde_json::Value as Json;
 use dvpn::{api, config, logger, node, tracker_server, transport};
 
 use dvpn::config::{Config, PEERS_FILE_NAME, SOCKET_DEFAULT_ADDR};
-use dvpn::crypto::{decode_b64, encode_b64, generate_key, random_bytes};
+use dvpn::crypto::{decode_b64, encode_b64, random_bytes};
+use dvpn::identity::Identity;
 use dvpn::peer_id::{PEER_ID_LEN, PeerId};
 use dvpn::storage::{PeerRecord, PeerStorage, PeerUpdate, normalize_key};
 use dvpn::tracker_client::TrackerClient;
@@ -59,8 +60,14 @@ struct OutputArgs {
 enum Command {
     /// Generate new peer-id
     GenPeerId,
-    /// Generate new symmetric encryption key
+    /// Generate a new node private key (base64url; for now also usable as a peer encryption key)
     GenKey,
+    /// Print the node public key (node id) from config.toml / DVPN_PRIVATE_KEY
+    ShowKey {
+        /// Private key to derive the public key from, instead of the configured one
+        #[arg(short = 'k', long)]
+        key: Option<String>,
+    },
     /// Set or add peer or peer parameters
     Set {
         /// Peer_id: len 32, alphanumeric, generate: gen-peer-id (a unique prefix of a known id is enough)
@@ -379,7 +386,14 @@ fn main() {
     }
     match &cli.command {
         Some(Command::GenPeerId) => return println!("{}", PeerId::generate()),
-        Some(Command::GenKey) => return println!("{}", generate_key()),
+        Some(Command::GenKey) => return println!("{}", Identity::generate().private_key_text()),
+        Some(Command::ShowKey { key: Some(k) }) => {
+            let id = Identity::from_private_key_text(k).unwrap_or_else(|e| {
+                eprintln!("Invalid private key: {e}");
+                exit(1)
+            });
+            return println!("{}", id.id());
+        }
         _ => {}
     }
 
@@ -415,9 +429,11 @@ fn main() {
     match cli.command {
         None => {
             log::info!("Starting dvpn {VERSION}");
+            log::info!("Node key: {}", conf.identity.id());
             rt.block_on(run_node(conf, Arc::new(storage), cli.api_addr));
         }
-        Some(Command::GenPeerId | Command::GenKey) => unreachable!(),
+        Some(Command::GenPeerId | Command::GenKey | Command::ShowKey { key: Some(_) }) => unreachable!(),
+        Some(Command::ShowKey { key: None }) => println!("{}", conf.identity.id()),
         Some(Command::Set { peer_id, name, addr, key, clear, set_self }) => {
             cmd_set(&mut conf, &storage, peer_id, name, addr, key, clear, set_self)
         }

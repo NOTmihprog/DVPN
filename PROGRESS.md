@@ -38,7 +38,9 @@
   - [x] `Display`/`FromStr`/`Serialize` в base64url без паддинга (приём standard и с паддингом); в postcard — 32 байта без префикса длины
   - [x] `ed25519 → curve25519` конверсия, тест-вектор (RFC 8032 seed, X25519 посчитан libsodium) + proptest round-trip
 - [x] **1.2** `encode_b64` → `URL_SAFE_NO_PAD`; проверить все вызовы — конфиг, `peers.json`, экспорт, API, лог трекера; декодер по-прежнему принимает паддинг и standard (тест)
-- [ ] **1.3** ключ в `config.toml` `[identity] private_key` + env `DVPN_PRIVATE_KEY`; `dvpn gen-key` / `dvpn show-key`
+- [x] **1.3** ключ в `config.toml` `[identity] private_key` + env `DVPN_PRIVATE_KEY`; `dvpn gen-key` / `dvpn show-key [-k KEY]`
+  - [x] нет `[identity]` (новый или v3-конфиг) → генерируется и дописывается в начало файла; env имеет приоритет и в файл не пишется; файл с ключом — `0600` (тесты в `config.rs`, `show-key` в netns-тесте)
+  - [x] логи переведены в stderr, чтобы `$(dvpn show-key)` / `export` в stdout были чистыми
 - [ ] **1.4** замена `PeerId` → `NodeId` по всему коду (storage, api, tracker, node)
 - [ ] **1.5** логгер: `Display` обёртки `NodeId` (`имя(префикс)`), убрать эвристику поиска id в тексте (§3)
 - [ ] **1.6** трекер: `Announce` подписан ключом узла над транскриптом handshake (§11)

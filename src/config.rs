@@ -8,14 +8,25 @@ use rand::RngExt;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::crypto::{decode_b64, decode_key32, encode_b64};
+use crate::identity::Identity;
 use crate::peer_id::PeerId;
 
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const PEERS_FILE_NAME: &str = "peers.json";
+/// Overrides `[identity] private_key`; never written to the config file.
+pub const PRIVATE_KEY_ENV: &str = "DVPN_PRIVATE_KEY";
 
 #[cfg(unix)]
 pub const SOCKET_DEFAULT_DIR: &str = "/run/dvpn";
 pub const SOCKET_DEFAULT_ADDR: &str = "127.0.0.1:9902";
+
+/// Prepended to `config.toml` when it has no `[identity]` (new file, or one from v3).
+const IDENTITY_SECTION: &str = r#"[identity]
+# Node private key (Ed25519 seed, base64url). The public key derived from it is the node id:
+# dvpn show-key. The DVPN_PRIVATE_KEY environment variable overrides it. Keep it secret.
+private_key = "{private_key}"
+
+"#;
 
 const DEFAULT_CONFIG: &str = r#"[peer]
 # Peer-Id string len = 32, generate: dvpn gen-peer-id
@@ -69,11 +80,29 @@ pub struct ServerConfig {
 pub struct Config {
     path: PathBuf,
     doc: DocumentMut,
+    pub identity: Identity,
     pub peer: PeerConfig,
     pub net: Option<NetConfig>,
     pub servers: Vec<ServerConfig>,
     pub log_level: LevelFilter,
     pub local_server_key: Option<[u8; 32]>,
+}
+
+/// Writes a file that holds private keys: created as 0600 on unix, and an existing file is
+/// narrowed to 0600 too (§14a).
+#[cfg(unix)]
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // mode() applies on creation, so a new file is never world-readable even briefly
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(text.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    std::fs::write(path, text)
 }
 
 fn random_host(net: Ipv4Addr, prefix: u8) -> Ipv4Addr {
@@ -162,18 +191,45 @@ fn parse_log_level(s: &str) -> anyhow::Result<LevelFilter> {
 }
 
 impl Config {
-    /// Loads `config.toml` from `dir`, creating a default one if missing.
+    /// Loads `config.toml` from `dir`, creating a default one if missing. The node key comes
+    /// from `DVPN_PRIVATE_KEY` if set, else from `[identity]`, else a new one is generated and
+    /// written to the file.
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
+        Self::load_with_env_key(dir, std::env::var(PRIVATE_KEY_ENV).ok())
+    }
+
+    fn load_with_env_key(dir: &Path, env_key: Option<String>) -> anyhow::Result<Self> {
         let path = dir.join(CONFIG_FILE_NAME);
         if !path.exists() {
             let addr = random_host(Ipv4Addr::new(10, 10, 33, 0), 24);
             let text =
                 DEFAULT_CONFIG.replace("{peer_id}", PeerId::generate().as_str()).replace("{addr}", &addr.to_string());
-            std::fs::write(&path, text).with_context(|| format!("create {}", path.display()))?;
+            write_private(&path, &text).with_context(|| format!("create {}", path.display()))?;
         }
         let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let doc: DocumentMut = text.parse().with_context(|| format!("parse {}", path.display()))?;
+        let mut doc: DocumentMut = text.parse().with_context(|| format!("parse {}", path.display()))?;
         let file = CONFIG_FILE_NAME;
+
+        let file_key = match section(&doc, "identity").and_then(|t| t.get("private_key")) {
+            Some(item) => {
+                let s = item.as_str().ok_or_else(|| anyhow!("[identity] private_key is not a string in {file}"))?;
+                Some(Identity::from_private_key_text(s).map_err(|e| anyhow!("[identity] private_key: {e} in {file}"))?)
+            }
+            None => None,
+        };
+        let env_key = env_key.filter(|s| !s.trim().is_empty());
+        let identity = match (env_key, file_key) {
+            (Some(s), _) => Identity::from_private_key_text(&s).map_err(|e| anyhow!("{PRIVATE_KEY_ENV}: {e}"))?,
+            (None, Some(id)) => id,
+            (None, None) => {
+                let id = Identity::generate();
+                let text = IDENTITY_SECTION.replace("{private_key}", &id.private_key_text()) + &doc.to_string();
+                doc = text.parse().with_context(|| format!("parse {}", path.display()))?;
+                write_private(&path, &text).with_context(|| format!("write {}", path.display()))?;
+                log::info!("Generated a new node key, saved to [identity] in {file}");
+                id
+            }
+        };
 
         let peer = parse_peer(section(&doc, "peer").ok_or_else(|| anyhow!("[peer] not found in {file}"))?)
             .map_err(|e| anyhow!("[peer] {e:#} in {file}"))?;
@@ -207,7 +263,7 @@ impl Config {
             None => None,
         };
 
-        Ok(Config { path, doc, peer, net, servers, log_level, local_server_key })
+        Ok(Config { path, doc, identity, peer, net, servers, log_level, local_server_key })
     }
 
     pub fn set_peer_id(&mut self, id: PeerId) {
@@ -273,6 +329,93 @@ mod tests {
         let text = std::fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap();
         assert!(text.contains("# local bind ip"), "comments must survive save");
         assert_eq!(Config::load(&dir).unwrap().peer.peer_id, id);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dvpn-test-{}", PeerId::generate()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn file_key(dir: &Path) -> Option<String> {
+        let doc: DocumentMut = std::fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap().parse().unwrap();
+        doc.get("identity")?.get("private_key")?.as_str().map(str::to_owned)
+    }
+
+    #[cfg(unix)]
+    fn mode(dir: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(dir.join(CONFIG_FILE_NAME)).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn identity_generated_with_new_config() {
+        let dir = temp_dir();
+        let a = Config::load_with_env_key(&dir, None).unwrap();
+        let text = std::fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap();
+        assert!(text.starts_with("[identity]"), "identity goes first");
+        assert_eq!(file_key(&dir).unwrap(), a.identity.private_key_text());
+        #[cfg(unix)]
+        assert_eq!(mode(&dir), 0o600);
+        // stable across loads and saves
+        a.save();
+        assert_eq!(Config::load_with_env_key(&dir, None).unwrap().identity.id(), a.identity.id());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn identity_added_to_config_without_one() {
+        let dir = temp_dir();
+        let path = dir.join(CONFIG_FILE_NAME);
+        let old = DEFAULT_CONFIG.replace("{peer_id}", PeerId::generate().as_str()).replace("{addr}", "10.10.33.7");
+        std::fs::write(&path, &old).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let a = Config::load_with_env_key(&dir, None).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# local bind ip"), "comments must survive");
+        assert!(text.contains("dvpn show-key"), "identity comment added");
+        assert!(
+            text.starts_with("[identity]") || text.starts_with("\n# Node private key") || text.starts_with("# Node")
+        );
+        assert_eq!(file_key(&dir).unwrap(), a.identity.private_key_text());
+        #[cfg(unix)]
+        assert_eq!(mode(&dir), 0o600, "narrowed once a key is written");
+        assert_eq!(Config::load_with_env_key(&dir, None).unwrap().identity.id(), a.identity.id());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn env_key_overrides_file_and_is_not_saved() {
+        let dir = temp_dir();
+        let from_file = Config::load_with_env_key(&dir, None).unwrap().identity.id();
+        let env = Identity::generate();
+        let conf = Config::load_with_env_key(&dir, Some(env.private_key_text())).unwrap();
+        assert_eq!(conf.identity.id(), env.id());
+        assert_ne!(conf.identity.id(), from_file);
+        conf.save();
+        assert_ne!(file_key(&dir).unwrap(), env.private_key_text());
+        // empty env var is ignored
+        assert_eq!(Config::load_with_env_key(&dir, Some(" ".into())).unwrap().identity.id(), from_file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bad_identity_keys_are_errors() {
+        let dir = temp_dir();
+        Config::load_with_env_key(&dir, None).unwrap();
+        let err = Config::load_with_env_key(&dir, Some("AAAA".into())).err().unwrap().to_string();
+        assert!(err.contains(PRIVATE_KEY_ENV), "{err}");
+        let path = dir.join(CONFIG_FILE_NAME);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let key = file_key(&dir).unwrap();
+        std::fs::write(&path, text.replace(&key, "broken")).unwrap();
+        let err = Config::load_with_env_key(&dir, None).err().unwrap().to_string();
+        assert!(err.contains("[identity] private_key"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -83,7 +83,7 @@ impl Log for Logger {
         }
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S,%3f");
         let msg = self.decorate(r.args().to_string());
-        let mut out = std::io::stdout().lock();
+        let mut out = std::io::stderr().lock();
         let _ = writeln!(
             out,
             "{GREEN}|{CYAN_DIM}{ts}{RESET}{GREEN}|{RESET} {} {GREEN}|{YELLOW}->{RESET} {WHITE}{msg}{RESET}",
@@ -92,6 +92,6 @@ impl Log for Logger {
     }
 
     fn flush(&self) {
-        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
     }
 }
