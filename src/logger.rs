@@ -1,9 +1,10 @@
+use std::fmt;
 use std::io::Write;
 use std::sync::{Arc, OnceLock};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
-use crate::identity::{NODE_ID_TEXT_LEN, NodeId};
+use crate::identity::NodeId;
 use crate::storage::PeerStorage;
 
 const RESET: &str = "\x1b[0m";
@@ -31,7 +32,7 @@ pub fn set_level(level: LevelFilter) {
     log::set_max_level(level);
 }
 
-/// From now on peer ids in log messages are shown together with the peer name.
+/// From now on `node(id)` in log messages shows the node name too.
 pub fn attach_storage(storage: Arc<PeerStorage>) {
     let _ = LOGGER.storage.set(storage);
 }
@@ -46,36 +47,23 @@ fn level_name(l: Level) -> &'static str {
     }
 }
 
-impl Logger {
-    fn decorate(&self, msg: String) -> String {
-        let Some(storage) = self.storage.get() else { return msg };
-        let b = msg.as_bytes();
-        let mut out = String::with_capacity(msg.len() + 32);
-        let mut i = 0;
-        let mut last = 0;
-        // Stopgap until log call sites format ids themselves (stage 1.5): any 43-char base64url
-        // token that parses as a node key and is known to the storage gets its name attached.
-        let is_b64 = |c: &u8| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_';
-        while i + NODE_ID_TEXT_LEN <= b.len() {
-            let boundary_before = i == 0 || !is_b64(&b[i - 1]);
-            let boundary_after = b.get(i + NODE_ID_TEXT_LEN).is_none_or(|c| !is_b64(c));
-            let token = &b[i..i + NODE_ID_TEXT_LEN];
-            let id = (boundary_before && boundary_after && token.iter().all(is_b64))
-                .then(|| msg[i..i + NODE_ID_TEXT_LEN].parse::<NodeId>().ok())
-                .flatten()
-                .filter(|id| storage.exists(id));
-            if let Some(id) = id {
-                let name = storage.name(&id).unwrap_or_else(|| "None".into());
-                out.push_str(&msg[last..i]);
-                out.push_str(&format!("{YELLOW}{name}{DARK_GREEN}({GREY}{id}{DARK_GREEN}){WHITE}"));
-                i += NODE_ID_TEXT_LEN;
-                last = i;
-            } else {
-                i += 1;
-            }
+/// Shows a node id in a log message as `name(prefix)`, or just the prefix when the node has no
+/// name or no storage is attached (tracker server). `{:#}` prints the full key instead of the
+/// prefix. Usage: `log::info!("Peer {} new endpoint {addr}", logger::node(id))`.
+pub fn node(id: NodeId) -> Node {
+    Node(id)
+}
+
+pub struct Node(NodeId);
+
+impl fmt::Display for Node {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let key = if f.alternate() { self.0.to_string() } else { self.0.short() };
+        // Never block here: storage methods log while holding the storage lock.
+        match LOGGER.storage.get().and_then(|s| s.name_if_unlocked(&self.0)) {
+            Some(name) => write!(f, "{YELLOW}{name}{DARK_GREEN}({GREY}{key}{DARK_GREEN}){WHITE}"),
+            None => write!(f, "{GREY}{key}{WHITE}"),
         }
-        out.push_str(&msg[last..]);
-        out
     }
 }
 
@@ -89,7 +77,7 @@ impl Log for Logger {
             return;
         }
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S,%3f");
-        let msg = self.decorate(r.args().to_string());
+        let msg = r.args();
         let mut out = std::io::stderr().lock();
         let _ = writeln!(
             out,
@@ -100,5 +88,51 @@ impl Log for Logger {
 
     fn flush(&self) {
         let _ = std::io::stderr().flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::PeerUpdate;
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    fn plain(s: String) -> String {
+        let mut out = String::new();
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c == '\x1b' {
+                it.by_ref().find(|c| *c == 'm');
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    // The only test that attaches a storage: LOGGER is process-global.
+    #[test]
+    fn node_display_and_no_deadlock_under_storage_lock() {
+        let s = Arc::new(PeerStorage::load(NodeId::random(), None).unwrap());
+        let (a, b) = (NodeId::random(), NodeId::random());
+        let ip = Ipv4Addr::new(10, 0, 0, 5);
+        s.set_peer(a, PeerUpdate { name: Some(Some("alice".into())), addr: Some(Some(ip)), ..Default::default() });
+
+        assert_eq!(plain(node(a).to_string()), a.short(), "no storage attached yet");
+        init(LevelFilter::Warn);
+        attach_storage(s.clone());
+        assert_eq!(plain(node(a).to_string()), format!("alice({})", a.short()));
+        assert_eq!(plain(format!("{:#}", node(a))), format!("alice({a})"));
+        assert_eq!(plain(node(b).to_string()), b.short(), "unknown node: prefix only");
+
+        // Storage logs these while holding its write lock; formatting must not wait for it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            s.set_peer(b, PeerUpdate { addr: Some(Some(ip)), ..Default::default() }); // shared addr
+            s.set_peer(b, PeerUpdate { key: Some(Some("not a key".into())), ..Default::default() }); // bad key
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(10)).expect("logging under the storage lock deadlocked");
     }
 }

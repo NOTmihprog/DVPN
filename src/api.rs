@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 
 use crate::crypto::encode_b64;
 use crate::identity::NodeId;
+use crate::logger::node;
 use crate::node::{ApiPacket, Node};
 use crate::proto::{MAX_DATAGRAM, ROUTE_API_MAX, ROUTE_API_MIN};
 use crate::storage::{Event, PeerRecord, PeerUpdate, normalize_key};
@@ -297,7 +298,7 @@ impl Api {
     async fn net_loop(self: Arc<Self>, mut rx: mpsc::Receiver<ApiPacket>) {
         while let Some((route, peer_id, data)) = rx.recv().await {
             let Some(owner) = self.state.lock().route_owner.get(&route).cloned() else {
-                log::debug!("API | packet from {peer_id} to unregistered route {route} dropped");
+                log::debug!("API | packet from {} to unregistered route {route} dropped", node(peer_id));
                 continue;
             };
             let v = map(vec![
@@ -392,11 +393,11 @@ impl Api {
         let peer = field(p, "peer_id").and_then(Value::as_str).and_then(|s| s.parse::<NodeId>().ok());
         let (Some(route), Some(data), Some(peer)) = (route, data, peer) else { return };
         if self.state.lock().route_owner.get(&route) != Some(from) {
-            log::debug!("API | conn {from} drop packet to {peer}: route {route} not owned");
+            log::debug!("API | conn {from} drop packet to {}: route {route} not owned", node(peer));
             return;
         }
         if !self.node.send_routed(&peer, route, data).await {
-            log::debug!("API | packet to {peer} destination addr not found");
+            log::debug!("API | packet to {} destination addr not found", node(peer));
         }
     }
 

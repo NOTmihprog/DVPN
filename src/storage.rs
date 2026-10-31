@@ -13,6 +13,7 @@ use tokio::sync::broadcast;
 
 use crate::crypto::{PeerCipher, decode_key32, encode_b64};
 use crate::identity::NodeId;
+use crate::logger::node;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerRecord {
@@ -111,7 +112,10 @@ impl Peer {
             Some(k) => match decode_key32(k) {
                 Ok(k) => Some(PeerCipher::new(&k)),
                 Err(e) => {
-                    log::warn!("PeerStorage | Peer {} key load error: {e}, encryption disabled", self.rec.peer_id);
+                    log::warn!(
+                        "PeerStorage | Peer {} key load error: {e}, encryption disabled",
+                        node(self.rec.peer_id)
+                    );
                     None
                 }
             },
@@ -134,7 +138,7 @@ impl Inner {
             if let Some(addr) = self.peers[id].rec.addr
                 && let Some(other) = self.by_addr.insert(addr, *id)
             {
-                log::warn!("PeerStorage | Peers {other} and {id} share addr {addr}, using {id}");
+                log::warn!("PeerStorage | Peers {} and {} share addr {addr}, using {1}", node(other), node(*id));
             }
         }
     }
@@ -386,6 +390,12 @@ impl PeerStorage {
 
     pub fn name(&self, id: &NodeId) -> Option<String> {
         self.inner.read().peers.get(id).and_then(|p| p.rec.name.clone())
+    }
+
+    /// Like `name`, but gives up instead of waiting if the storage is locked (for the logger,
+    /// which is called from inside storage methods that hold the write lock).
+    pub fn name_if_unlocked(&self, id: &NodeId) -> Option<String> {
+        self.inner.try_read()?.peers.get(id).and_then(|p| p.rec.name.clone())
     }
 
     pub fn endpoint(&self, id: &NodeId) -> Option<SocketAddr> {

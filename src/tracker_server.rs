@@ -9,6 +9,7 @@ use tokio::net::UdpSocket;
 
 use crate::crypto::{TrackerSession, server_accept};
 use crate::identity::NodeId;
+use crate::logger::node;
 use crate::proto::{HELLO, MAX_DATAGRAM, SEARCH_BATCH, TRACKER, TrackerMsg};
 
 const TIMEOUT: Duration = Duration::from_secs(45);
@@ -69,7 +70,7 @@ impl State {
                     self.drop_session(out, old, true);
                     self.by_peer.insert(peer_id, addr);
                 }
-                log::info!("Server | Session {addr} peer_id: {peer_id}");
+                log::info!("Server | Session {addr} node: {:#}", node(peer_id));
             }
         }
         self.send(out, addr, &TrackerMsg::Found { peer_id, addr });
@@ -83,7 +84,7 @@ impl State {
             }
             let mine = self.searches.entry(me).or_default();
             if mine.len() < MAX_SEARCHES && mine.insert(target) {
-                log::info!("Server | peer_id: {me} new search {target}");
+                log::info!("Server | node {:#} new search {:#}", node(me), node(target));
             }
             let mutual = self.searches.get(&target).is_some_and(|s| s.contains(&me));
             if !mutual {
@@ -93,7 +94,7 @@ impl State {
             // Tell both sides at once so they start punching through their NATs simultaneously.
             self.send(out, addr, &TrackerMsg::Found { peer_id: target, addr: target_addr });
             self.send(out, target_addr, &TrackerMsg::Found { peer_id: me, addr });
-            log::debug!("Server | peer_id: {me} <-> {target} matched");
+            log::debug!("Server | node {:#} <-> {:#} matched", node(me), node(target));
         }
     }
 

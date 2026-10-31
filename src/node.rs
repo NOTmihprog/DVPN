@@ -10,6 +10,7 @@ use tun_rs::AsyncDevice;
 
 use crate::crypto::{SEALED_HDR, TAG_LEN};
 use crate::identity::NodeId;
+use crate::logger::node;
 use crate::packet::{self, IpInfo};
 use crate::proto::{
     CONTROL_LEN, CONTROL_PING, CONTROL_PONG, HELLO_ACK, MAX_DATAGRAM, PLAIN, ROAM_MAX_LEN, ROUTE_API_MIN,
@@ -174,7 +175,7 @@ impl Node {
             tick.tick().await;
             for (id, link) in self.storage.links() {
                 if link.last_seen.unwrap_or(link.since).elapsed() > LINK_TIMEOUT {
-                    log::info!("Ping | peer {id} link timeout, endpoint dropped");
+                    log::info!("Ping | peer {} link timeout, endpoint dropped", node(id));
                     self.storage.del_endpoint(&id);
                     continue;
                 }
@@ -186,7 +187,7 @@ impl Node {
                 let ts = self.epoch.elapsed().as_nanos() as u64;
                 if self.send_routed(&id, ROUTE_CONTROL, &self.control_payload(CONTROL_PING, ts)).await {
                     self.storage.update_link(&id, |l| l.last_ping = Some(Instant::now()));
-                    log::debug!("Ping | send ping to peer {id}");
+                    log::debug!("Ping | send ping to peer {}", node(id));
                 }
             }
         }
@@ -197,7 +198,7 @@ impl Node {
             CONTROL_PING => {
                 self.storage.update_link(&peer, |l| l.last_seen = Some(Instant::now()));
                 self.send_routed(&peer, ROUTE_CONTROL, &self.control_payload(CONTROL_PONG, c.echo_ts)).await;
-                log::debug!("Ping | receive ping from {peer}");
+                log::debug!("Ping | receive ping from {}", node(peer));
             }
             CONTROL_PONG => {
                 let now = self.epoch.elapsed().as_nanos() as u64;
@@ -208,7 +209,7 @@ impl Node {
                     l.rtt_ms = Some(ms);
                 });
                 self.storage.emit(Event::Ping { peer_id: peer, ms });
-                log::debug!("Ping | receive pong from {peer} ping: {ms:.3}");
+                log::debug!("Ping | receive pong from {} ping: {ms:.3}", node(peer));
             }
             _ => {}
         }
@@ -278,7 +279,7 @@ impl Node {
                 log::debug!("Peer | replayed control packet from {from} dropped");
                 return;
             }
-            log::info!("Peer | Peer {} new endpoint {from} (roaming)", c.sender);
+            log::info!("Peer | Peer {} new endpoint {from} (roaming)", node(c.sender));
             self.storage.set_peer(c.sender, PeerUpdate { endpoint: Some(Some(from)), ..Default::default() });
             self.handle_control(c.sender, c).await;
             return;
@@ -293,7 +294,7 @@ impl Node {
                     Some(IpInfo { src: IpAddr::V4(src), .. }) if inb.peer_addr == Some(src)
                 );
                 if !from_peer {
-                    log::debug!("Peer | packet from {} with foreign source dropped", inb.peer_id);
+                    log::debug!("Peer | packet from {} with foreign source dropped", node(inb.peer_id));
                     return;
                 }
                 if let Err(e) = tun.send(payload).await {
@@ -312,7 +313,7 @@ impl Node {
                     let _ = tx.try_send((route, inb.peer_id, payload.to_vec()));
                 }
             }
-            route => log::debug!("Peer | route {route} from {} not found", inb.peer_id),
+            route => log::debug!("Peer | route {route} from {} not found", node(inb.peer_id)),
         }
     }
 

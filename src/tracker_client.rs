@@ -5,6 +5,7 @@ use ed25519_dalek::VerifyingKey;
 use parking_lot::Mutex;
 
 use crate::crypto::{ClientHandshake, TrackerSession};
+use crate::logger::node;
 use crate::proto::{HELLO_ACK, SEARCH_BATCH, TRACKER, TrackerMsg};
 use crate::storage::{PeerStorage, PeerUpdate};
 
@@ -149,20 +150,25 @@ impl TrackerClient {
                         drop(s);
                         if !storage.exists(&peer_id) {
                             log::info!(
-                                "{} Received packet | Peer {peer_id} not found in peer_storage",
-                                self.log_prefix
+                                "{} Received packet | Peer {} not found in peer_storage",
+                                self.log_prefix,
+                                node(peer_id)
                             );
                         } else if storage.endpoint(&peer_id) == Some(addr) {
-                            log::debug!("{} Peer {peer_id} receive endpoint {addr}", self.log_prefix);
+                            log::debug!("{} Peer {} receive endpoint {addr}", self.log_prefix, node(peer_id));
                         } else if storage.link_alive(&peer_id, LIVE_LINK) {
                             // The direct link works; behind some NATs the peer's real port differs
                             // from what the tracker sees, so don't break a working link.
-                            log::debug!("{} Peer {peer_id} endpoint {addr} ignored, link alive", self.log_prefix);
+                            log::debug!(
+                                "{} Peer {} endpoint {addr} ignored, link alive",
+                                self.log_prefix,
+                                node(peer_id)
+                            );
                         } else {
                             if storage.is_self(&peer_id) {
                                 log::info!("{} New self endpoint {addr}", self.log_prefix);
                             } else {
-                                log::info!("{} Peer {peer_id} new endpoint {addr}", self.log_prefix);
+                                log::info!("{} Peer {} new endpoint {addr}", self.log_prefix, node(peer_id));
                             }
                             storage.set_peer(peer_id, PeerUpdate { endpoint: Some(Some(addr)), ..Default::default() });
                         }
