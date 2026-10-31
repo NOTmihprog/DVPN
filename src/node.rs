@@ -89,9 +89,11 @@ impl Node {
     /// Sends a handshake to `peer`'s endpoint unless one went out less than `min_interval` ago.
     async fn handshake(&self, peer: NodeId, min_interval: Duration) {
         let Some(route) = self.storage.route_by_id(&peer) else { return };
-        if let Some(p) = self.links.initiate(peer, min_interval) {
+        if let Some(packets) = self.links.initiate(peer, min_interval) {
             log::debug!("Link | handshake to {}", node(peer));
-            self.transport.send_to(&p, route.endpoint).await;
+            for p in &packets {
+                self.transport.send_to(p, route.endpoint).await;
+            }
         }
     }
 

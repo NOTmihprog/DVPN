@@ -44,13 +44,14 @@ const MEMBER_REFRESH: Duration = Duration::from_secs(1);
 pub struct Group {
     pub psk: [u8; 32],
     pub id: [u8; 32],
+    pub obfs: Profile,
 }
 
 impl Group {
     /// The group id is derived from the psk for now; stage 3 derives both from the group secret.
     pub fn from_psk(psk: [u8; 32]) -> Self {
         let id = Blake2s256::new().chain_update(b"dvpn/4 group id").chain_update(psk).finalize().into();
-        Group { psk, id }
+        Group { psk, id, obfs: Profile::default() }
     }
 }
 
@@ -241,7 +242,7 @@ pub struct Links {
 
 impl Links {
     pub fn new(identity: Arc<Identity>, group: Group) -> Self {
-        let obfs = Arc::new(Obfs::new(&group.psk, Profile::default()));
+        let obfs = Arc::new(Obfs::new(&group.psk, group.obfs.clone()));
         Links { identity, group, obfs, inner: RwLock::new(Inner::default()) }
     }
 
@@ -260,8 +261,9 @@ impl Links {
         HandshakePayload::new(0, self.group.id).encode()
     }
 
-    /// A HS_INIT packet to `peer`, unless one was sent less than `min_interval` ago.
-    pub fn initiate(&self, peer: NodeId, min_interval: Duration) -> Option<Vec<u8>> {
+    /// Packets that start a handshake with `peer`, in sending order: the profile's signature and
+    /// junk packets, then HS_INIT. `None` if one was sent less than `min_interval` ago.
+    pub fn initiate(&self, peer: NodeId, min_interval: Duration) -> Option<Vec<Vec<u8>>> {
         if peer == self.identity.id() {
             return None;
         }
@@ -283,7 +285,9 @@ impl Links {
         out[HS_INIT_HDR..HS_INIT_HDR + 32].copy_from_slice(&repr);
         inner.pending.insert(idx, Pending { peer, initiator: ini, sent: Instant::now() });
         drop(inner);
-        Some(self.finish_handshake(HS_INIT, out))
+        let mut packets = self.obfs.prelude();
+        packets.push(self.finish_handshake(HS_INIT, out));
+        Some(packets)
     }
 
     fn lookup_member(&self, x25519: &[u8; 32], members: impl FnOnce() -> Vec<NodeId>) -> Option<NodeId> {
@@ -439,7 +443,7 @@ mod tests {
 
     /// A -> B handshake; returns whether both ends completed it.
     fn handshake(a: &Side, b: &Side) -> bool {
-        let Some(mut init) = a.links.initiate(b.id, Duration::ZERO) else { return false };
+        let Some(mut init) = a.links.initiate(b.id, Duration::ZERO).and_then(|mut p| p.pop()) else { return false };
         let Some(Received::Handshake { peer, reply: Some(mut resp) }) = b.links.receive(&mut init, || vec![a.id])
         else {
             return false;
@@ -495,14 +499,14 @@ mod tests {
     #[test]
     fn unknown_initiator_rejected() {
         let (a, b) = pair();
-        let mut init = a.links.initiate(b.id, Duration::ZERO).unwrap();
+        let mut init = a.links.initiate(b.id, Duration::ZERO).unwrap().pop().unwrap();
         assert!(b.links.receive(&mut init, Vec::new).is_none(), "a is not a member of b's network");
     }
 
     #[test]
     fn replayed_init_gets_no_reply() {
         let (a, b) = pair();
-        let init = a.links.initiate(b.id, Duration::ZERO).unwrap();
+        let init = a.links.initiate(b.id, Duration::ZERO).unwrap().pop().unwrap();
         assert!(b.links.receive(&mut init.clone(), || vec![a.id]).is_some());
         assert!(b.links.receive(&mut init.clone(), || vec![a.id]).is_none(), "same TAI64N timestamp");
     }
@@ -531,7 +535,7 @@ mod tests {
     #[test]
     fn forged_resp_does_not_cancel_pending_handshake() {
         let (a, b) = pair();
-        let mut init = a.links.initiate(b.id, Duration::ZERO).unwrap();
+        let mut init = a.links.initiate(b.id, Duration::ZERO).unwrap().pop().unwrap();
         let Some(Received::Handshake { reply: Some(resp), .. }) = b.links.receive(&mut init, || vec![a.id]) else {
             panic!()
         };
@@ -556,8 +560,8 @@ mod tests {
     #[test]
     fn simultaneous_handshakes_both_work() {
         let (a, b) = pair();
-        let mut ia = a.links.initiate(b.id, Duration::ZERO).unwrap();
-        let mut ib = b.links.initiate(a.id, Duration::ZERO).unwrap();
+        let mut ia = a.links.initiate(b.id, Duration::ZERO).unwrap().pop().unwrap();
+        let mut ib = b.links.initiate(a.id, Duration::ZERO).unwrap().pop().unwrap();
         let Some(Received::Handshake { reply: Some(mut ra), .. }) = b.links.receive(&mut ia, || vec![a.id]) else {
             panic!()
         };
@@ -570,6 +574,23 @@ mod tests {
             assert!(deliver(&b, data(&a, &b.id, b"ab").unwrap()).is_some());
             assert!(deliver(&a, data(&b, &a.id, b"ba").unwrap()).is_some());
         }
+    }
+
+    #[test]
+    fn junk_and_signatures_precede_init_and_are_ignored() {
+        let psk = crate::crypto::random_bytes();
+        let mut group = Group::from_psk(psk);
+        group.obfs.signatures = vec!["<b 0x16030301> <r 40>".parse().unwrap()];
+        let (ia, ib) = (Arc::new(Identity::generate()), Arc::new(Identity::generate()));
+        let (a, b) = (Links::new(ia.clone(), group.clone()), Links::new(ib.clone(), group));
+        let packets = a.initiate(ib.id(), Duration::ZERO).unwrap();
+        assert!((1 + 4 + 1..=1 + 8 + 1).contains(&packets.len()), "signature, 4-8 junk, init");
+        assert_eq!(packets[0][..4], [0x16, 0x03, 0x03, 0x01]);
+        let (init, prelude) = packets.split_last().unwrap();
+        for p in prelude {
+            assert!(b.receive(&mut p.clone(), || vec![ia.id()]).is_none());
+        }
+        assert!(b.receive(&mut init.clone(), || vec![ia.id()]).is_some());
     }
 
     #[test]
@@ -599,7 +620,7 @@ mod bench {
         let psk = random_bytes();
         let (ia, ib) = (Arc::new(Identity::generate()), Arc::new(Identity::generate()));
         let (a, b) = (Links::new(ia.clone(), Group::from_psk(psk)), Links::new(ib.clone(), Group::from_psk(psk)));
-        let mut init = a.initiate(ib.id(), Duration::ZERO).unwrap();
+        let mut init = a.initiate(ib.id(), Duration::ZERO).unwrap().pop().unwrap();
         let Some(Received::Handshake { reply: Some(mut resp), .. }) = b.receive(&mut init, || vec![ia.id()]) else {
             panic!()
         };

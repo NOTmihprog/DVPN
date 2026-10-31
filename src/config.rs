@@ -1,4 +1,5 @@
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
@@ -10,6 +11,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use crate::crypto::{decode_b64, decode_key32, encode_b64};
 use crate::identity::Identity;
 use crate::link::Group;
+use crate::obfs::{MAX_PAD, MAX_WIRE, Profile, Template};
 
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const PEERS_FILE_NAME: &str = "peers.json";
@@ -54,6 +56,16 @@ mask = "255.255.255.0"
 # Generate once with `dvpn gen-key` and copy to all nodes. (Real groups with invites: stage 3.)
 # [group]
 # psk = "..."
+#
+# Obfuscation profile, identical on all nodes (defaults shown; AmneziaWG-style names).
+# [group.obfs]
+# jc = "4-8"        # junk packets before each handshake
+# jmin = 40         # junk packet sizes
+# jmax = 200
+# s1 = "0-96"       # random padding of handshake initiations
+# s2 = "0-96"       # ... of handshake responses
+# s4 = "0-48"       # ... of data packets
+# i1 = "<b 0x16030301> <r 32> <t>"   # optional signature packets i1..i5, sent before the junk
 
 [app]
 # Log Levels DEBUG, INFO, WARNING, ERROR, CRITICAL
@@ -126,6 +138,62 @@ pub fn parse_mask(s: &str) -> anyhow::Result<u8> {
         bail!("mask {s} is not contiguous");
     }
     Ok(m.leading_ones() as u8)
+}
+
+/// "a-b" or "a" (also an integer value) as an inclusive range.
+fn parse_range<T: std::str::FromStr + PartialOrd + std::fmt::Display>(s: &str) -> anyhow::Result<RangeInclusive<T>>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    let (a, b) = s.split_once('-').unwrap_or((s, s));
+    let (a, b): (T, T) = (a.trim().parse()?, b.trim().parse()?);
+    if a > b {
+        bail!("{a} > {b}");
+    }
+    Ok(a..=b)
+}
+
+/// `[group.obfs]`: the group's obfuscation profile (PLAN §4.4). Unknown keys are errors, so a
+/// typo cannot silently fall back to defaults.
+fn parse_obfs(t: &Table) -> anyhow::Result<Profile> {
+    let mut p = Profile::default();
+    let (mut jmin, mut jmax) = (*p.junk_size.start(), *p.junk_size.end());
+    let mut signatures: [Option<Template>; 5] = Default::default();
+    for (key, item) in t.iter() {
+        let text = || get_str_or_int(t, key).with_context(|| key.to_owned());
+        let pad = || -> anyhow::Result<RangeInclusive<u16>> {
+            let r = parse_range::<u16>(&text()?).with_context(|| key.to_owned())?;
+            if *r.end() as usize > MAX_PAD {
+                bail!("{key}: padding above {MAX_PAD}");
+            }
+            Ok(r)
+        };
+        match key {
+            "jc" => p.junk_count = parse_range::<u8>(&text()?).context("jc")?,
+            "jmin" => jmin = text()?.parse().context("jmin")?,
+            "jmax" => jmax = text()?.parse().context("jmax")?,
+            "s1" => p.init_pad = pad()?,
+            "s2" => p.resp_pad = pad()?,
+            "s4" => p.data_pad = pad()?,
+            "i1" | "i2" | "i3" | "i4" | "i5" => {
+                let s = item.as_str().ok_or_else(|| anyhow!("{key} is not a string"))?;
+                let i = key.as_bytes()[1] - b'1';
+                signatures[i as usize] = Some(s.parse().map_err(|e| anyhow!("{key}: {e}"))?);
+            }
+            "header_protection" => {
+                if item.as_bool() != Some(true) {
+                    bail!("header_protection cannot be turned off: basic masking is always on");
+                }
+            }
+            _ => bail!("unknown key {key}"),
+        }
+    }
+    if jmin > jmax || jmax as usize > MAX_WIRE {
+        bail!("need jmin <= jmax <= {MAX_WIRE}, got {jmin}..{jmax}");
+    }
+    p.junk_size = jmin..=jmax;
+    p.signatures = signatures.into_iter().flatten().collect();
+    Ok(p)
 }
 
 pub fn parse_port_range(s: &str) -> anyhow::Result<(u16, u16)> {
@@ -268,7 +336,11 @@ impl Config {
         let group = match section(&doc, "group").and_then(|t| t.get("psk")) {
             Some(item) => {
                 let s = item.as_str().ok_or_else(|| anyhow!("[group] psk is not a string in {file}"))?;
-                Some(Group::from_psk(decode_key32(s).map_err(|e| anyhow!("[group] psk: {e} in {file}"))?))
+                let mut g = Group::from_psk(decode_key32(s).map_err(|e| anyhow!("[group] psk: {e} in {file}"))?);
+                if let Some(t) = section(&doc, "group").and_then(|g| g.get("obfs")).and_then(Item::as_table) {
+                    g.obfs = parse_obfs(t).map_err(|e| anyhow!("[group.obfs] {e:#} in {file}"))?;
+                }
+                Some(g)
             }
             None => None,
         };
@@ -406,6 +478,45 @@ mod tests {
         // empty env var is ignored
         assert_eq!(Config::load_with_env_key(&dir, Some(" ".into())).unwrap().identity.id(), from_file);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn with_group(extra: &str) -> anyhow::Result<Config> {
+        let dir = temp_dir();
+        Config::load_with_env_key(&dir, None).unwrap();
+        let path = dir.join(CONFIG_FILE_NAME);
+        let psk = encode_b64(&crate::crypto::random_bytes::<32>());
+        let text = std::fs::read_to_string(&path).unwrap() + &format!("\n[group]\npsk = \"{psk}\"\n{extra}");
+        std::fs::write(&path, text).unwrap();
+        let r = Config::load_with_env_key(&dir, None);
+        std::fs::remove_dir_all(dir).unwrap();
+        r
+    }
+
+    #[test]
+    fn group_obfs_profile() {
+        assert_eq!(with_group("").unwrap().group.unwrap().obfs, Profile::default());
+        let c = with_group(
+            "[group.obfs]\njc = \"1-2\"\njmin = 10\njmax = \"20\"\ns1 = \"5-6\"\ns2 = 7\ns4 = \"0-0\"\n\
+             i2 = \"<r 3>\"\ni1 = \"<b 0xab>\"\nheader_protection = true\n",
+        )
+        .unwrap();
+        let o = c.group.unwrap().obfs;
+        assert_eq!((o.junk_count, o.junk_size), (1..=2, 10..=20));
+        assert_eq!((o.init_pad, o.resp_pad, o.data_pad), (5..=6, 7..=7, 0..=0));
+        assert_eq!(o.signatures, vec!["<b 0xab>".parse().unwrap(), "<r 3>".parse().unwrap()], "kept in i1..i5 order");
+
+        for (bad, why) in [
+            ("jc = \"9-1\"", "9 > 1"),
+            ("jmin = 300\njmax = 100", "jmin <= jmax"),
+            ("jmax = 5000", "jmin <= jmax"),
+            ("s1 = \"0-9999\"", "padding above"),
+            ("i1 = \"<zz>\"", "unknown tag"),
+            ("header_protection = false", "cannot be turned off"),
+            ("h1 = \"1-5\"", "unknown key h1"),
+        ] {
+            let err = format!("{:#}", with_group(&format!("[group.obfs]\n{bad}\n")).err().unwrap());
+            assert!(err.contains(why) && err.contains("[group.obfs]"), "{bad}: {err}");
+        }
     }
 
     #[test]

@@ -40,19 +40,144 @@ pub fn header_len(ty: u8) -> Option<usize> {
     }
 }
 
-/// Padding ranges per packet type (AmneziaWG's s1/s2 and content padding). Shared by the whole
-/// group so all members look alike; configurable in stage 2.6.
-#[derive(Clone, Debug)]
+/// One piece of a signature packet template (AmneziaWG `i1..i5` syntax).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Piece {
+    /// `<b 0x0102..>` fixed bytes
+    Bytes(Vec<u8>),
+    /// `<r N>` random bytes
+    Random(usize),
+    /// `<rc N>` random ASCII letters
+    Letters(usize),
+    /// `<rd N>` random ASCII digits
+    Digits(usize),
+    /// `<t>` unix time, u32 big-endian
+    Time,
+}
+
+/// A signature packet sent before handshakes, built from a template like
+/// `<b 0x16030301> <r 8> <t>`, so the start of a flow can resemble some harmless protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Template(Vec<Piece>);
+
+impl std::str::FromStr for Template {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let mut pieces = Vec::new();
+        let mut rest = s.trim();
+        while !rest.is_empty() {
+            let inner = rest
+                .strip_prefix('<')
+                .and_then(|r| r.split_once('>'))
+                .ok_or_else(|| format!("expected <tag> at {rest:?}"))?;
+            let (tag, after) = inner;
+            rest = after.trim_start();
+            let mut words = tag.split_whitespace();
+            let name = words.next().unwrap_or_default();
+            let arg = words.next();
+            if words.next().is_some() {
+                return Err(format!("too many arguments in <{tag}>"));
+            }
+            let count = || -> Result<usize, String> {
+                let n: usize = arg
+                    .ok_or(format!("<{name}> needs a length"))?
+                    .parse()
+                    .map_err(|_| format!("bad length in <{tag}>"))?;
+                if n == 0 || n > MAX_WIRE { Err(format!("length out of range in <{tag}>")) } else { Ok(n) }
+            };
+            pieces.push(match name {
+                "b" => {
+                    let hex =
+                        arg.and_then(|a| a.strip_prefix("0x")).ok_or(format!("<b> needs 0x-prefixed hex: <{tag}>"))?;
+                    if hex.is_empty() || hex.len() % 2 != 0 {
+                        return Err(format!("odd or empty hex in <{tag}>"));
+                    }
+                    let bytes = (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                        .collect::<Result<Vec<u8>, _>>()
+                        .map_err(|_| format!("bad hex in <{tag}>"))?;
+                    Piece::Bytes(bytes)
+                }
+                "r" => Piece::Random(count()?),
+                "rc" => Piece::Letters(count()?),
+                "rd" => Piece::Digits(count()?),
+                "t" if arg.is_none() => Piece::Time,
+                _ => return Err(format!("unknown tag <{tag}>")),
+            });
+        }
+        let t = Template(pieces);
+        match t.len() {
+            0 => Err("empty template".into()),
+            n if n > MAX_WIRE => Err(format!("template makes {n}-byte packets, more than {MAX_WIRE}")),
+            _ => Ok(t),
+        }
+    }
+}
+
+impl Template {
+    fn len(&self) -> usize {
+        self.0
+            .iter()
+            .map(|p| match p {
+                Piece::Bytes(b) => b.len(),
+                Piece::Random(n) | Piece::Letters(n) | Piece::Digits(n) => *n,
+                Piece::Time => 4,
+            })
+            .sum()
+    }
+
+    pub fn generate(&self) -> Vec<u8> {
+        const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let mut rng = rand::rng();
+        let mut out = Vec::with_capacity(self.len());
+        for p in &self.0 {
+            match p {
+                Piece::Bytes(b) => out.extend_from_slice(b),
+                Piece::Random(n) => out.extend((0..*n).map(|_| rng.random::<u8>())),
+                Piece::Letters(n) => out.extend((0..*n).map(|_| LETTERS[rng.random_range(0..LETTERS.len())])),
+                Piece::Digits(n) => out.extend((0..*n).map(|_| b'0' + rng.random_range(0..10u8))),
+                Piece::Time => {
+                    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                    out.extend_from_slice(&(t.as_secs() as u32).to_be_bytes());
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The group's obfuscation profile (`[group.obfs]`), the same for all members so they look
+/// alike. Names follow AmneziaWG; its `h1..h4` (message type ranges) are not needed because the
+/// type is masked entirely, and `content_padding` is what `s4` does.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
+    /// `jc`: junk packets sent before each handshake initiation.
+    pub junk_count: RangeInclusive<u8>,
+    /// `jmin`..`jmax`: their sizes.
+    pub junk_size: RangeInclusive<u16>,
+    /// `i1`..`i5`: signature packets sent before the junk, in order.
+    pub signatures: Vec<Template>,
+    /// `s1`: padding of handshake initiations.
     pub init_pad: RangeInclusive<u16>,
+    /// `s2`: padding of handshake responses.
     pub resp_pad: RangeInclusive<u16>,
+    /// `s4`: padding of data packets.
     pub data_pad: RangeInclusive<u16>,
 }
 
 impl Default for Profile {
-    /// Moderate: handshakes vary by up to 96 bytes, data by up to 48.
+    /// Moderate: 4-8 junk packets of 40-200 bytes, handshakes vary by up to 96 bytes, data by 48.
     fn default() -> Self {
-        Profile { init_pad: 0..=96, resp_pad: 0..=96, data_pad: 0..=48 }
+        Profile {
+            junk_count: 4..=8,
+            junk_size: 40..=200,
+            signatures: Vec::new(),
+            init_pad: 0..=96,
+            resp_pad: 0..=96,
+            data_pad: 0..=48,
+        }
     }
 }
 
@@ -75,6 +200,18 @@ impl Obfs {
         let mut m = [0u8; 16];
         c.apply_keystream(&mut m);
         m
+    }
+
+    /// Packets to send right before a handshake initiation: the signature packets, then junk.
+    /// They are not ours to the receiver (no valid header/MAC) and get dropped there.
+    pub fn prelude(&self) -> Vec<Vec<u8>> {
+        let mut rng = rand::rng();
+        let mut out: Vec<Vec<u8>> = self.profile.signatures.iter().map(Template::generate).collect();
+        for _ in 0..rng.random_range(self.profile.junk_count.clone()) {
+            let n = rng.random_range(self.profile.junk_size.clone()) as usize;
+            out.push((0..n).map(|_| rng.random::<u8>()).collect());
+        }
+        out
     }
 
     /// How much padding to add to a packet of type `ty` that is `len` bytes long, with `room`
@@ -178,8 +315,62 @@ mod tests {
     }
 
     #[test]
+    fn templates() {
+        let t: Template = "<b 0x16030301> <r 8> <rc 5><rd 3> <t>".parse().unwrap();
+        let p = t.generate();
+        assert_eq!(p.len(), 4 + 8 + 5 + 3 + 4);
+        assert_eq!(&p[..4], &[0x16, 0x03, 0x03, 0x01]);
+        assert!(p[12..17].iter().all(u8::is_ascii_alphabetic));
+        assert!(p[17..20].iter().all(u8::is_ascii_digit));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+        let t_val = u32::from_be_bytes(p[20..24].try_into().unwrap());
+        assert!(now.abs_diff(t_val) <= 2);
+        assert_ne!(t.generate()[4..12], p[4..12], "random part differs between packets");
+        for bad in [
+            "",
+            "<b 0x>",
+            "<b 0x123>",
+            "<b 1234>",
+            "<b 0xzz>",
+            "<r>",
+            "<r 0>",
+            "<r x>",
+            "<q 3>",
+            "<t 4>",
+            "b 0x00",
+            "<r 99999>",
+            "<r 1 2>",
+        ] {
+            assert!(bad.parse::<Template>().is_err(), "{bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn prelude_counts_and_sizes() {
+        let profile = Profile {
+            junk_count: 2..=3,
+            junk_size: 10..=20,
+            signatures: vec!["<b 0xaabb>".parse().unwrap(), "<r 4>".parse().unwrap()],
+            ..Profile::default()
+        };
+        let o = Obfs::new(&random_bytes(), profile);
+        for _ in 0..50 {
+            let p = o.prelude();
+            assert!((4..=5).contains(&p.len()));
+            assert_eq!(p[0], [0xaa, 0xbb]);
+            assert_eq!(p[1].len(), 4);
+            assert!(p[2..].iter().all(|j| (10..=20).contains(&j.len())));
+        }
+        let none = Obfs::new(&random_bytes(), Profile { junk_count: 0..=0, ..Profile::default() });
+        assert!(none.prelude().is_empty());
+    }
+
+    #[test]
     fn padding_respects_room_and_mtu() {
-        let o = Obfs::new(&random_bytes(), Profile { init_pad: 400..=400, resp_pad: 0..=0, data_pad: 300..=300 });
+        let o = Obfs::new(
+            &random_bytes(),
+            Profile { init_pad: 400..=400, resp_pad: 0..=0, data_pad: 300..=300, ..Profile::default() },
+        );
         assert_eq!(o.pad_len(HS_INIT, 100, 1000), 400);
         assert_eq!(o.pad_len(HS_INIT, 100, 10), 10, "limited by buffer room");
         assert_eq!(o.pad_len(DATA, MAX_WIRE - 5, 1000), 5, "limited by MTU");
