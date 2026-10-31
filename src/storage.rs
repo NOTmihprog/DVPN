@@ -132,9 +132,10 @@ impl Inner {
         self.by_addr.clear();
         for id in &self.order {
             if let Some(addr) = self.peers[id].rec.addr
-                && let Some(other) = self.by_addr.insert(addr, *id) {
-                    log::warn!("PeerStorage | Peers {other} and {id} share addr {addr}, using {id}");
-                }
+                && let Some(other) = self.by_addr.insert(addr, *id)
+            {
+                log::warn!("PeerStorage | Peers {other} and {id} share addr {addr}, using {id}");
+            }
         }
     }
 
@@ -152,9 +153,10 @@ impl Inner {
             // An endpoint belongs to one peer only; a NAT may hand it over to another one.
             if let Some(prev) = self.by_endpoint.insert(ep, id)
                 && prev != id
-                    && let Some(pp) = self.peers.get_mut(&prev) {
-                        pp.endpoint = None;
-                    }
+                && let Some(pp) = self.peers.get_mut(&prev)
+            {
+                pp.endpoint = None;
+            }
         }
     }
 }
@@ -220,7 +222,9 @@ impl PeerStorage {
         let mut records: Vec<PeerRecord> = Vec::new();
         if let Some(p) = &path {
             match std::fs::read(p) {
-                Ok(data) => records = serde_json::from_slice(&data).with_context(|| format!("parse {}", p.display()))?,
+                Ok(data) => {
+                    records = serde_json::from_slice(&data).with_context(|| format!("parse {}", p.display()))?
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => log::warn!("PeerStorage | read file({}) error: {e}", p.display()),
             }
@@ -424,15 +428,19 @@ impl PeerStorage {
 
     pub fn update_link(&self, id: &PeerId, f: impl FnOnce(&mut Link)) {
         if let Some(p) = self.inner.write().peers.get_mut(id)
-            && p.endpoint.is_some() {
-                f(&mut p.link);
-            }
+            && p.endpoint.is_some()
+        {
+            f(&mut p.link);
+        }
     }
 
     /// Whether we heard from the peer at its current endpoint within `within`.
     pub fn link_alive(&self, id: &PeerId, within: Duration) -> bool {
         let inner = self.inner.read();
-        inner.peers.get(id).is_some_and(|p| p.endpoint.is_some() && p.link.last_seen.is_some_and(|t| t.elapsed() < within))
+        inner
+            .peers
+            .get(id)
+            .is_some_and(|p| p.endpoint.is_some() && p.link.last_seen.is_some_and(|t| t.elapsed() < within))
     }
 
     /// Records a control packet's (session, seq); false if it is not newer than what we saw (replay).
@@ -555,7 +563,12 @@ mod bench {
             let ep: SocketAddr = format!("192.0.2.{}:{}", i + 1, 5000 + i as u16).parse().unwrap();
             s.set_peer(
                 PeerId::generate(),
-                PeerUpdate { addr: Some(Some(ip)), key: Some(Some(generate_key())), endpoint: Some(Some(ep)), ..Default::default() },
+                PeerUpdate {
+                    addr: Some(Some(ip)),
+                    key: Some(Some(generate_key())),
+                    endpoint: Some(Some(ep)),
+                    ..Default::default()
+                },
             );
             ips.push(ip);
             eps.push(ep);

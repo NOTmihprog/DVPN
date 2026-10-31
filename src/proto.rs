@@ -61,12 +61,19 @@ pub const SEARCH_BATCH: usize = 32;
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TrackerMsg {
     /// Client -> server: "I am `peer_id`, at the address you see this packet from".
-    Announce { peer_id: PeerId },
+    Announce {
+        peer_id: PeerId,
+    },
     /// Client -> server: "I want to connect to these peers".
-    Search { peers: Vec<PeerId> },
+    Search {
+        peers: Vec<PeerId>,
+    },
     /// Server -> client: `peer_id` is reachable at `addr`. Sent for our own id in reply to
     /// an announce, and for a searched peer once both sides searched for each other.
-    Found { peer_id: PeerId, addr: SocketAddr },
+    Found {
+        peer_id: PeerId,
+        addr: SocketAddr,
+    },
     Close,
 }
 

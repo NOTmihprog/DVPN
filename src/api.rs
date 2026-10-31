@@ -85,10 +85,9 @@ impl ApiSocket {
         match self {
             ApiSocket::Inet(s) => s.recv_from(buf).await.map(|(n, a)| (n, Some(ApiAddr::Inet(a)))),
             #[cfg(unix)]
-            ApiSocket::Unix(s, _) => s
-                .recv_from(buf)
-                .await
-                .map(|(n, a)| (n, a.as_pathname().map(|p| ApiAddr::Unix(p.to_owned())))),
+            ApiSocket::Unix(s, _) => {
+                s.recv_from(buf).await.map(|(n, a)| (n, a.as_pathname().map(|p| ApiAddr::Unix(p.to_owned()))))
+            }
         }
     }
 
@@ -193,7 +192,9 @@ fn event_value(e: &Event) -> Value {
             ("crypto", crypto_value(record)),
             ("sub_args", sub_args_value(record)),
         ]),
-        Event::Server { addr, connected } => map(vec![("server", addr_value(Some(*addr))), ("status", (*connected).into())]),
+        Event::Server { addr, connected } => {
+            map(vec![("server", addr_value(Some(*addr))), ("status", (*connected).into())])
+        }
         Event::Ping { peer_id, ms } => map(vec![("peer_id", peer_id.as_str().into()), ("ping", (*ms).into())]),
     }
 }
@@ -419,9 +420,7 @@ impl Api {
             "peer_sub_args" => rec().map_or(Value::Nil, |(r, _)| sub_args_value(&r)),
             "peer_sub_arg" => {
                 let arg = field(p, "arg").and_then(Value::as_str).unwrap_or_default();
-                rec()
-                    .and_then(|(r, _)| r.sub_args?.get(arg).map(json_to_mp))
-                    .unwrap_or(Value::Nil)
+                rec().and_then(|(r, _)| r.sub_args?.get(arg).map(json_to_mp)).unwrap_or(Value::Nil)
             }
             "peer_endpoint" => addr_value(rec().and_then(|(_, e)| e)),
             "peer_status" => rec().is_some_and(|(_, e)| e.is_some()).into(),

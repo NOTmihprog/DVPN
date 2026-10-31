@@ -43,10 +43,11 @@ impl State {
         }
         let Some(s) = self.sessions.remove(&addr) else { return };
         if let Some(id) = s.peer_id
-            && self.by_peer.get(&id) == Some(&addr) {
-                self.by_peer.remove(&id);
-                self.searches.remove(&id);
-            }
+            && self.by_peer.get(&id) == Some(&addr)
+        {
+            self.by_peer.remove(&id);
+            self.searches.remove(&id);
+        }
         log::info!("Server | {addr} Session dropped");
     }
 
@@ -63,10 +64,11 @@ impl State {
                 s.peer_id = Some(peer_id);
                 // The newest address wins: the peer probably restarted or its NAT mapping changed.
                 if let Some(old) = self.by_peer.insert(peer_id, addr)
-                    && old != addr {
-                        self.drop_session(out, old, true);
-                        self.by_peer.insert(peer_id, addr);
-                    }
+                    && old != addr
+                {
+                    self.drop_session(out, old, true);
+                    self.by_peer.insert(peer_id, addr);
+                }
                 log::info!("Server | Session {addr} peer_id: {peer_id}");
             }
         }
@@ -137,12 +139,8 @@ impl State {
 
     fn collect_garbage(&mut self) -> Out {
         let mut out = Out::new();
-        let expired: Vec<_> = self
-            .sessions
-            .iter()
-            .filter(|(_, s)| s.last_announce.elapsed() > TIMEOUT)
-            .map(|(a, _)| *a)
-            .collect();
+        let expired: Vec<_> =
+            self.sessions.iter().filter(|(_, s)| s.last_announce.elapsed() > TIMEOUT).map(|(a, _)| *a).collect();
         for addr in expired {
             self.drop_session(&mut out, addr, true);
         }

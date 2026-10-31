@@ -106,10 +106,7 @@ pub fn parse_port_range(s: &str) -> anyhow::Result<(u16, u16)> {
 }
 
 fn get_str<'a>(t: &'a Table, key: &str) -> anyhow::Result<&'a str> {
-    t.get(key)
-        .ok_or_else(|| anyhow!("{key} not found"))?
-        .as_str()
-        .ok_or_else(|| anyhow!("{key} is not a string"))
+    t.get(key).ok_or_else(|| anyhow!("{key} not found"))?.as_str().ok_or_else(|| anyhow!("{key} is not a string"))
 }
 
 /// Ports are accepted both as `8647` and `"8647-9942"`.
@@ -118,9 +115,7 @@ fn get_str_or_int(t: &Table, key: &str) -> anyhow::Result<String> {
     if let Some(i) = item.as_integer() {
         return Ok(i.to_string());
     }
-    item.as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow!("{key} is not a string or integer"))
+    item.as_str().map(str::to_owned).ok_or_else(|| anyhow!("{key} is not a string or integer"))
 }
 
 fn section<'a>(doc: &'a DocumentMut, name: &str) -> Option<&'a Table> {
@@ -172,9 +167,8 @@ impl Config {
         let path = dir.join(CONFIG_FILE_NAME);
         if !path.exists() {
             let addr = random_host(Ipv4Addr::new(10, 10, 33, 0), 24);
-            let text = DEFAULT_CONFIG
-                .replace("{peer_id}", PeerId::generate().as_str())
-                .replace("{addr}", &addr.to_string());
+            let text =
+                DEFAULT_CONFIG.replace("{peer_id}", PeerId::generate().as_str()).replace("{addr}", &addr.to_string());
             std::fs::write(&path, text).with_context(|| format!("create {}", path.display()))?;
         }
         let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;

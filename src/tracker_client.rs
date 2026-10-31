@@ -148,7 +148,10 @@ impl TrackerClient {
                         s.response_ts = unix_now();
                         drop(s);
                         if !storage.exists(&peer_id) {
-                            log::info!("{} Received packet | Peer {peer_id} not found in peer_storage", self.log_prefix);
+                            log::info!(
+                                "{} Received packet | Peer {peer_id} not found in peer_storage",
+                                self.log_prefix
+                            );
                         } else if storage.endpoint(&peer_id) == Some(addr) {
                             log::debug!("{} Peer {peer_id} receive endpoint {addr}", self.log_prefix);
                         } else if storage.link_alive(&peer_id, LIVE_LINK) {

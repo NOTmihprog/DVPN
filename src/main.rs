@@ -130,10 +130,7 @@ fn die(msg: impl std::fmt::Display) -> ! {
 }
 
 fn default_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
+    std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn resolve_peer_id(s: &str, storage: &PeerStorage) -> PeerId {
@@ -214,9 +211,10 @@ fn read_input(inp: &Option<PathBuf>) -> Json {
 fn parse_import(mut v: Json) -> anyhow::Result<PeerRecord> {
     if let Some(obj) = v.as_object_mut() {
         if !obj.contains_key("key")
-            && let Some(k) = obj.get("crypto").and_then(|c| c.get("key")).cloned() {
-                obj.insert("key".into(), k);
-            }
+            && let Some(k) = obj.get("crypto").and_then(|c| c.get("key")).cloned()
+        {
+            obj.insert("key".into(), k);
+        }
         obj.remove("crypto");
     }
     let mut r: PeerRecord = serde_json::from_value(v)?;
@@ -254,10 +252,10 @@ fn cmd_set(
     set_self: bool,
 ) {
     let id = resolve_peer_id(&peer_id, storage);
-    let addr = cli_field(addr).map(|a| {
-        a.map(|s| s.parse::<Ipv4Addr>().unwrap_or_else(|e| die(format!("addr invalid, error: {e}"))))
-    });
-    let key = cli_field(key).map(|k| k.map(|s| normalize_key(&s).unwrap_or_else(|e| die(format!("key {s} invalid: {e}")))));
+    let addr = cli_field(addr)
+        .map(|a| a.map(|s| s.parse::<Ipv4Addr>().unwrap_or_else(|e| die(format!("addr invalid, error: {e}")))));
+    let key =
+        cli_field(key).map(|k| k.map(|s| normalize_key(&s).unwrap_or_else(|e| die(format!("key {s} invalid: {e}")))));
     let name = cli_field(name);
     fn pick<T>(f: Option<Option<T>>, clear: bool) -> Option<Option<T>> {
         if clear { Some(f.flatten()) } else { f }
@@ -290,7 +288,9 @@ fn api_addr_default(conf: &Config) -> String {
         let dir = Path::new(config::SOCKET_DEFAULT_DIR);
         match std::fs::create_dir_all(dir) {
             Ok(()) => return dir.join(format!("{}.sock", net.tun_name)).display().to_string(),
-            Err(e) => log::info!("Failed create directory: {}: {e}, use net socket: {SOCKET_DEFAULT_ADDR}", dir.display()),
+            Err(e) => {
+                log::info!("Failed create directory: {}: {e}, use net socket: {SOCKET_DEFAULT_ADDR}", dir.display())
+            }
         }
     }
     let _ = conf;
@@ -298,11 +298,8 @@ fn api_addr_default(conf: &Config) -> String {
 }
 
 fn build_tun(net: &config::NetConfig) -> anyhow::Result<tun_rs::AsyncDevice> {
-    let dev = tun_rs::DeviceBuilder::new()
-        .name(&net.tun_name)
-        .ipv4(net.addr, net.prefix, None)
-        .mtu(net.mtu)
-        .build_async()?;
+    let dev =
+        tun_rs::DeviceBuilder::new().name(&net.tun_name).ipv4(net.addr, net.prefix, None).mtu(net.mtu).build_async()?;
     Ok(dev)
 }
 
@@ -340,11 +337,7 @@ async fn run_node(conf: Config, storage: Arc<PeerStorage>, api_addr: Option<Stri
         Err(e) => die(format!("TUN | Tun init error: {e}")),
     });
 
-    let clients = conf
-        .servers
-        .iter()
-        .map(|s| TrackerClient::new(s.name.clone(), s.addr, s.key))
-        .collect();
+    let clients = conf.servers.iter().map(|s| TrackerClient::new(s.name.clone(), s.addr, s.key)).collect();
     let node = node::Node::new(storage, transport, clients, tun, conf.net.as_ref().map(|n| n.addr));
     node.start();
     let _api = api::Api::start(node.clone(), api_sock);

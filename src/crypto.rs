@@ -29,10 +29,7 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 pub fn decode_b64(s: &str) -> anyhow::Result<Vec<u8>> {
     let s = s.trim().trim_end_matches('=');
     let padded = format!("{s}{}", "=".repeat((4 - s.len() % 4) % 4));
-    URL_SAFE
-        .decode(&padded)
-        .or_else(|_| STANDARD.decode(&padded))
-        .context("invalid base64")
+    URL_SAFE.decode(&padded).or_else(|_| STANDARD.decode(&padded)).context("invalid base64")
 }
 
 pub fn decode_key32(s: &str) -> anyhow::Result<[u8; 32]> {
@@ -98,12 +95,7 @@ impl PeerCipher {
         let nonce = XNonce::try_from(&packet[1..SEALED_HDR]).ok()?;
         let tag = Tag::try_from(&packet[end..]).ok()?;
         self.0
-            .decrypt_inout_detached(
-                &nonce,
-                &Self::aad(recipient),
-                InOutBuf::from(&mut packet[SEALED_HDR..end]),
-                &tag,
-            )
+            .decrypt_inout_detached(&nonce, &Self::aad(recipient), InOutBuf::from(&mut packet[SEALED_HDR..end]), &tag)
             .ok()?;
         Some(SEALED_HDR..end)
     }
@@ -155,7 +147,13 @@ fn counter_nonce(n: u64) -> Nonce {
 }
 
 impl TrackerSession {
-    fn derive(shared: &[u8; 32], nonce: &[u8; 16], client_pub: &[u8; 32], server_pub: &[u8; 32], is_client: bool) -> Self {
+    fn derive(
+        shared: &[u8; 32],
+        nonce: &[u8; 16],
+        client_pub: &[u8; 32],
+        server_pub: &[u8; 32],
+        is_client: bool,
+    ) -> Self {
         let hk = Hkdf::<Sha256>::new(Some(nonce), shared);
         let mut okm = [0u8; 64];
         let info = [KEYS_CTX, client_pub, server_pub].concat();
@@ -174,7 +172,11 @@ impl TrackerSession {
         out.extend_from_slice(msg);
         let tag = self
             .tx
-            .encrypt_inout_detached(&counter_nonce(self.tx_counter), &[TRACKER], InOutBuf::from(&mut out[TRACKER_HDR..]))
+            .encrypt_inout_detached(
+                &counter_nonce(self.tx_counter),
+                &[TRACKER],
+                InOutBuf::from(&mut out[TRACKER_HDR..]),
+            )
             .expect("plaintext within AEAD limits");
         out.extend_from_slice(&tag);
         out
@@ -191,9 +193,7 @@ impl TrackerSession {
         let end = packet.len() - TAG_LEN;
         let mut plain = packet[TRACKER_HDR..end].to_vec();
         let tag = Tag::try_from(&packet[end..]).ok()?;
-        self.rx
-            .decrypt_inout_detached(&counter_nonce(n), &[TRACKER], InOutBuf::from(&mut plain[..]), &tag)
-            .ok()?;
+        self.rx.decrypt_inout_detached(&counter_nonce(n), &[TRACKER], InOutBuf::from(&mut plain[..]), &tag).ok()?;
         self.replay.accept(n);
         Some(plain)
     }
@@ -233,9 +233,7 @@ impl ClientHandshake {
         }
         let server_pub: [u8; 32] = ack[1..33].try_into().unwrap();
         let sig = Signature::from_bytes(ack[33..97].try_into().unwrap());
-        server_key
-            .verify(&hello_sig_msg(&self.public, &self.nonce, &server_pub), &sig)
-            .ok()?;
+        server_key.verify(&hello_sig_msg(&self.public, &self.nonce, &server_pub), &sig).ok()?;
         let shared = self.secret.diffie_hellman(&PublicKey::from(server_pub));
         if !shared.was_contributory() {
             return None;

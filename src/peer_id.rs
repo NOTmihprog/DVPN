@@ -69,9 +69,7 @@ impl TryFrom<&[u8]> for PeerId {
     type Error = InvalidPeerId;
 
     fn try_from(b: &[u8]) -> Result<Self, Self::Error> {
-        std::str::from_utf8(b)
-            .map_err(|_| InvalidPeerId("not utf-8".into()))?
-            .parse()
+        std::str::from_utf8(b).map_err(|_| InvalidPeerId("not utf-8".into()))?.parse()
     }
 }
 
