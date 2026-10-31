@@ -211,6 +211,8 @@ pub struct ClientHandshake {
 }
 
 impl ClientHandshake {
+    // Not `Default`: every call draws fresh random keys, which `Default` would hide.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let secret = StaticSecret::from(random_bytes::<32>());
         let public = PublicKey::from(&secret).to_bytes();

@@ -1,16 +1,3 @@
-mod api;
-mod config;
-mod crypto;
-mod logger;
-mod node;
-mod packet;
-mod peer_id;
-mod proto;
-mod storage;
-mod tracker_client;
-mod tracker_server;
-mod transport;
-
 use std::io::{BufRead, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
@@ -23,11 +10,13 @@ use ed25519_dalek::SigningKey;
 use log::LevelFilter;
 use serde_json::Value as Json;
 
-use crate::config::{Config, PEERS_FILE_NAME, SOCKET_DEFAULT_ADDR};
-use crate::crypto::{decode_b64, encode_b64, generate_key, random_bytes};
-use crate::peer_id::{PEER_ID_LEN, PeerId};
-use crate::storage::{PeerRecord, PeerStorage, PeerUpdate, normalize_key};
-use crate::tracker_client::TrackerClient;
+use dvpn::{api, config, logger, node, tracker_server, transport};
+
+use dvpn::config::{Config, PEERS_FILE_NAME, SOCKET_DEFAULT_ADDR};
+use dvpn::crypto::{decode_b64, encode_b64, generate_key, random_bytes};
+use dvpn::peer_id::{PEER_ID_LEN, PeerId};
+use dvpn::storage::{PeerRecord, PeerStorage, PeerUpdate, normalize_key};
+use dvpn::tracker_client::TrackerClient;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTHOR: &str = "mihprog";
