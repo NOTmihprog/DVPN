@@ -9,7 +9,7 @@
 - в конце каждого этапа выполняется его «Готово, когда» из PLAN.md — отмечается в «Критерий приёмки»;
 - при изменении плана синхронизировать и этот файл.
 
-Текущий этап: **Этап 0**. Версия протокола на проводе: `dvpn/4`, байт версии в handshake-payload с самого начала.
+Текущий этап: **Этап 1** (этап 0 закрыт). Версия протокола на проводе: `dvpn/4`, байт версии в handshake-payload с самого начала.
 
 ---
 
@@ -24,11 +24,11 @@
 - [x] **0.3** netns-тест-харнесс (по образцу `yggmgr/tests/netns-e2e.sh`): трекер + 3 узла, NAT `nft masquerade`, ping/iperf — `tests/netns-e2e.sh`, без root (`unshare -rnm`), ~10 с
   - [x] топология: A и B за разными NAT (с политикой домашнего роутера `ct state new drop` с WAN), C с публичным адресом
   - [x] проверки: ping во всех направлениях, A↔B через hole punching, прямой путь nat1→nat2 (счётчик nft), iperf3; отсутствие открытого текста на WAN через `tcpdump` (необязателен; негативный контроль без ключей ловит открытый текст)
-  - [~] запуск из CI — job `netns` в `.gitea/workflows/ci.yml`, на раннере ещё не проверен (нужны user namespaces и `/dev/net/tun`)
+  - [x] запуск из CI — job `netns` в `.gitea/workflows/ci.yml` (privileged-контейнер: user namespaces и `/dev/net/tun`)
 - [x] **0.4** каркас `cargo-fuzz` (пустые цели-заглушки) + `proptest` в dev-deps, прогон в CI (§14a) — цели `packet_parse`, `tracker_msg`; крейт разделён на `lib.rs` + `main.rs`
-- [~] **0.5** CI: `cargo test`, `clippy -D warnings`, `fmt --check`, netns-тест, сборка фаззинг-целей — всё в `.gitea/workflows/ci.yml`; на раннере Gitea ещё не проверен
+- [x] **0.5** CI: `cargo test`, `clippy -D warnings`, `fmt --check`, netns-тест, сборка фаззинг-целей — `.gitea/workflows/ci.yml`, свой Forgejo-раннер (docker, privileged, `ubuntu-latest` = `catthehacker/ubuntu:act-24.04`)
 
-**Критерий приёмки:** [ ] текущие тесты + netns-тест проходят, фаззинг-каркас собирается в CI. — локально всё проходит, осталось подтвердить на раннере Gitea.
+**Критерий приёмки:** [x] текущие тесты + netns-тест проходят, фаззинг-каркас собирается в CI — зелёный прогон на `43e9219` (check, fuzz, netns).
 
 ---
 
