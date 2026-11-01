@@ -75,3 +75,10 @@ path = "fuzz_targets/ckr_spec.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "routing_msg"
+path = "fuzz_targets/routing_msg.rs"
+test = false
+doc = false
+bench = false

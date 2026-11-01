@@ -35,6 +35,14 @@ pub const KIND_CONTROL: u8 = 0;
 pub const KIND_IP: u8 = 1;
 /// Group records between neighbours: `SyncMsg`.
 pub const KIND_STATE: u8 = 2;
+/// Mesh routing between neighbours: `router::RoutingMsg`.
+pub const KIND_ROUTING: u8 = 3;
+/// A packet for another node: `[limit u8][hops u8][probe u16][dst8][src8][inner]`, where inner
+/// is a packet of the end-to-end session with dst (PLAN §4.3, §6).
+pub const KIND_FORWARD: u8 = 4;
+pub const FORWARD_HDR: usize = 1 + 1 + 2 + 8 + 8;
+/// Hop limit of forwarded packets (PLAN §6.4).
+pub const MAX_HOPS: u8 = 16;
 pub const KIND_API_MIN: u8 = 32;
 pub const KIND_API_MAX: u8 = 255;
 

@@ -423,4 +423,67 @@ reach y6 x6 10.10.66.1
 grep -q 'new endpoint \[2001:db8::12\]' "$W/node-x6.log" || fail "x6 did not get y6's IPv6 endpoint"
 ok "pure IPv6: tracker, discovery and the tunnel over IPv6"
 
+# ---- mesh: relays ---------------------------------------------------------------------
+# MA and MC cannot reach each other (a filter on MA, like a hostile network between them);
+# MB and MD are relays. MA <-> MC must work through a relay, survive that relay going down
+# (the other one takes over), and move to the direct path once it opens.
+for n in ma mb mc md; do ip netns add $n; nsx $n ip link set lo up; done
+wan_port ma 203.0.113.31
+wan_port mb 203.0.113.32
+wan_port mc 203.0.113.33
+wan_port md 203.0.113.34
+nsx ma nft -f - <<NFT
+table inet block {
+    chain out { type filter hook output priority 0; ip daddr 203.0.113.33 drop; }
+    chain in { type filter hook input priority 0; ip saddr 203.0.113.33 drop; }
+}
+NFT
+mkdir ma mb mc md
+"$D" --dir "$W/ma" show-key >/dev/null 2>&1
+cat >> ma/config.toml <<TOML
+
+[servers.main]
+addr = "203.0.113.1"
+port = 6485
+key = "$TKEY"
+TOML
+"$D" --dir "$W/ma" group create mesh -a 10.10.77.1 -n ma >/dev/null || fail "ma: group create"
+for x in "mb 2 --relay" "mc 3" "md 4 --relay"; do
+    set -- $x
+    inv=$("$D" --dir "$W/ma" group invite -n "$1" -a "10.10.77.$2" ${3:-} 2>/dev/null) || fail "invite $1"
+    "$D" --dir "$W/$1" group join "$inv" >/dev/null 2>&1 || fail "$1: join"
+done
+for n in ma mb mc md; do bg "node-$n" $n "$D" --dir "$W/$n" -a 127.0.0.1:9902; done
+reach ma mc 10.10.77.3
+reach mc ma 10.10.77.1
+plain() { sed 's/\x1b\[[0-9;]*m//g' "$W/node-$1.log"; } # logs are coloured
+plain ma | grep -q 'end-to-end session with mc' || plain mc | grep -q 'end-to-end session with ma' \
+    || fail "ma <-> mc did not go through a relay"
+via=$( (plain ma; plain mc) | sed -n 's/.*end-to-end session with [^ ]* via \(m[bd]\).*/\1/p' | tail -n1)
+ok "ma <-> mc through relay $via"
+
+# the relay in use goes down: the other one takes over
+case $via in mb) other=md ;; *) other=mb ;; esac
+nsx "$via" ip link set wan0 down
+wait_for 60 nsx ma ping -c1 -W1 10.10.77.3 || fail "ma -> mc lost after $via went down"
+nsx ma ping -c3 -i0.2 -W1 10.10.77.3 >/dev/null || fail "ma -> mc unstable through $other"
+ok "relay $via down: ma <-> mc through $other"
+nsx "$via" ip link set wan0 up
+
+# the direct path opens: traffic moves to it
+nsx ma nft delete table inet block
+nsx ma nft -f - <<NFT
+table ip direct {
+    counter c { }
+    chain out { type filter hook output priority 0; ip daddr 203.0.113.33 meta l4proto udp counter name c; }
+}
+NFT
+direct() { nsx ma nft list counter ip direct c | awk '/packets/ {print $2}'; }
+wait_for 40 sh -c "ip netns exec ma ping -c1 -W1 10.10.77.3 >/dev/null && [ \$(ip netns exec ma nft list counter ip direct c | awk '/packets/ {print \$2}') -gt 0 ]" \
+    || fail "no direct packets to mc after the path opened"
+before=$(direct)
+nsx ma ping -c5 -i0.2 -W1 10.10.77.3 >/dev/null || fail "ma -> mc after the path opened"
+[ $(( $(direct) - before )) -ge 5 ] || fail "ma -> mc still not direct"
+ok "direct path opened: ma <-> mc go direct"
+
 echo "PASS"

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -16,8 +16,10 @@ use crate::noise::TAG_LEN;
 use crate::obfs::MAX_PAD;
 use crate::packet::{self, IpInfo};
 use crate::proto::{
-    CONTROL_LEN, CONTROL_PING, CONTROL_PONG, DATA_HDR, KIND_API_MIN, KIND_CONTROL, KIND_IP, KIND_STATE, MAX_DATAGRAM,
+    CONTROL_LEN, CONTROL_PING, CONTROL_PONG, DATA_HDR, FORWARD_HDR, KIND_API_MIN, KIND_CONTROL, KIND_FORWARD, KIND_IP,
+    KIND_ROUTING, KIND_STATE, MAX_DATAGRAM, MAX_HOPS,
 };
+use crate::router::{LSA_REFRESH, Lsa, LsaBody, Lsdb, MAX_LSA_NEIGHBORS, RouteTable, RoutingMsg, ShortId, short_id};
 use crate::state::{Body, Entry, Membership, StateStore, SyncMsg, record_key};
 use crate::storage::{Event, PeerStorage, PeerUpdate};
 use crate::tracker_client::{Output, TrackerClient};
@@ -32,6 +34,9 @@ const KEEPALIVE: std::ops::Range<Duration> = Duration::from_secs(12)..Duration::
 /// The link loop runs at random intervals around a second, for the same reason.
 const LINK_TICK: std::ops::Range<Duration> = Duration::from_millis(700)..Duration::from_millis(1300);
 const LINK_TIMEOUT: Duration = Duration::from_secs(45);
+/// A neighbour silent this long (keepalives answer every 12-18 s) is no longer announced as a
+/// link nor used as a first hop, so routes move to another relay quickly.
+const NEIGHBOR_ALIVE: Duration = Duration::from_secs(25);
 /// Group records are compared with each neighbour this often (and when a session comes up).
 const PEER_SYNC: Duration = Duration::from_secs(60);
 /// Admins renew certificates that expire sooner than this.
@@ -87,6 +92,13 @@ pub struct Node {
     ckr: arc_swap::ArcSwap<CkrTable>,
     /// System routes for the CKR table, with the prefixes already on the TUN interface.
     sys_routes: parking_lot::Mutex<Option<(crate::sysroute::SysRoutes, Vec<ipnet::IpNet>)>>,
+    /// Mesh (PLAN §6): end-to-end sessions carried in `FORWARD`, the link-state database, the
+    /// routes computed from it, and what we last announced.
+    pub e2e: Links,
+    lsdb: parking_lot::Mutex<Lsdb>,
+    routes: arc_swap::ArcSwap<RouteTable>,
+    my_lsa: parking_lot::Mutex<(Vec<NodeId>, Option<Instant>, u64)>,
+    last_routing_sync: parking_lot::Mutex<HashMap<NodeId, Instant>>,
     /// Further addresses to try for peers without a session (PLAN §9.1): the candidates they
     /// announced to the tracker, or all addresses of a static peer.
     candidates: parking_lot::Mutex<HashMap<NodeId, Vec<SocketAddr>>>,
@@ -101,12 +113,14 @@ impl Node {
     pub fn new(
         storage: Arc<PeerStorage>,
         transport: Arc<Transport>,
-        links: Links,
+        // direct link sessions, and end-to-end sessions through the mesh
+        (links, e2e): (Links, Links),
         clients: Vec<TrackerClient>,
         tun: Option<AsyncDevice>,
         self_addr: Option<Ipv4Addr>,
         group: GroupCtx,
     ) -> Arc<Self> {
+        let group_id = group.id;
         let clients: Vec<_> = clients.into_iter().map(Arc::new).collect();
         let clients_by_addr = clients.iter().flat_map(|c| c.addrs().iter().map(move |a| (*a, c.clone()))).collect();
         Arc::new(Node {
@@ -126,6 +140,11 @@ impl Node {
             peer_certs: parking_lot::Mutex::new(HashMap::new()),
             ckr: arc_swap::ArcSwap::from_pointee(CkrTable::default()),
             sys_routes: parking_lot::Mutex::new(None),
+            e2e,
+            lsdb: parking_lot::Mutex::new(Lsdb::new(group_id)),
+            routes: arc_swap::ArcSwap::from_pointee(RouteTable::default()),
+            my_lsa: parking_lot::Mutex::new((Vec::new(), None, 0)),
+            last_routing_sync: parking_lot::Mutex::new(HashMap::new()),
             candidates: parking_lot::Mutex::new(HashMap::new()),
             last_peer_sync: parking_lot::Mutex::new(HashMap::new()),
         })
@@ -187,6 +206,7 @@ impl Node {
         store.save();
         let m = Membership::of(store, &self.group.id);
         self.links.set_membership(m.clone());
+        self.e2e.set_membership(m.clone());
         let gone: Vec<NodeId> =
             self.peer_certs.lock().iter().filter(|(_, c)| !m.admits(c)).map(|(id, _)| *id).collect();
         for id in gone {
@@ -194,6 +214,7 @@ impl Node {
             self.peer_certs.lock().remove(&id);
             self.rebuild_ckr();
             self.links.drop_peer(&id);
+            self.e2e.drop_peer(&id);
             self.storage.del_peer(&id);
         }
         self.update_psks();
@@ -211,6 +232,7 @@ impl Node {
             );
             *self.cert.write() = c.clone();
             self.links.set_cert(c.clone());
+            self.e2e.set_cert(c.clone());
             for client in &self.clients {
                 client.set_certs(vec![c.clone()]);
             }
@@ -333,6 +355,7 @@ impl Node {
         }
         drop(st);
         self.links.set_psks(cur, next.or(prev));
+        self.e2e.set_psks(cur, next.or(prev));
     }
 
     async fn sync_peer(&self, peer: NodeId) {
@@ -362,6 +385,7 @@ impl Node {
     pub fn start(self: &Arc<Self>) {
         self.rebuild_ckr();
         self.links.set_membership(Membership::of(&self.group.store, &self.group.id));
+        self.e2e.set_membership(Membership::of(&self.group.store, &self.group.id));
         self.update_psks();
         {
             let me = self.clone();
@@ -414,9 +438,18 @@ impl Node {
     fn own_candidates(&self) -> Vec<SocketAddr> {
         let Ok(local) = self.transport.local_addr() else { return Vec::new() };
         let mut c = crate::transport::local_candidates(local.port(), self.transport.families(), None);
-        c.retain(|a| Some(a.ip()) != self.self_addr.map(IpAddr::V4));
+        c.retain(|a| Some(a.ip()) != self.self_addr.map(IpAddr::V4) && !self.in_overlay(a));
         c.truncate(crate::proto::MAX_CANDIDATES);
         c
+    }
+
+    /// Whether an address belongs to the overlay itself (the group ULA, or anything the CKR
+    /// routes into the tunnel): a "direct" link to it would run inside the tunnel.
+    fn in_overlay(&self, a: &SocketAddr) -> bool {
+        let ip = a.ip();
+        ipnet::IpNet::V6(crate::ckr::ula_prefix(&self.group.id)).contains(&ip)
+            || self.self_addr.is_some_and(|s| IpAddr::V4(s) == ip)
+            || self.ckr.load().lookup(ip).is_some()
     }
 
     /// Sends `[kind][body]` to `peer` over its session. Not for the TUN hot path.
@@ -449,7 +482,7 @@ impl Node {
         if !out.candidates.is_empty() {
             let mut cands = self.candidates.lock();
             for (peer, c) in out.candidates.iter().cloned() {
-                cands.insert(peer, c);
+                cands.insert(peer, c.into_iter().filter(|a| !self.in_overlay(a)).collect());
             }
         }
         for cert in &out.members {
@@ -510,6 +543,8 @@ impl Node {
             let tick = rand::rng().random_range(LINK_TICK); // ThreadRng must not live across .await
             tokio::time::sleep(tick).await;
             self.links.expire();
+            self.e2e.expire();
+            self.mesh_tick().await;
             // records written by the CLI (e.g. dvpn group revoke)
             let changed = self.group.store.reload();
             self.apply(&changed);
@@ -535,6 +570,14 @@ impl Node {
                 let synced = self.last_peer_sync.lock().get(&id).copied();
                 if has_session && synced.is_none_or(|t| t.elapsed() >= PEER_SYNC) {
                     self.sync_peer(id).await;
+                }
+                let routed = self.last_routing_sync.lock().get(&id).copied();
+                if has_session && routed.is_none_or(|t| t.elapsed() >= LSA_REFRESH) {
+                    self.last_routing_sync.lock().insert(id, Instant::now());
+                    let msgs = RoutingMsg::summaries(&self.lsdb.lock());
+                    for m in msgs {
+                        self.send_kind(&id, KIND_ROUTING, &m.encode()).await;
+                    }
                 }
             }
         }
@@ -667,28 +710,265 @@ impl Node {
                 self.roam(peer, from);
                 let Some((&kind, body)) = packet[plain].split_first() else { return };
                 match kind {
-                    KIND_IP => {
-                        let Some(tun) = &self.tun else { return };
-                        // Reverse path (PLAN §7.2): the source must route back to the sender, so
-                        // a peer injects only from its own addresses and subnets (its
-                        // certificate), or from the internet if it is our exit.
-                        let own = packet::parse(body).is_some_and(|i| self.ckr.load().lookup(i.src) == Some(peer));
-                        if !own {
-                            log::debug!("Link | packet from {} with foreign source dropped", node(peer));
-                            return;
-                        }
-                        if let Err(e) = tun.send(body).await {
-                            log::warn!("TUN | write error: {e}");
-                        }
-                    }
+                    KIND_IP => self.deliver_ip(peer, body).await,
                     KIND_CONTROL => self.handle_control(peer, body).await,
                     KIND_STATE => self.handle_state(peer, body).await,
+                    KIND_ROUTING => self.handle_routing(peer, body).await,
+                    KIND_FORWARD => Box::pin(self.handle_forward(peer, body)).await,
                     k if k >= KIND_API_MIN => {
                         if let Some(tx) = self.api_tx.get() {
                             let _ = tx.try_send((k, peer, body.to_vec()));
                         }
                     }
                     k => log::debug!("Link | unknown kind {k} from {}", node(peer)),
+                }
+            }
+        }
+    }
+
+    /// An IP packet from `peer` (directly or end to end) for the TUN device. Reverse path
+    /// (PLAN §7.2): the source must route back to the sender, so a peer injects only from its own
+    /// addresses and subnets (its certificate), or from the internet if it is our exit.
+    async fn deliver_ip(&self, peer: NodeId, body: &[u8]) {
+        let Some(tun) = &self.tun else { return };
+        let own = packet::parse(body).is_some_and(|i| self.ckr.load().lookup(i.src) == Some(peer));
+        if !own {
+            log::debug!("Link | packet from {} with foreign source dropped", node(peer));
+            return;
+        }
+        if let Err(e) = tun.send(body).await {
+            log::warn!("TUN | write error: {e}");
+        }
+    }
+
+    // ---- mesh (PLAN §6) ----
+
+    /// Whether we relay for others: the relay role in our certificate.
+    fn is_relay(&self) -> bool {
+        self.cert.read().body.roles.has(crate::group::Roles::RELAY)
+    }
+
+    /// Our direct links for the LSA: neighbours with a live session, cost = RTT in ms.
+    fn neighbors(&self) -> Vec<(NodeId, u32)> {
+        let mut v: Vec<(NodeId, u32)> = self
+            .storage
+            .others()
+            .into_iter()
+            .filter(|p| self.link_alive(p))
+            .map(|p| (p, self.storage.rtt_ms(&p).map_or(100, |r| r.ceil() as u32 + 1)))
+            .collect();
+        v.sort_by_key(|(p, c)| (*c, *p));
+        v.truncate(MAX_LSA_NEIGHBORS);
+        v
+    }
+
+    /// A direct session that answered recently.
+    fn link_alive(&self, p: &NodeId) -> bool {
+        self.links.current(p).is_some() && self.storage.link_alive(p, NEIGHBOR_ALIVE)
+    }
+
+    fn recompute_routes(&self) {
+        let me = self.storage.self_id();
+        let certs = self.peer_certs.lock();
+        let relay = |n: &NodeId| certs.get(n).is_some_and(|c| c.body.roles.has(crate::group::Roles::RELAY));
+        let table = RouteTable::compute(me, &self.lsdb.lock(), &relay, &self.routes.load());
+        drop(certs);
+        self.routes.store(Arc::new(table));
+    }
+
+    /// Floods LSAs to all neighbours but `except`.
+    async fn flood(&self, lsas: Vec<Lsa>, except: Option<NodeId>) {
+        let msgs: Vec<Vec<u8>> = RoutingMsg::lsas(lsas).iter().map(|m| m.encode()).collect();
+        for n in self.storage.others() {
+            if Some(n) != except && self.links.current(&n).is_some() {
+                for m in &msgs {
+                    self.send_kind(&n, KIND_ROUTING, m).await;
+                }
+            }
+        }
+    }
+
+    /// Once a second: announce our links when they changed (or every `LSA_REFRESH`), expire old
+    /// LSAs, recompute routes.
+    async fn mesh_tick(&self) {
+        let revoked = Membership::of(&self.group.store, &self.group.id).revoked;
+        let expired = self.lsdb.lock().expire(&revoked);
+        let neighbors = self.neighbors();
+        let ids: Vec<NodeId> = neighbors.iter().map(|(n, _)| *n).collect();
+        let due = {
+            let (last, at, _) = &*self.my_lsa.lock();
+            *last != ids || at.is_none_or(|t| t.elapsed() >= LSA_REFRESH)
+        };
+        if due {
+            let seq = {
+                let mut m = self.my_lsa.lock();
+                m.2 = crate::clock::now_ms().max(m.2 + 1);
+                m.0 = ids;
+                m.1 = Some(Instant::now());
+                m.2
+            };
+            let body = LsaBody { origin: self.storage.self_id(), group: self.group.id, seq, neighbors };
+            let lsa = Lsa::sign(&self.group.identity, &body);
+            self.lsdb.lock().insert(lsa.clone(), &HashSet::new());
+            self.flood(vec![lsa], None).await;
+        }
+        if due || expired {
+            self.recompute_routes();
+        }
+    }
+
+    async fn handle_routing(&self, peer: NodeId, body: &[u8]) {
+        let Some(msg) = RoutingMsg::decode(body) else { return };
+        match msg {
+            RoutingMsg::Summary(theirs) => {
+                let (give, want) = self.lsdb.lock().diff(&theirs);
+                for m in RoutingMsg::lsas(give) {
+                    self.send_kind(&peer, KIND_ROUTING, &m.encode()).await;
+                }
+                if !want.is_empty() {
+                    self.send_kind(&peer, KIND_ROUTING, &RoutingMsg::Want(want).encode()).await;
+                }
+            }
+            RoutingMsg::Want(origins) => {
+                let lsas = self.lsdb.lock().get(&origins);
+                for m in RoutingMsg::lsas(lsas) {
+                    self.send_kind(&peer, KIND_ROUTING, &m.encode()).await;
+                }
+            }
+            RoutingMsg::Lsas(lsas) => {
+                let revoked = Membership::of(&self.group.store, &self.group.id).revoked;
+                let me = self.storage.self_id();
+                let new: Vec<Lsa> = {
+                    let mut db = self.lsdb.lock();
+                    // our own LSA comes back from neighbours: ignore older copies of it
+                    lsas.into_iter()
+                        .filter(|l| l.open().is_some_and(|b| b.origin != me) && db.insert(l.clone(), &revoked))
+                        .collect()
+                };
+                if !new.is_empty() {
+                    self.recompute_routes();
+                    self.flood(new, Some(peer)).await;
+                }
+            }
+        }
+    }
+
+    /// Sends `inner` (a packet of the end-to-end session with the node `dst`) towards `dst`.
+    async fn send_forward(&self, next: NodeId, hdr: [u8; 4], dst: ShortId, src: ShortId, inner: &[u8]) -> bool {
+        let mut body = Vec::with_capacity(FORWARD_HDR + inner.len());
+        body.extend_from_slice(&hdr);
+        body.extend_from_slice(&dst);
+        body.extend_from_slice(&src);
+        body.extend_from_slice(inner);
+        self.send_kind(&next, KIND_FORWARD, &body).await
+    }
+
+    /// The neighbour to send `dst`'s packets to: `dst` itself over a direct session, else the
+    /// first hop of the mesh route.
+    fn next_hop(&self, dst: &NodeId) -> Option<NodeId> {
+        if self.links.current(dst).is_some() {
+            return Some(*dst);
+        }
+        self.routes.load().next_hop(dst).filter(|n| self.link_alive(n))
+    }
+
+    /// End-to-end handshake with `dst` through the mesh (rate limited like direct ones).
+    async fn e2e_handshake(&self, dst: NodeId, min_interval: Duration) {
+        let Some(next) = self.next_hop(&dst) else { return };
+        if let Some(packets) = self.e2e.initiate(dst, min_interval) {
+            log::debug!("Mesh | handshake to {} via {}", node(dst), node(next));
+            let (d, s) = (short_id(&dst), short_id(&self.storage.self_id()));
+            for p in packets {
+                self.send_forward(next, [MAX_HOPS, 0, 0, 0], d, s, &p).await;
+            }
+        }
+    }
+
+    /// `[kind][body]` to `dst` over the end-to-end session, through the mesh. Starts the
+    /// session if there is none (the packet is dropped meanwhile, like a direct first contact).
+    pub async fn send_e2e(&self, dst: NodeId, kind: u8, body: &[u8], limit: u8) -> bool {
+        let Some(next) = self.next_hop(&dst) else { return false };
+        let Some(session) = self.e2e.current(&dst) else {
+            self.e2e_handshake(dst, PUNCH_INTERVAL).await;
+            return false;
+        };
+        if self.e2e.needs_handshake(&dst) {
+            self.e2e_handshake(dst, REKEY_RETRY).await;
+        }
+        let mut buf = vec![0u8; DATA_HDR + 1 + body.len() + TAG_LEN + MAX_PAD];
+        buf[DATA_HDR] = kind;
+        buf[DATA_HDR + 1..DATA_HDR + 1 + body.len()].copy_from_slice(body);
+        let Some(len) = session.seal(&mut buf, 1 + body.len()) else { return false };
+        let (d, s) = (short_id(&dst), short_id(&self.storage.self_id()));
+        self.send_forward(next, [limit, 0, 0, 0], d, s, &buf[..len]).await
+    }
+
+    /// A `FORWARD` from neighbour `from`: ours (open the end-to-end packet) or one to pass on.
+    async fn handle_forward(&self, from: NodeId, body: &[u8]) {
+        if body.len() < FORWARD_HDR {
+            return;
+        }
+        let (limit, hops) = (body[0], body[1]);
+        let dst: ShortId = body[4..12].try_into().unwrap();
+        let src: ShortId = body[12..20].try_into().unwrap();
+        let inner = &body[FORWARD_HDR..];
+        let me = self.storage.self_id();
+        if dst == short_id(&me) {
+            return self.handle_e2e(from, inner).await;
+        }
+        if !self.is_relay() {
+            log::debug!("Mesh | FORWARD from {} dropped: not a relay", node(from));
+            return;
+        }
+        let hops = hops.saturating_add(1);
+        if hops >= limit {
+            log::debug!("Mesh | FORWARD from {} dropped: hop limit", node(from));
+            return; // ICMP_REPORT: PLAN §6.4
+        }
+        let routes = self.routes.load();
+        let Some(dst_id) = routes.resolve(&dst) else { return };
+        let Some(next) = self.next_hop(&dst_id) else { return };
+        if next == from {
+            return; // routes not converged yet: do not bounce
+        }
+        let hdr = [limit, hops, body[2], body[3]];
+        self.send_forward(next, hdr, dst, src, inner).await;
+    }
+
+    async fn handle_e2e(&self, from: NodeId, inner: &[u8]) {
+        let mut packet = inner.to_vec();
+        match self.e2e.receive(&mut packet) {
+            None => {}
+            Some(Received::Handshake { peer, cert, reply }) => {
+                let update = PeerUpdate::from_cert(&cert);
+                if self
+                    .storage
+                    .get(&peer)
+                    .is_none_or(|(r, _)| Some(r.name) != update.name || Some(r.addr) != update.addr)
+                {
+                    self.storage.set_peer(peer, update);
+                }
+                Box::pin(self.member_seen(&cert)).await;
+                if let Some(r) = reply {
+                    // back the way it came if we have no route of our own yet
+                    let next = self.next_hop(&peer).unwrap_or(from);
+                    let (d, s) = (short_id(&peer), short_id(&self.storage.self_id()));
+                    self.send_forward(next, [MAX_HOPS, 0, 0, 0], d, s, &r).await;
+                } else {
+                    log::info!("Mesh | end-to-end session with {} via {}", node(peer), node(from));
+                }
+            }
+            Some(Received::Data { session, plain }) => {
+                let peer = session.peer;
+                let Some((&kind, body)) = packet[plain].split_first() else { return };
+                match kind {
+                    KIND_IP => self.deliver_ip(peer, body).await,
+                    k if k >= KIND_API_MIN => {
+                        if let Some(tx) = self.api_tx.get() {
+                            let _ = tx.try_send((k, peer, body.to_vec()));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -716,7 +996,12 @@ impl Node {
                 continue;
             };
             let (Some(session), Some(route)) = (self.links.current(&peer), self.storage.route_by_id(&peer)) else {
-                self.handshake(peer, PUNCH_INTERVAL).await;
+                // no direct session: through the mesh if there is a route (link_loop keeps
+                // trying the direct path meanwhile), else first contact
+                let ip = &buf[OFF..OFF + n];
+                if !self.send_e2e(peer, KIND_IP, ip, MAX_HOPS).await && self.routes.load().next_hop(&peer).is_none() {
+                    self.handshake(peer, PUNCH_INTERVAL).await;
+                }
                 continue;
             };
             buf[DATA_HDR] = KIND_IP;

@@ -171,6 +171,21 @@ pub struct Profile {
     pub data_pad: RangeInclusive<u16>,
 }
 
+impl Profile {
+    /// No junk and no padding: for end-to-end sessions inside `FORWARD`, whose packets are
+    /// padded and masked by the link session that carries them anyway.
+    pub fn none() -> Self {
+        Profile {
+            junk_count: 0..=0,
+            junk_size: 40..=40,
+            signatures: Vec::new(),
+            init_pad: 0..=0,
+            resp_pad: 0..=0,
+            data_pad: 0..=0,
+        }
+    }
+}
+
 impl Default for Profile {
     /// Moderate: 4-8 junk packets of 40-200 bytes, handshakes vary by up to 96 bytes, data by 48.
     fn default() -> Self {

@@ -86,6 +86,9 @@ enum GroupCommand {
         /// A subnet behind this node, routed to it by every member (repeatable)
         #[arg(long = "route", value_name = "PREFIX")]
         routes: Vec<IpNet>,
+        /// This node relays traffic between members that cannot reach each other directly
+        #[arg(long)]
+        relay: bool,
     },
     /// Print an invite for one new node (admins only)
     Invite {
@@ -109,6 +112,10 @@ enum GroupCommand {
         /// routed to it by members that want it (repeatable)
         #[arg(long = "route", value_name = "PREFIX")]
         routes: Vec<IpNet>,
+        /// The new node relays traffic between members that cannot reach each other directly
+        /// (a node with a public address or a good connection)
+        #[arg(long)]
+        relay: bool,
     },
     /// Join a group by invite (from the argument, a file or stdin)
     Join {
@@ -275,7 +282,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
         die("the clock is earlier than this build: set it (NTP) before signing group records or certificates");
     }
     match cmd {
-        GroupCommand::Create { name, addr, node_name, routes } => {
+        GroupCommand::Create { name, addr, node_name, routes, relay } => {
             if conf.group(&name).is_some() {
                 die(format!("group {name} already exists"));
             }
@@ -289,7 +296,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             let secret = GroupSecret::generate();
             let node_name = node_name.unwrap_or_else(|| id.short());
             let mut body = CertBody::new(id, &node_name, host_net(addr, &routes));
-            body.roles.0 = dvpn::group::Roles::ADMIN;
+            body.roles.0 = dvpn::group::Roles::ADMIN | if relay { dvpn::group::Roles::RELAY } else { 0 };
             let cert = secret.issue(body);
             let g = GroupConfig {
                 name: name.clone(),
@@ -308,7 +315,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             println!("back it up with: dvpn group backup -o <file>");
             println!("Invite nodes with: dvpn group invite --name <name>");
         }
-        GroupCommand::Invite { group, name, addr, ttl, statics, routes } => {
+        GroupCommand::Invite { group, name, addr, ttl, statics, routes, relay } => {
             let g = pick_group(conf, &group);
             let Some(secret) = &g.secret else { die(format!("only admins of {} can invite", g.name)) };
             let own = g.ipv4().unwrap_or_else(|| die("this node has no address in the group"));
@@ -323,7 +330,10 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             if !statics.is_empty() && conf.peer.port_range.0 != conf.peer.port_range.1 {
                 log::warn!("[peer] bind_port is a range: give this node a fixed port for --static to work");
             }
-            let template = CertBody::new(conf.identity.id(), &name, host_net(addr, &routes));
+            let mut template = CertBody::new(conf.identity.id(), &name, host_net(addr, &routes));
+            if relay {
+                template.roles.0 |= dvpn::group::Roles::RELAY;
+            }
             let join = secret.grant_join(template, now_unix() + ttl * 3600);
             let trackers = conf.servers.iter().map(|s| s.tracker_ref()).collect();
             let mut inv = Invite::new(&g.name, g.epoch, g.psk, g.obfs_entries.clone(), trackers, join);
@@ -458,11 +468,18 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             let key: NodeId = match node.parse() {
                 Ok(k) => k,
                 Err(_) => {
-                    let hits: Vec<NodeId> = certs
-                        .iter()
-                        .filter(|c| c.body.name == node || c.body.node.to_string().starts_with(&node))
-                        .map(|c| c.body.node)
-                        .collect();
+                    // an exact name first, a key prefix only if no name matches
+                    let by_name: Vec<NodeId> =
+                        certs.iter().filter(|c| c.body.name == node).map(|c| c.body.node).collect();
+                    let hits = if by_name.is_empty() {
+                        certs
+                            .iter()
+                            .filter(|c| c.body.node.to_string().starts_with(&node))
+                            .map(|c| c.body.node)
+                            .collect()
+                    } else {
+                        by_name
+                    };
                     match hits.as_slice() {
                         [k] => *k,
                         [] => die(format!("{node}: no such member key, key prefix or name (see dvpn group members)")),
@@ -710,6 +727,11 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         identity.clone(),
         dvpn::link::Group { id: group.id, psk: group.psk, obfs: group.obfs.clone(), cert: cert.clone() },
     );
+    // end-to-end sessions through relays: carried inside link sessions, no masking of their own
+    let e2e = dvpn::link::Links::new(
+        identity.clone(),
+        dvpn::link::Group { id: group.id, psk: group.psk, obfs: dvpn::obfs::Profile::none(), cert: cert.clone() },
+    );
     let clients = conf
         .servers
         .iter()
@@ -751,7 +773,7 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
             Err(e) => log::warn!("Config | new psk epoch not saved: {e:#}"),
         }),
     };
-    let node = node::Node::new(storage.clone(), transport, links, clients, tun, self_addr, ctx);
+    let node = node::Node::new(storage.clone(), transport, (links, e2e), clients, tun, self_addr, ctx);
     if let (Some(net), Some(addr)) = (conf.net.as_ref().filter(|n| n.manage_routes), self_addr) {
         let v4 = ipnet::Ipv4Net::new(addr, net.prefix).map(|n| IpNet::V4(n.trunc()));
         let connected = v4.into_iter().chain([IpNet::V6(dvpn::ckr::ula_prefix(&group.id))]).collect();

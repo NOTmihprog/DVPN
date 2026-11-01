@@ -18,6 +18,7 @@ pub mod obfs;
 pub mod packet;
 pub mod proto;
 pub mod replay;
+pub mod router;
 pub mod state;
 pub mod storage;
 pub mod sysroute;
