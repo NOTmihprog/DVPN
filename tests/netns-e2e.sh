@@ -300,6 +300,8 @@ nsx b nft delete table inet blockgw
 from=$(($(wc -l < "$W/node-b.log") + 1))
 wait_for 60 sh -c "tail -n +$from '$W/node-b.log' | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'Exit | IPv4 via'" \
     || fail "b found no gateway again"
+wait_for 60 nsx b ping -c1 -W1 10.10.33.1 >/dev/null || fail "b -> a not back after the gateways came back"
+wait_for 30 nsx b ping -c1 -W1 10.10.33.3 >/dev/null || fail "b -> c not back after the gateways came back"
 ok "kill switch: no gateway, no internet (and direct with it off)"
 
 # DNS through the gateway: B's DNS server forwards other names to [exit] dns, through the
@@ -639,6 +641,15 @@ if command -v tracepath >/dev/null; then
 else
     echo "skip: tracepath not found (traceroute through relays)"
 fi
+
+# diagnostics from the running node (through its API)
+dv() { n=$1; shift; nsx "$n" "$D" --dir "$W/$n" -a 127.0.0.1:9902 "$@"; }
+p=$(dv ma path mc 2>&1) || fail "path: $p"
+echo "$p" | grep -q " -> $via -> mc" || fail "path ma -> mc does not go through $via: $p"
+dv ma status 2>&1 | grep -q 'group' || fail "status"
+dv ma neighbors 2>&1 | grep -q "| $via " || fail "neighbors of ma do not list $via"
+dv ma routes 2>&1 | grep -q "| mc .*| $via " || fail "routes of ma: mc not via $via"
+ok "diagnostics: dvpn path / status / neighbors / routes"
 
 # the relay in use goes down: the other one takes over
 case $via in mb) other=md ;; *) other=mb ;; esac

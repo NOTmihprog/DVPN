@@ -66,6 +66,18 @@ enum Command {
     /// Access rules inside the group (admins set them; every node enforces them)
     #[command(subcommand)]
     Acl(AclCommand),
+    /// The running node: key, group, addresses, trackers, gateway (asks its API)
+    Status,
+    /// Direct neighbours of the running node: endpoint, RTT, session
+    Neighbors,
+    /// Routes of the running node: mesh (through relays) and CKR (addresses and subnets)
+    Routes,
+    /// The hops to a member through the mesh
+    Path {
+        /// Member name, node key or key prefix
+        #[arg(allow_hyphen_values = true)]
+        node: String,
+    },
     /// Gateways to the internet, by priority (the first alive one is used), or none.
     /// Without options: show them. A running node follows the change within seconds
     Exit {
@@ -371,6 +383,52 @@ fn member_certs(conf: &Config, g: &GroupConfig, store: &StateStore) -> Vec<dvpn:
     let _ = conf;
     v.sort_by(|a, b| a.body.name.cmp(&b.body.name));
     v
+}
+
+/// The running node's API address: `-a`, else the default socket of the config's TUN.
+fn api_target(conf: &Config, cli_addr: Option<String>) -> String {
+    if let Some(a) = cli_addr {
+        return a;
+    }
+    #[cfg(unix)]
+    if let Some(net) = &conf.net {
+        let p = Path::new(config::SOCKET_DEFAULT_DIR).join(format!("{}.sock", net.tun_name));
+        if p.exists() {
+            return p.display().to_string();
+        }
+    }
+    let _ = conf;
+    SOCKET_DEFAULT_ADDR.to_owned()
+}
+
+fn diag(
+    rt: &tokio::runtime::Runtime,
+    conf: &Config,
+    api: Option<String>,
+    req: &str,
+    key: Option<String>,
+) -> rmpv::Value {
+    let addr = api_target(conf, api);
+    let mut fields = vec![("req", rmpv::Value::from(req))];
+    if let Some(k) = key {
+        fields.push(("key", k.into()));
+    }
+    rt.block_on(api::query(&addr, fields)).unwrap_or_else(|e| die(format!("{e:#}")))
+}
+
+fn mp<'a>(v: &'a rmpv::Value, k: &str) -> &'a rmpv::Value {
+    static NIL: rmpv::Value = rmpv::Value::Nil;
+    v.as_map().and_then(|m| m.iter().find(|(a, _)| a.as_str() == Some(k)).map(|(_, b)| b)).unwrap_or(&NIL)
+}
+
+fn mps(v: &rmpv::Value, k: &str) -> String {
+    match mp(v, k) {
+        rmpv::Value::Nil => "-".into(),
+        rmpv::Value::String(s) => s.as_str().unwrap_or_default().to_owned(),
+        rmpv::Value::Boolean(b) => if *b { "yes" } else { "no" }.into(),
+        rmpv::Value::F64(f) => format!("{f:.1}"),
+        other => other.to_string(),
+    }
 }
 
 fn cmd_acl(conf: &Config, dir: &Path, cmd: AclCommand) {
@@ -1146,6 +1204,81 @@ fn main() {
         Some(Command::Group(cmd)) => cmd_group(&mut conf, &dir, cmd),
         Some(Command::Node(cmd)) => cmd_node(&mut conf, &dir, cmd),
         Some(Command::Acl(cmd)) => cmd_acl(&conf, &dir, cmd),
+        Some(Command::Status) => {
+            let s = diag(&rt, &conf, cli.api_addr, "status", None);
+            println!("node      {} ({})", mps(&s, "name"), mps(&s, "key"));
+            println!("group     {}", mps(&s, "group"));
+            let prefixes: Vec<String> = mp(&s, "prefixes")
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            println!("addresses {}", prefixes.join(", "));
+            println!("relay     {}   certificate valid {} more days", mps(&s, "relay"), mps(&s, "cert_days"));
+            println!("socket    {}", mps(&s, "local_addr"));
+            for t in mp(&s, "servers").as_array().into_iter().flatten() {
+                println!(
+                    "tracker   {} {}",
+                    mps(t, "addr"),
+                    if mps(t, "connected") == "yes" { "connected" } else { "not connected" }
+                );
+            }
+            println!(
+                "exit      IPv4 {}, IPv6 {}{}",
+                mps(&s, "exit_v4"),
+                mps(&s, "exit_v6"),
+                if mps(&s, "kill_switch") == "yes" { "  (kill switch on: no gateway alive)" } else { "" }
+            );
+        }
+        Some(Command::Neighbors) => {
+            let v = diag(&rt, &conf, cli.api_addr, "neighbors", None);
+            let rows: Vec<Vec<String>> = v
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|n| {
+                    vec![
+                        mps(n, "name"),
+                        mps(n, "key").chars().take(10).collect(),
+                        mps(n, "endpoint"),
+                        mps(n, "rtt_ms"),
+                        mps(n, "alive"),
+                        format!("{} s", mps(n, "session_secs")),
+                    ]
+                })
+                .collect();
+            println!("\n{}\n", github_table(&["Name", "Key", "Endpoint", "RTT ms", "Alive", "Session"], &rows));
+        }
+        Some(Command::Routes) => {
+            let v = diag(&rt, &conf, cli.api_addr, "routes", None);
+            let mesh: Vec<Vec<String>> = mp(&v, "mesh")
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| {
+                    vec![mps(r, "name"), mps(r, "key").chars().take(10).collect(), mps(r, "via_name"), mps(r, "cost")]
+                })
+                .collect();
+            println!("\nMesh (node: first hop, cost in ms)\n{}", github_table(&["Node", "Key", "Via", "Cost"], &mesh));
+            let ckr: Vec<Vec<String>> = mp(&v, "ckr")
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| vec![mps(r, "net"), mps(r, "to"), mps(r, "system")])
+                .collect();
+            println!("\nCKR (destination: node)\n{}\n", github_table(&["Prefix", "To", "System route"], &ckr));
+        }
+        Some(Command::Path { node }) => {
+            let v = diag(&rt, &conf, cli.api_addr, "path", Some(node.clone()));
+            match v.as_array() {
+                Some(hops) if !hops.is_empty() => {
+                    let names: Vec<String> = hops.iter().map(|h| mps(h, "name")).collect();
+                    println!("{} (this node) -> {}", conf.identity.id().short(), names.join(" -> "));
+                }
+                _ => die(format!("no route to {node}")),
+            }
+        }
         Some(Command::Exit { v4, v6, none, kill_switch, dns }) => {
             let mut e = conf.exits.clone();
             if none {

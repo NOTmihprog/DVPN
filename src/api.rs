@@ -109,6 +109,74 @@ impl ApiSocket {
     }
 }
 
+/// One `get` request to a running node's API, for the CLI (`dvpn status` and the like):
+/// `fields` go into the request next to `type`, `id`.
+pub async fn query(addr: &str, fields: Vec<(&str, Value)>) -> anyhow::Result<Value> {
+    use anyhow::{Context, anyhow};
+    let encode = |v: &Value| {
+        let mut d = Vec::new();
+        rmpv::encode::write_value(&mut d, v).expect("write to vec");
+        d
+    };
+    let init = map(vec![("type", "init".into()), ("name", "dvpn-cli".into())]);
+    let mut req = vec![("type", Value::from("get")), ("id", Value::from(1))];
+    req.extend(fields);
+    let (init, req, close) = (encode(&init), encode(&map(req)), encode(&map(vec![("type", "close".into())])));
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let reply = |data: &[u8]| -> Option<Value> {
+        let v = rmpv::decode::read_value(&mut &data[..]).ok()?;
+        (field(&v, "type").and_then(Value::as_str) == Some("res") && field(&v, "id").and_then(Value::as_i64) == Some(1))
+            .then(|| field(&v, "res").cloned().unwrap_or(Value::Nil))
+    };
+    let deadline = std::time::Duration::from_secs(3);
+    if let Ok(a) = addr.parse::<SocketAddr>() {
+        let local: SocketAddr = if a.is_ipv4() { "127.0.0.1:0".parse()? } else { "[::1]:0".parse()? };
+        let s = UdpSocket::bind(local).await?;
+        s.connect(a).await?;
+        s.send(&init).await?;
+        s.send(&req).await.with_context(|| format!("is the node running? (API {addr})"))?;
+        let r = tokio::time::timeout(deadline, async {
+            loop {
+                let n = s.recv(&mut buf).await?;
+                if let Some(v) = reply(&buf[..n]) {
+                    return Ok::<_, std::io::Error>(v);
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("no answer from the node's API at {addr}: is it running?"))??;
+        let _ = s.send(&close).await;
+        return Ok(r);
+    }
+    #[cfg(unix)]
+    {
+        let me = std::env::temp_dir().join(format!("dvpn-cli-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&me);
+        let s = UnixDatagram::bind(&me)?;
+        let result = async {
+            s.send_to(&init, addr).await.with_context(|| format!("is the node running? (API {addr})"))?;
+            s.send_to(&req, addr).await?;
+            let r = tokio::time::timeout(deadline, async {
+                loop {
+                    let n = s.recv(&mut buf).await?;
+                    if let Some(v) = reply(&buf[..n]) {
+                        return Ok::<_, std::io::Error>(v);
+                    }
+                }
+            })
+            .await
+            .map_err(|_| anyhow!("no answer from the node's API at {addr}: is it running?"))??;
+            let _ = s.send_to(&close, addr).await;
+            Ok(r)
+        }
+        .await;
+        let _ = std::fs::remove_file(&me);
+        result
+    }
+    #[cfg(not(unix))]
+    Err(anyhow!("{addr} is not an ip:port address"))
+}
+
 impl Drop for ApiSocket {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -401,7 +469,14 @@ impl Api {
     /// `key_validate_error` (missing, invalid or unknown), `key_ambiguous`.
     fn peer_arg(&self, p: &Value) -> Result<NodeId, &'static str> {
         let s = field(p, "key").and_then(Value::as_str).ok_or("key_validate_error")?;
-        self.node.storage.resolve(s).map_err(|e| match e {
+        let storage = &self.node.storage;
+        // a member name works too, if it names exactly one peer
+        let by_name: Vec<NodeId> =
+            storage.ids().into_iter().filter(|i| storage.name(i).as_deref() == Some(s)).collect();
+        if let [one] = by_name.as_slice() {
+            return Ok(*one);
+        }
+        storage.resolve(s).map_err(|e| match e {
             ResolveError::NotFound => "key_validate_error",
             ResolveError::Ambiguous(_) => "key_ambiguous",
         })
@@ -438,6 +513,84 @@ impl Api {
             "server_last_search" => client().map_or(Value::Nil, |c| c.timestamps().1.into()),
             "server_last_response" => client().map_or(Value::Nil, |c| c.timestamps().2.into()),
             "local_addr" => addr_value(self.node.transport.local_addr().ok()),
+            // diagnostics (dvpn status / neighbors / routes / path)
+            "status" => {
+                let n = &self.node;
+                let cert = n.own_cert();
+                let (gw4, gw6, kill) = n.exit_state();
+                let name = |id: Option<NodeId>| opt_str(id.map(|i| storage.name(&i).unwrap_or_else(|| i.short())));
+                map(vec![
+                    ("key", storage.self_id().to_string().into()),
+                    ("name", cert.body.name.clone().into()),
+                    ("group", n.group_id().to_string().into()),
+                    ("prefixes", Value::Array(cert.body.prefixes.iter().map(|p| p.to_string().into()).collect())),
+                    ("relay", cert.body.roles.has(crate::group::Roles::RELAY).into()),
+                    ("cert_days", (cert.body.not_after.saturating_sub(crate::clock::now_unix()) / 86400).into()),
+                    (
+                        "servers",
+                        Value::Array(
+                            n.clients
+                                .iter()
+                                .map(|c| {
+                                    map(vec![
+                                        ("addr", c.addr().to_string().into()),
+                                        ("connected", c.is_connected().into()),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    ("exit_v4", name(gw4)),
+                    ("exit_v6", name(gw6)),
+                    ("kill_switch", kill.into()),
+                    ("local_addr", opt_str(n.transport.local_addr().ok().map(|a| a.to_string()))),
+                ])
+            }
+            "neighbors" => Value::Array(
+                self.node
+                    .direct_links()
+                    .into_iter()
+                    .map(|(id, ep, rtt, alive, age)| {
+                        map(vec![
+                            ("key", id.to_string().into()),
+                            ("name", opt_str(storage.name(&id))),
+                            ("endpoint", opt_str(ep.map(|e| e.to_string()))),
+                            ("rtt_ms", rtt.map_or(Value::Nil, Value::from)),
+                            ("alive", alive.into()),
+                            ("session_secs", age.as_secs().into()),
+                        ])
+                    })
+                    .collect(),
+            ),
+            "routes" => {
+                let mesh = self.node.mesh_routes().into_iter().map(|(d, f, c)| {
+                    map(vec![
+                        ("key", d.to_string().into()),
+                        ("name", opt_str(storage.name(&d))),
+                        ("via", f.to_string().into()),
+                        ("via_name", opt_str(storage.name(&f))),
+                        ("cost", c.into()),
+                    ])
+                });
+                let table = self.node.ckr();
+                let ckr = table.routes().iter().map(|r| {
+                    let target = match r.target {
+                        crate::ckr::Target::Node(n) => storage.name(&n).unwrap_or_else(|| n.short()),
+                        crate::ckr::Target::Exclude => "(not through the tunnel)".into(),
+                        crate::ckr::Target::Blackhole => "(kill switch: dropped)".into(),
+                    };
+                    map(vec![("net", r.net.to_string().into()), ("to", target.into()), ("system", r.system.into())])
+                });
+                map(vec![("mesh", Value::Array(mesh.collect())), ("ckr", Value::Array(ckr.collect()))])
+            }
+            "path" => match peer.and_then(|id| self.node.path(&id)) {
+                Some(hops) => Value::Array(
+                    hops.iter()
+                        .map(|h| map(vec![("key", h.to_string().into()), ("name", opt_str(storage.name(h)))]))
+                        .collect(),
+                ),
+                None => Value::Nil,
+            },
             _ => Value::Nil,
         }
     }

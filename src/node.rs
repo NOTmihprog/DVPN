@@ -929,7 +929,7 @@ impl Node {
     }
 
     /// Our direct links for the LSA: neighbours with a live session, cost = RTT in ms.
-    fn neighbors(&self) -> Vec<(NodeId, u32)> {
+    fn lsa_neighbors(&self) -> Vec<(NodeId, u32)> {
         let mut v: Vec<(NodeId, u32)> = self
             .storage
             .others()
@@ -973,7 +973,7 @@ impl Node {
     async fn mesh_tick(&self) {
         let revoked = Membership::of(&self.group.store, &self.group.id).revoked;
         let expired = self.lsdb.lock().expire(&revoked);
-        let neighbors = self.neighbors();
+        let neighbors = self.lsa_neighbors();
         let ids: Vec<NodeId> = neighbors.iter().map(|(n, _)| *n).collect();
         let due = {
             let (last, at, _) = &*self.my_lsa.lock();
@@ -996,6 +996,56 @@ impl Node {
             self.recompute_routes();
         }
         self.exit_tick();
+    }
+
+    // ---- diagnostics (dvpn status / neighbors / routes / path) ----
+
+    /// Peers with a direct session: (key, endpoint, RTT, alive, session age).
+    pub fn direct_links(&self) -> Vec<(NodeId, Option<SocketAddr>, Option<f64>, bool, Duration)> {
+        self.storage
+            .others()
+            .into_iter()
+            .filter_map(|p| {
+                let s = self.links.current(&p)?;
+                Some((p, self.storage.endpoint(&p), self.storage.rtt_ms(&p), self.link_alive(&p), s.age()))
+            })
+            .collect()
+    }
+
+    /// Mesh routes: (destination, first hop, cost).
+    pub fn mesh_routes(&self) -> Vec<(NodeId, NodeId, u32)> {
+        let mut v: Vec<_> = self.routes.load().next.iter().map(|(d, (f, c))| (*d, *f, *c)).collect();
+        v.sort_by_key(|(d, _, c)| (*c, *d));
+        v
+    }
+
+    /// The hops to `dst` as the mesh would take them: every hop's choice recomputed from the
+    /// LSDB (without its hysteresis). `None` if there is no route.
+    pub fn path(&self, dst: &NodeId) -> Option<Vec<NodeId>> {
+        if self.link_alive(dst) {
+            return Some(vec![*dst]);
+        }
+        let lsdb = self.lsdb.lock();
+        let certs = self.peer_certs.lock();
+        let relay = |n: &NodeId| certs.get(n).is_some_and(|c| c.body.roles.has(crate::group::Roles::RELAY));
+        let mut hops = vec![self.next_hop(dst)?];
+        while hops.last() != Some(dst) && hops.len() < usize::from(MAX_HOPS) {
+            let at = *hops.last().unwrap();
+            let t = RouteTable::compute(at, &lsdb, &relay, &RouteTable::default());
+            hops.push(t.next_hop(dst)?);
+        }
+        Some(hops)
+    }
+
+    /// The gateways in use (IPv4, IPv6) and whether the kill switch is on.
+    pub fn exit_state(&self) -> (Option<NodeId>, Option<NodeId>, bool) {
+        let k = *self.kill.lock();
+        (self.exit4.lock().current, self.exit6.lock().current, k.0 || k.1)
+    }
+
+    /// Our certificate as now in use.
+    pub fn own_cert(&self) -> Cert {
+        self.cert.read().clone()
     }
 
     /// A gateway from `[exit]`: a member name or a node key.
