@@ -127,6 +127,8 @@ pub struct Config {
     pub exits: Exits,
     /// `[gateway]`: this node is a gateway to the internet for members.
     pub gateway: Option<GatewayConfig>,
+    /// `[dns]`: names of members (on by default when there is a TUN).
+    pub dns: DnsConfig,
     pub peer: PeerConfig,
     pub net: Option<NetConfig>,
     pub servers: Vec<ServerConfig>,
@@ -314,6 +316,40 @@ fn parse_gateway(t: &Table) -> anyhow::Result<GatewayConfig> {
         }
     }
     Ok(GatewayConfig { wan, ndp_proxy, manage_sysctl })
+}
+
+/// `[dns]`: `enable`, `domain` (default "dvpn"), `manage_resolved` (split DNS via systemd-resolved).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DnsConfig {
+    pub enable: bool,
+    pub domain: String,
+    pub manage_resolved: bool,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        DnsConfig { enable: true, domain: "dvpn".into(), manage_resolved: true }
+    }
+}
+
+fn parse_dns(t: &Table) -> anyhow::Result<DnsConfig> {
+    let mut d = DnsConfig::default();
+    for (k, v) in t.iter() {
+        match k {
+            "enable" => d.enable = v.as_bool().ok_or_else(|| anyhow!("enable: true or false"))?,
+            "manage_resolved" => {
+                d.manage_resolved = v.as_bool().ok_or_else(|| anyhow!("manage_resolved: true or false"))?
+            }
+            "domain" => {
+                d.domain = v.as_str().ok_or_else(|| anyhow!("domain: a string"))?.trim_matches('.').to_lowercase();
+                if d.domain.is_empty() {
+                    bail!("domain is empty");
+                }
+            }
+            _ => bail!("unknown key {k}"),
+        }
+    }
+    Ok(d)
 }
 
 /// Reads only `[exit]` from a config file: a running node follows changes to it.
@@ -580,6 +616,10 @@ impl Config {
             Some(t) => Some(parse_gateway(t).map_err(|e| anyhow!("[gateway] {e:#} in {file}"))?),
             None => None,
         };
+        let dns = match section(&doc, "dns") {
+            Some(t) => parse_dns(t).map_err(|e| anyhow!("[dns] {e:#} in {file}"))?,
+            None => DnsConfig::default(),
+        };
         if section(&doc, "group").is_some() {
             log::warn!("[group] psk in {file} is ignored: create or join a group (dvpn group --help)");
         }
@@ -593,6 +633,7 @@ impl Config {
             remote_subnets,
             exits,
             gateway,
+            dns,
             peer,
             net,
             servers,

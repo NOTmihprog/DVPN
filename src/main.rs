@@ -1003,6 +1003,8 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         .collect();
     let group_id = group.id;
     let dir2 = dir.clone();
+    let dns = (conf.dns.enable && tun.is_some() && self_addr.is_some())
+        .then(|| (conf.dns.domain.clone(), Arc::new(arc_swap::ArcSwap::from_pointee(dvpn::dns::Zone::new()))));
     let ctx = node::GroupCtx {
         id: group.id,
         secret: group.secret.clone(),
@@ -1022,6 +1024,8 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         routes: conf.remote_subnets.clone(),
         exits: conf.exits.clone(),
         tun_prefix: conf.net.as_ref().map_or(24, |n| n.prefix),
+        group_name: group.name.clone(),
+        dns: dns.clone(),
         config_path: conf.path().to_path_buf(),
         on_epoch: Box::new(move |epoch, psk| match Config::load(&dir2) {
             Ok(mut conf) => {
@@ -1036,6 +1040,15 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         let v4 = ipnet::Ipv4Net::new(addr, net.prefix).map(|n| IpNet::V4(n.trunc()));
         let connected = v4.into_iter().chain([IpNet::V6(dvpn::ckr::ula_prefix(&group.id))]).collect();
         node.manage_routes(&net.tun_name, connected);
+    }
+    if let (Some((domain, zone)), Some(addr), Some(net)) = (&dns, self_addr, &conf.net) {
+        tokio::spawn(dvpn::dns::serve(std::net::IpAddr::V4(addr), zone.clone(), domain.clone()));
+        if conf.dns.manage_resolved {
+            let (tun, domain) = (net.tun_name.clone(), domain.clone());
+            tokio::task::spawn_blocking(move || {
+                dvpn::dns::configure_resolved(&tun, std::net::IpAddr::V4(addr), &domain)
+            });
+        }
     }
     if let (Some(gw), Some(net)) = (&conf.gateway, &conf.net) {
         let ula = dvpn::ckr::ula_prefix(&group.id);

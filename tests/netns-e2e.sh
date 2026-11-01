@@ -382,6 +382,31 @@ nsx a ping -c2 -W1 10.10.33.3 >/dev/null || fail "ACL blocked a -> c too"
 wait_for 20 nsx b ping -c1 -W1 10.10.33.3 || fail "b -> c still blocked after acl clear"
 ok "ACL: ping b -> c denied, a -> c allowed, cleared again"
 
+# Names of members: every node answers DNS for <name>.dvpn and <name>.<group>.dvpn on its
+# overlay address (systemd-resolved would send *.dvpn there; here we ask it directly).
+if command -v python3 >/dev/null; then
+    dnsq() { # dnsq NS SERVER NAME: the first A record, fails on none
+        nsx "$1" python3 -I -c '
+import socket, sys
+srv, name = sys.argv[1], sys.argv[2]
+q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+q += b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\x00\x00\x01\x00\x01"
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+s.sendto(q, (srv, 53))
+r = s.recv(512)
+if r[7] == 0:
+    sys.exit(1)
+print(".".join(map(str, r[-4:])))
+' "$2" "$3"
+    }
+    [ "$(dnsq a 10.10.33.3 b.dvpn)" = "10.10.33.2" ] || fail "c's DNS: b.dvpn"
+    [ "$(dnsq a 10.10.33.3 B.e2e.dvpn)" = "10.10.33.2" ] || fail "c's DNS: B.e2e.dvpn"
+    [ "$(dnsq b 10.10.33.2 c.dvpn)" = "10.10.33.3" ] || fail "b's DNS: c.dvpn"
+    ! dnsq a 10.10.33.3 nobody.dvpn >/dev/null 2>&1 || fail "c's DNS answered for an unknown name"
+    ok "DNS: members by name (b.dvpn, b.e2e.dvpn)"
+fi
+
 # Revocation (before the roaming check, which leaves A without a tracker session for a
 # while): the admin revokes B with the CLI while its node runs; the node spreads the record
 # (tracker + direct), C drops B and B can no longer reach anybody.

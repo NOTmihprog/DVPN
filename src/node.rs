@@ -69,6 +69,9 @@ pub struct GroupCtx {
     pub routes: Vec<crate::ckr::Route>,
     /// Prefix length of the group network on the TUN (`[net] mask`).
     pub tun_prefix: u8,
+    /// The group's local name and the DNS zone of members' names (`[dns]`), if served.
+    pub group_name: String,
+    pub dns: Option<(String, Arc<arc_swap::ArcSwap<crate::dns::Zone>>)>,
     /// `[exit]` as at start; the node follows later changes in `config_path`.
     pub exits: crate::config::Exits,
     pub config_path: std::path::PathBuf,
@@ -224,6 +227,7 @@ impl Node {
         }
         routes.extend(self.group.routes.iter().copied());
         self.apply_acl(&newest);
+        self.update_dns(&newest);
         if let Some(gw) = self.gateway.lock().as_mut() {
             let prefixes: Vec<ipnet::IpNet> = newest.values().flat_map(|c| c.body.prefixes.iter().copied()).collect();
             tokio::task::block_in_place(|| gw.apply(&prefixes));
@@ -234,6 +238,31 @@ impl Node {
             tokio::task::block_in_place(|| sys.apply(&wanted));
         }
         self.ckr.store(Arc::new(table));
+    }
+
+    /// The DNS zone from the members' certificates and our own (PLAN §14a).
+    fn update_dns(&self, members: &HashMap<NodeId, Cert>) {
+        let Some((domain, zone)) = &self.group.dns else { return };
+        let group = crate::dns::label(&self.group.group_name);
+        let own = self.cert.read().clone();
+        let mut z = crate::dns::Zone::new();
+        for c in members.values().chain([&own]) {
+            let name = crate::dns::label(&c.body.name);
+            if name.is_empty() {
+                continue;
+            }
+            let mut addrs: Vec<IpAddr> = c.body.ipv4().map(IpAddr::V4).into_iter().collect();
+            addrs.push(IpAddr::V6(crate::ckr::ula_addr(&self.group.id, &c.body.node)));
+            addrs.extend(c.body.prefixes.iter().filter_map(|p| match p {
+                ipnet::IpNet::V6(n) if n.prefix_len() == 128 => Some(IpAddr::V6(n.addr())),
+                _ => None,
+            }));
+            z.insert(format!("{name}.{domain}"), addrs.clone());
+            if !group.is_empty() {
+                z.insert(format!("{name}.{group}.{domain}"), addrs);
+            }
+        }
+        zone.store(Arc::new(z));
     }
 
     /// Renders the group's ACL for this node over the members' current addresses and installs it

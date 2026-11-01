@@ -8,6 +8,7 @@ pub mod ckr;
 pub mod clock;
 pub mod config;
 pub mod crypto;
+pub mod dns;
 pub mod elligator;
 pub mod exit;
 pub mod gateway;
