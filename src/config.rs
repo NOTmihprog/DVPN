@@ -506,6 +506,31 @@ impl Config {
         self.groups.push(g);
     }
 
+    /// Replaces the node key (restoring a backed-up node).
+    pub fn set_private_key(&mut self, identity: Identity) {
+        if self.doc.get("identity").is_none() {
+            self.doc["identity"] = Item::Table(Table::new());
+        }
+        self.doc["identity"]["private_key"] = value(identity.private_key_text());
+        self.identity = identity;
+    }
+
+    /// Whether the config file can be read by others than its owner (it holds secrets).
+    #[cfg(unix)]
+    pub fn too_open(&self) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&self.path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
+    }
+
+    #[cfg(not(unix))]
+    pub fn too_open(&self) -> bool {
+        false
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Replaces this node's certificate in a group (renewed by an admin).
     pub fn set_group_cert(&mut self, id: &GroupId, cert: &Cert) -> bool {
         let Some(i) = self.groups.iter().position(|g| &g.id == id) else { return false };

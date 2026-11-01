@@ -145,6 +145,24 @@ enum GroupCommand {
         #[arg(long = "in", default_value_t = 120)]
         lead: u64,
     },
+    /// Save the group secret and admin material to a password-protected file (admins only)
+    Backup {
+        /// Group name or id (default: the only group)
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+        /// Output file (default: print)
+        #[arg(short = 'o', long = "output")]
+        out: Option<PathBuf>,
+    },
+    /// Become the admin of a group from a backup (password from DVPN_BACKUP_PASSWORD or asked)
+    Restore {
+        /// Backup file (default: read from stdin)
+        #[arg(short = 'i', long = "input")]
+        inp: Option<PathBuf>,
+        /// Also take over the backed-up node key: this node becomes that node
+        #[arg(long)]
+        with_key: bool,
+    },
     /// Leave a group (removes it from config.toml)
     Leave {
         /// Group name or id
@@ -205,6 +223,24 @@ fn pick_group<'a>(conf: &'a Config, group: &Option<String>) -> &'a GroupConfig {
     }
 }
 
+/// The backup password: DVPN_BACKUP_PASSWORD, or asked on the terminal (twice when creating).
+fn backup_password(new: bool) -> String {
+    if let Ok(p) = std::env::var("DVPN_BACKUP_PASSWORD") {
+        return p;
+    }
+    let p = rpassword::prompt_password("Backup password: ").unwrap_or_else(|e| die(format!("password: {e}")));
+    if new {
+        if p.chars().count() < 8 {
+            die("use at least 8 characters");
+        }
+        let again = rpassword::prompt_password("Again: ").unwrap_or_else(|e| die(format!("password: {e}")));
+        if again != p {
+            die("the passwords differ");
+        }
+    }
+    p
+}
+
 fn epoch_of(changed: &[dvpn::state::Entry]) -> u32 {
     changed
         .iter()
@@ -223,6 +259,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             | GroupCommand::Invite { .. }
             | GroupCommand::Revoke { .. }
             | GroupCommand::Rotate { .. }
+            | GroupCommand::Restore { .. }
     );
     if signs && !dvpn::clock::trusted() {
         die("the clock is earlier than this build: set it (NTP) before signing group records or certificates");
@@ -257,7 +294,8 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             println!("Group {name}: {}\nThis node: {node_name}, {addr}/{prefix}, admin", g.id);
             conf.add_group(g);
             conf.save();
-            println!("The group secret is in config.toml ([[groups]] secret): back it up, it cannot be recovered.");
+            println!("The group secret is in config.toml ([[groups]] secret) and cannot be recovered if lost:");
+            println!("back it up with: dvpn group backup -o <file>");
             println!("Invite nodes with: dvpn group invite --name <name>");
         }
         GroupCommand::Invite { group, name, addr, ttl, statics } => {
@@ -436,6 +474,102 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             store.save();
             println!("A running node of this admin spreads it to the trackers and members within seconds.");
         }
+        GroupCommand::Backup { group, out } => {
+            let g = pick_group(conf, &group);
+            let Some(secret) = &g.secret else { die(format!("only admins of {} have something to back up", g.name)) };
+            let password = backup_password(true);
+            let b = dvpn::backup::Backup {
+                group_name: g.name.clone(),
+                secret: *secret.as_bytes(),
+                epoch: g.epoch,
+                obfs: g.obfs_entries.clone(),
+                trackers: conf.servers.iter().map(|s| s.tracker_ref()).collect(),
+                statics: conf.static_peers.clone(),
+                cert: g.cert.clone(),
+                node_key: Some(conf.identity.private_key_text()),
+            };
+            let text = b.seal(&password, dvpn::backup::DEFAULT_COST);
+            match out {
+                Some(p) => {
+                    std::fs::write(&p, text + "\n").unwrap_or_else(|e| die(format!("write {}: {e}", p.display())));
+                    eprintln!("Backup of group {} written to {}", g.name, p.display());
+                }
+                None => println!("{text}"),
+            }
+            eprintln!("Keep it offline. With it and the password anybody can run the group.");
+        }
+        GroupCommand::Restore { inp, with_key } => {
+            let text = match inp {
+                Some(p) => std::fs::read_to_string(&p).unwrap_or_else(|e| die(format!("read {}: {e}", p.display()))),
+                None => {
+                    let mut s = String::new();
+                    let _ = std::io::stdin().lock().read_line(&mut s);
+                    s
+                }
+            };
+            let b = dvpn::backup::Backup::open(&text, &backup_password(false)).unwrap_or_else(|e| die(e));
+            let secret = GroupSecret::from_bytes(b.secret);
+            if conf.groups.iter().any(|g| g.id == secret.id()) {
+                die(format!("already in group {}", secret.id()));
+            }
+            if !conf.groups.is_empty() {
+                die("this node is already in a group; several groups per node come later (PLAN stage 3.5)");
+            }
+            if with_key {
+                let key = b.node_key.as_deref().unwrap_or_else(|| die("the backup has no node key"));
+                conf.set_private_key(Identity::from_private_key_text(key).unwrap_or_else(|e| die(e)));
+            }
+            let me = conf.identity.id();
+            let cert = match &b.cert {
+                // the same node: its certificate goes on
+                Some(c) if c.body.node == me && c.verify(&secret.id(), dvpn::clock::trusted_unix()).is_ok() => {
+                    c.clone()
+                }
+                // another node takes over: same name, address and roles, for its own key
+                Some(c) => {
+                    let mut body = c.body.clone();
+                    body.node = me;
+                    body.not_after = now_unix() + dvpn::group::CERT_TTL_SECS;
+                    body.serial = u64::from_le_bytes(random_bytes());
+                    secret.issue(body)
+                }
+                None => {
+                    let mut body = CertBody::new(me, &me.short(), Vec::new());
+                    body.roles.0 = dvpn::group::Roles::ADMIN;
+                    secret.issue(body)
+                }
+            };
+            let obfs = parse_obfs(&b.obfs).unwrap_or_else(|e| die(format!("backup obfuscation profile: {e:#}")));
+            for t in &b.trackers {
+                conf.add_server(t);
+            }
+            for sp in &b.statics {
+                conf.add_static_peer(sp);
+            }
+            let addr = cert.body.ipv4();
+            conf.add_group(GroupConfig {
+                name: b.group_name.clone(),
+                id: secret.id(),
+                psk: secret.psk(b.epoch),
+                secret: Some(secret),
+                epoch: b.epoch,
+                cert: Some(cert),
+                obfs,
+                obfs_entries: b.obfs,
+            });
+            conf.save();
+            println!(
+                "Restored group {} as admin, this node {}{}",
+                b.group_name,
+                me.short(),
+                addr.map_or_else(String::new, |a| format!(", {a}"))
+            );
+            if !with_key && b.cert.as_ref().is_some_and(|c| c.body.node != me) {
+                println!(
+                    "This node has a new key; if the old admin node is lost for good, revoke it: dvpn group revoke <old key>"
+                );
+            }
+        }
         GroupCommand::Leave { group } => {
             let id = conf.group(&group).unwrap_or_else(|| die(format!("no group {group}"))).id;
             if conf.groups.iter().any(|g| g.id == id && g.secret.is_some()) {
@@ -489,6 +623,9 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         conf.set_group_cert(&group.id, &c);
         conf.save();
         cert = c;
+    }
+    if conf.too_open() {
+        log::warn!("{} is readable by other users, but holds secrets: chmod 600 it", conf.path().display());
     }
     if !dvpn::clock::trusted() {
         log::warn!("The clock is earlier than this build: certificate expiry is not checked until it is set (NTP)");

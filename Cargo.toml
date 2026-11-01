@@ -35,6 +35,8 @@ tun-rs = { version = "2.8", features = ["async"] }
 x25519-dalek = { version = "3.0", features = ["static_secrets"] }
 socket2 = "0.6"
 if-addrs = "0.15"
+argon2 = "0.5"
+rpassword = "7"
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = "0.3"

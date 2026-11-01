@@ -155,6 +155,20 @@ join() { # join NAME ADDR
 join b 10.10.33.2
 join c 10.10.33.3
 "$D" --dir "$W/b" group list | grep -q 'e2e.*member.*10.10.33.2' || fail "b: group list"
+
+# The admin's secret survives the admin node: a password-protected backup restores the group on
+# another node (with a new key, or the old one with --with-key), and that node can invite.
+DVPN_BACKUP_PASSWORD=e2e-backup-pw "$D" --dir "$W/a" group backup -o "$W/a.bak" 2>/dev/null || fail "backup"
+mkdir r r2
+! DVPN_BACKUP_PASSWORD=wrong "$D" --dir "$W/r" group restore -i "$W/a.bak" >/dev/null 2>&1 || fail "restore with a wrong password"
+DVPN_BACKUP_PASSWORD=e2e-backup-pw "$D" --dir "$W/r" group restore -i "$W/a.bak" >/dev/null 2>&1 || fail "restore"
+gid() { "$D" --dir "$W/$1" group list | awk -F'|' '/e2e/ {gsub(/ /, "", $3); print $3}'; }
+[ "$(gid r)" = "$(gid a)" ] || fail "restored group id differs"
+"$D" --dir "$W/r" group list | grep -q 'e2e.*admin.*10.10.33.1' || fail "restored node is not the admin"
+"$D" --dir "$W/r" group invite -n z >/dev/null 2>&1 || fail "restored admin cannot invite"
+DVPN_BACKUP_PASSWORD=e2e-backup-pw "$D" --dir "$W/r2" group restore --with-key -i "$W/a.bak" >/dev/null 2>&1 || fail "restore --with-key"
+[ "$("$D" --dir "$W/r2" show-key)" = "$("$D" --dir "$W/a" show-key)" ] || fail "--with-key did not restore the node key"
+ok "group backup restores the admin elsewhere"
 # All namespaces share one /run, so the default unix API socket would collide: use UDP
 # on each namespace's own loopback instead.
 # C starts with its clock in 1970, like a router without RTC before NTP (a test-only offset
