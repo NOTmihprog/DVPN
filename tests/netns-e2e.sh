@@ -654,8 +654,8 @@ dv ma neighbors 2>&1 | grep -q "| $via " || fail "neighbors of ma do not list $v
 dv ma routes 2>&1 | grep -q "| mc .*| $via " || fail "routes of ma: mc not via $via"
 pg=$(dv ma ping mc -c 2 2>&1) || fail "dvpn ping: $pg"
 echo "$pg" | grep -q 'ms (relays)' || fail "dvpn ping ma -> mc not through relays: $pg"
-mt=$(dv mb metrics 2>&1) || fail "dvpn metrics: $mt"
-echo "$mt" | grep -qE 'relayed for others [1-9][0-9]* /' || fail "metrics of mb: nothing relayed: $mt"
+mt=$(dv "$via" metrics 2>&1) || fail "dvpn metrics: $mt"
+echo "$mt" | grep -qE 'relayed for others [1-9][0-9]* /' || fail "metrics of relay $via: nothing relayed: $mt"
 mt=$(dv ma metrics 2>&1)
 echo "$mt" | grep -E '^\| mc ' | grep -qE '\| [1-9][0-9]* / [0-9.]+ [KMG]?i?B +\| [1-9]' || fail "metrics of ma: no IP traffic with mc: $mt"
 ok "diagnostics: dvpn path / status / neighbors / routes / ping / metrics"
