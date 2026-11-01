@@ -55,7 +55,7 @@ jobs:
       - name: install tools
         run: |
           SUDO=$(command -v sudo || true)
-          $SUDO apt-get update && $SUDO apt-get install -y iproute2 nftables iputils-ping iperf3 tcpdump
+          $SUDO apt-get update && $SUDO apt-get install -y iproute2 nftables iputils-ping iputils-tracepath iperf3 tcpdump
       - name: build
         run: cargo build --locked
       # needs unprivileged user namespaces and /dev/net/tun on the runner

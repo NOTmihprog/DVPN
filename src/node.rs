@@ -17,7 +17,7 @@ use crate::obfs::MAX_PAD;
 use crate::packet::{self, IpInfo};
 use crate::proto::{
     CONTROL_LEN, CONTROL_PING, CONTROL_PONG, DATA_HDR, FORWARD_HDR, KIND_API_MIN, KIND_CONTROL, KIND_FORWARD, KIND_IP,
-    KIND_ROUTING, KIND_STATE, MAX_DATAGRAM, MAX_HOPS,
+    KIND_REPORT, KIND_ROUTING, KIND_STATE, MAX_DATAGRAM, MAX_HOPS, REPORT_LEN,
 };
 use crate::router::{LSA_REFRESH, Lsa, LsaBody, Lsdb, MAX_LSA_NEIGHBORS, RouteTable, RoutingMsg, ShortId, short_id};
 use crate::state::{Body, Entry, Membership, StateStore, SyncMsg, record_key};
@@ -99,6 +99,11 @@ pub struct Node {
     routes: arc_swap::ArcSwap<RouteTable>,
     my_lsa: parking_lot::Mutex<(Vec<NodeId>, Option<Instant>, u64)>,
     last_routing_sync: parking_lot::Mutex<HashMap<NodeId, Instant>>,
+    /// Packets sent with a TTL within the hop limit (traceroute probes), by probe id: what an
+    /// ICMP Time Exceeded quotes when a relay reports the probe ran out (PLAN §6.4).
+    probes: parking_lot::Mutex<HashMap<u16, (Vec<u8>, Instant)>>,
+    /// Reports sent in the current second (rate limit).
+    reports: parking_lot::Mutex<(Instant, u32)>,
     /// Further addresses to try for peers without a session (PLAN §9.1): the candidates they
     /// announced to the tracker, or all addresses of a static peer.
     candidates: parking_lot::Mutex<HashMap<NodeId, Vec<SocketAddr>>>,
@@ -145,6 +150,8 @@ impl Node {
             routes: arc_swap::ArcSwap::from_pointee(RouteTable::default()),
             my_lsa: parking_lot::Mutex::new((Vec::new(), None, 0)),
             last_routing_sync: parking_lot::Mutex::new(HashMap::new()),
+            probes: parking_lot::Mutex::new(HashMap::new()),
+            reports: parking_lot::Mutex::new((Instant::now(), 0)),
             candidates: parking_lot::Mutex::new(HashMap::new()),
             last_peer_sync: parking_lot::Mutex::new(HashMap::new()),
         })
@@ -715,6 +722,7 @@ impl Node {
                     KIND_STATE => self.handle_state(peer, body).await,
                     KIND_ROUTING => self.handle_routing(peer, body).await,
                     KIND_FORWARD => Box::pin(self.handle_forward(peer, body)).await,
+                    KIND_REPORT => self.handle_report(peer, body).await,
                     k if k >= KIND_API_MIN => {
                         if let Some(tx) = self.api_tx.get() {
                             let _ = tx.try_send((k, peer, body.to_vec()));
@@ -886,7 +894,7 @@ impl Node {
 
     /// `[kind][body]` to `dst` over the end-to-end session, through the mesh. Starts the
     /// session if there is none (the packet is dropped meanwhile, like a direct first contact).
-    pub async fn send_e2e(&self, dst: NodeId, kind: u8, body: &[u8], limit: u8) -> bool {
+    pub async fn send_e2e(&self, dst: NodeId, kind: u8, body: &[u8], limit: u8, probe: u16) -> bool {
         let Some(next) = self.next_hop(&dst) else { return false };
         let Some(session) = self.e2e.current(&dst) else {
             self.e2e_handshake(dst, PUNCH_INTERVAL).await;
@@ -900,7 +908,74 @@ impl Node {
         buf[DATA_HDR + 1..DATA_HDR + 1 + body.len()].copy_from_slice(body);
         let Some(len) = session.seal(&mut buf, 1 + body.len()) else { return false };
         let (d, s) = (short_id(&dst), short_id(&self.storage.self_id()));
-        self.send_forward(next, [limit, 0, 0, 0], d, s, &buf[..len]).await
+        let p = probe.to_le_bytes();
+        self.send_forward(next, [limit, 0, p[0], p[1]], d, s, &buf[..len]).await
+    }
+
+    /// Remembers a probe (an IP packet with a small TTL) for a later ICMP Time Exceeded.
+    fn new_probe(&self, packet: &[u8]) -> u16 {
+        let mut probes = self.probes.lock();
+        probes.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(10));
+        if probes.len() >= 256 {
+            return 0; // no more room: the probe just gets no ICMP answer
+        }
+        let id = loop {
+            let id: u16 = rand::random();
+            if id != 0 && !probes.contains_key(&id) {
+                break id;
+            }
+        };
+        probes.insert(id, (packet::quote(packet), Instant::now()));
+        id
+    }
+
+    /// Reports to the source that its probe ran out of hops here (rate limited).
+    async fn send_report(&self, src: ShortId, probe: u16) {
+        {
+            let mut r = self.reports.lock();
+            if r.0.elapsed() >= Duration::from_secs(1) {
+                *r = (Instant::now(), 0);
+            }
+            r.1 += 1;
+            if r.1 > 50 {
+                return;
+            }
+        }
+        let Some(src_id) = self.routes.load().resolve(&src) else { return };
+        let Some(next) = self.next_hop(&src_id) else { return };
+        let mut b = Vec::with_capacity(REPORT_LEN);
+        b.extend_from_slice(&src);
+        b.extend_from_slice(&probe.to_le_bytes());
+        b.extend_from_slice(self.storage.self_id().as_bytes());
+        b.push(0); // time exceeded
+        self.send_kind(&next, KIND_REPORT, &b).await;
+    }
+
+    /// A report on the way back to a probe's source: ours (answer traceroute with an ICMP Time
+    /// Exceeded from the reporter's overlay address) or one to pass on.
+    async fn handle_report(&self, from: NodeId, body: &[u8]) {
+        if body.len() < REPORT_LEN {
+            return;
+        }
+        let dst: ShortId = body[..8].try_into().unwrap();
+        let probe = u16::from_le_bytes([body[8], body[9]]);
+        let Ok(reporter) = NodeId::try_from(&body[10..42]) else { return };
+        if dst != short_id(&self.storage.self_id()) {
+            let Some(dst_id) = self.routes.load().resolve(&dst) else { return };
+            if let Some(next) = self.next_hop(&dst_id).filter(|n| *n != from) {
+                self.send_kind(&next, KIND_REPORT, body).await;
+            }
+            return;
+        }
+        let Some((quoted, _)) = self.probes.lock().remove(&probe) else { return };
+        let addr = match packet::version(&quoted) {
+            Some(4) => self.peer_certs.lock().get(&reporter).and_then(|c| c.body.ipv4()).map(IpAddr::V4),
+            _ => Some(IpAddr::V6(crate::ckr::ula_addr(&self.group.id, &reporter))),
+        };
+        let (Some(addr), Some(tun)) = (addr, &self.tun) else { return };
+        if let Some(icmp) = packet::icmp_time_exceeded(addr, &quoted) {
+            let _ = tun.send(&icmp).await;
+        }
     }
 
     /// A `FORWARD` from neighbour `from`: ours (open the end-to-end packet) or one to pass on.
@@ -914,7 +989,7 @@ impl Node {
         let inner = &body[FORWARD_HDR..];
         let me = self.storage.self_id();
         if dst == short_id(&me) {
-            return self.handle_e2e(from, inner).await;
+            return self.handle_e2e(from, inner, hops).await;
         }
         if !self.is_relay() {
             log::debug!("Mesh | FORWARD from {} dropped: not a relay", node(from));
@@ -923,7 +998,11 @@ impl Node {
         let hops = hops.saturating_add(1);
         if hops >= limit {
             log::debug!("Mesh | FORWARD from {} dropped: hop limit", node(from));
-            return; // ICMP_REPORT: PLAN §6.4
+            let probe = u16::from_le_bytes([body[2], body[3]]);
+            if probe != 0 {
+                self.send_report(src, probe).await;
+            }
+            return;
         }
         let routes = self.routes.load();
         let Some(dst_id) = routes.resolve(&dst) else { return };
@@ -935,7 +1014,8 @@ impl Node {
         self.send_forward(next, hdr, dst, src, inner).await;
     }
 
-    async fn handle_e2e(&self, from: NodeId, inner: &[u8]) {
+    /// An end-to-end packet that reached us after `hops` relays.
+    async fn handle_e2e(&self, from: NodeId, inner: &[u8], hops: u8) {
         let mut packet = inner.to_vec();
         match self.e2e.receive(&mut packet) {
             None => {}
@@ -962,7 +1042,13 @@ impl Node {
                 let peer = session.peer;
                 let Some((&kind, body)) = packet[plain].split_first() else { return };
                 match kind {
-                    KIND_IP => self.deliver_ip(peer, body).await,
+                    KIND_IP => {
+                        // relays do not see the IP header: the TTL drops here, by the hops
+                        let mut ip = body.to_vec();
+                        if packet::decrement_ttl(&mut ip, hops) {
+                            self.deliver_ip(peer, &ip).await;
+                        }
+                    }
                     k if k >= KIND_API_MIN => {
                         if let Some(tx) = self.api_tx.get() {
                             let _ = tx.try_send((k, peer, body.to_vec()));
@@ -988,7 +1074,7 @@ impl Node {
                     break;
                 }
             };
-            let Some(IpInfo { dst, .. }) = packet::parse(&buf[OFF..OFF + n]) else { continue };
+            let Some(IpInfo { dst, ttl, .. }) = packet::parse(&buf[OFF..OFF + n]) else { continue };
             // Any source: our own address, a LAN host behind us (site-to-site), or the internet
             // if we are an exit; the receiver checks it by the reverse path.
             let Some(peer) = self.ckr.load().lookup(dst) else {
@@ -999,7 +1085,10 @@ impl Node {
                 // no direct session: through the mesh if there is a route (link_loop keeps
                 // trying the direct path meanwhile), else first contact
                 let ip = &buf[OFF..OFF + n];
-                if !self.send_e2e(peer, KIND_IP, ip, MAX_HOPS).await && self.routes.load().next_hop(&peer).is_none() {
+                // TTL into the hop limit (PLAN §6.4): small TTLs are traceroute probes
+                let (limit, probe) = if ttl <= MAX_HOPS { (ttl.max(1), self.new_probe(ip)) } else { (MAX_HOPS, 0) };
+                if !self.send_e2e(peer, KIND_IP, ip, limit, probe).await && self.routes.load().next_hop(&peer).is_none()
+                {
                     self.handshake(peer, PUNCH_INTERVAL).await;
                 }
                 continue;

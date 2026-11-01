@@ -43,6 +43,10 @@ pub const KIND_FORWARD: u8 = 4;
 pub const FORWARD_HDR: usize = 1 + 1 + 2 + 8 + 8;
 /// Hop limit of forwarded packets (PLAN §6.4).
 pub const MAX_HOPS: u8 = 16;
+/// A relay's report that a probe ran out of hops, routed hop by hop back to the source:
+/// `[dst8][probe u16 LE][reporter NodeId 32][code u8]` (PLAN §6.4).
+pub const KIND_REPORT: u8 = 5;
+pub const REPORT_LEN: usize = 8 + 2 + 32 + 1;
 pub const KIND_API_MIN: u8 = 32;
 pub const KIND_API_MAX: u8 = 255;
 

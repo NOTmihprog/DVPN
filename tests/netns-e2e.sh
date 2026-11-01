@@ -16,7 +16,8 @@
 #   DVPN=target/release/dvpn tests/netns-e2e.sh
 #   KEEP=1 tests/netns-e2e.sh           # keep the work dir (configs, logs)
 #
-# Needs: unshare, ip, nft, ping; optional: iperf3 (throughput), tcpdump (plaintext check).
+# Needs: unshare, ip, nft, ping; optional: iperf3 (throughput), tcpdump (plaintext check),
+# tracepath (traceroute through relays).
 # Exits non-zero on the first failure.
 set -eu
 
@@ -461,6 +462,21 @@ plain ma | grep -q 'end-to-end session with mc' || plain mc | grep -q 'end-to-en
     || fail "ma <-> mc did not go through a relay"
 via=$( (plain ma; plain mc) | sed -n 's/.*end-to-end session with [^ ]* via \(m[bd]\).*/\1/p' | tail -n1)
 ok "ma <-> mc through relay $via"
+
+# traceroute through the mesh: the relay shows up as a hop (by its overlay address), as an
+# ordinary router would; the end node lowers the TTL by the relays passed
+if command -v tracepath >/dev/null; then
+    case $via in mb) hop=2 ;; *) hop=4 ;; esac
+    tp=$(nsx ma tracepath -n -m 5 10.10.77.3 2>&1 || true)
+    echo "$tp" | grep -q "10.10.77.$hop " || fail "tracepath ma -> mc does not show relay $via: $tp"
+    echo "$tp" | grep -q 'reached' || fail "tracepath ma -> mc did not reach mc: $tp"
+    ula() { nsx "$1" ip -6 -o addr show dev dnet scope global | awk '{print $4}' | cut -d/ -f1; }
+    tp6=$(nsx ma tracepath -6 -n -m 5 "$(ula mc)" 2>&1 || true)
+    echo "$tp6" | grep -q "$(ula "$via") " || fail "tracepath -6 ma -> mc does not show relay $via: $tp6"
+    ok "traceroute shows relay $via (IPv4 and IPv6)"
+else
+    echo "skip: tracepath not found (traceroute through relays)"
+fi
 
 # the relay in use goes down: the other one takes over
 case $via in mb) other=md ;; *) other=mb ;; esac
