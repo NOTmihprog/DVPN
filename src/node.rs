@@ -265,6 +265,22 @@ impl Node {
         zone.store(Arc::new(z));
     }
 
+    /// An mDNS query the system sent into the TUN (`<member>.local`): the response, from the
+    /// member's address (our own would be a martian source on arrival), to the mDNS group.
+    fn mdns_reply(&self, ip: &[u8]) -> Option<Vec<u8>> {
+        use crate::dns::{MDNS_PORT, MDNS_V4, MDNS_V6};
+        let (domain, zone) = self.group.dns.as_ref()?;
+        let (_, dport, data) = packet::udp(ip)?;
+        if dport != MDNS_PORT {
+            return None;
+        }
+        let (msg, addrs) = crate::dns::mdns_answer(data, &zone.load(), domain)?;
+        let v6 = packet::parse(ip)?.src.is_ipv6();
+        let src = addrs.iter().find(|a| a.is_ipv6() == v6).copied()?;
+        let group = if v6 { IpAddr::V6(MDNS_V6) } else { IpAddr::V4(MDNS_V4) };
+        packet::udp_packet(src, group, MDNS_PORT, MDNS_PORT, &msg, 255)
+    }
+
     /// Renders the group's ACL for this node over the members' current addresses and installs it
     /// when it changed (PLAN §7.4).
     fn apply_acl(&self, members: &HashMap<NodeId, Cert>) {
@@ -1271,6 +1287,13 @@ impl Node {
                 }
             };
             let Some(IpInfo { dst, ttl, .. }) = packet::parse(&buf[OFF..OFF + n]) else { continue };
+            if dst == IpAddr::V4(crate::dns::MDNS_V4) || dst == IpAddr::V6(crate::dns::MDNS_V6) {
+                // names of members as <name>.local, answered right here
+                if let Some(r) = self.mdns_reply(&buf[OFF..OFF + n]) {
+                    let _ = tun.send(&r).await;
+                }
+                continue;
+            }
             // Any source: our own address, a LAN host behind us (site-to-site), or the internet
             // if we are an exit; the receiver checks it by the reverse path.
             let Some(peer) = self.ckr.load().lookup(dst) else {

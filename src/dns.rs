@@ -90,6 +90,80 @@ pub fn answer(query: &[u8], zone: &Zone, domain: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+pub const MDNS_PORT: u16 = 5353;
+pub const MDNS_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(224, 0, 0, 251);
+pub const MDNS_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
+
+/// Sets the multicast flag on the TUN (off by default for TUN devices): without it the system
+/// sends no mDNS queries there.
+pub fn enable_multicast(tun: &str) {
+    if cfg!(target_os = "linux") {
+        let _ = std::process::Command::new("ip").args(["link", "set", "dev", tun, "multicast", "on"]).output();
+    }
+}
+
+/// The mDNS answer to a query for `<member>.local` (A / AAAA / ANY), looked up as
+/// `<member>.<domain>` in the zone: the response message and the addresses it is about (the
+/// first is the packet's source). `None` for anything we do not know (mDNS sends no negatives).
+pub fn mdns_answer(query: &[u8], zone: &Zone, domain: &str) -> Option<(Vec<u8>, Vec<IpAddr>)> {
+    if query.len() < 12 || query[2] & 0x80 != 0 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([query[4], query[5]]);
+    let mut i = 12;
+    let mut answers: Vec<(String, IpAddr)> = Vec::new();
+    for _ in 0..qd.min(16) {
+        let mut labels = Vec::new();
+        loop {
+            let len = *query.get(i)? as usize;
+            if len == 0 {
+                i += 1;
+                break;
+            }
+            if len > 63 {
+                return None;
+            }
+            labels.push(std::str::from_utf8(query.get(i + 1..i + 1 + len)?).ok()?.to_lowercase());
+            i += 1 + len;
+        }
+        let ty = u16::from_be_bytes([*query.get(i)?, *query.get(i + 1)?]);
+        i += 4;
+        let [host, local] = labels.as_slice() else { continue };
+        if local != "local" {
+            continue;
+        }
+        for a in zone.get(&format!("{host}.{domain}")).into_iter().flatten() {
+            let fits = matches!((ty, a), (TYPE_A, IpAddr::V4(_)) | (TYPE_AAAA, IpAddr::V6(_)) | (255, _));
+            if fits {
+                answers.push((format!("{host}.local"), *a));
+            }
+        }
+    }
+    if answers.is_empty() {
+        return None;
+    }
+    let mut out = vec![0, 0, 0x84, 0, 0, 0];
+    out.extend_from_slice(&(answers.len() as u16).to_be_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    for (name, a) in &answers {
+        for l in name.split('.') {
+            out.push(l.len() as u8);
+            out.extend_from_slice(l.as_bytes());
+        }
+        out.push(0);
+        let (t, data) = match a {
+            IpAddr::V4(v) => (TYPE_A, v.octets().to_vec()),
+            IpAddr::V6(v) => (TYPE_AAAA, v.octets().to_vec()),
+        };
+        out.extend_from_slice(&t.to_be_bytes());
+        out.extend_from_slice(&0x8001u16.to_be_bytes()); // IN, cache flush: we own the name
+        out.extend_from_slice(&120u32.to_be_bytes());
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(&data);
+    }
+    Some((out, answers.into_iter().map(|(_, a)| a).collect()))
+}
+
 /// Serves `zone` on `addr:53` until the process ends.
 pub async fn serve(addr: IpAddr, zone: Arc<ArcSwap<Zone>>, domain: String) {
     let sock = match UdpSocket::bind(SocketAddr::new(addr, 53)).await {
@@ -109,12 +183,13 @@ pub async fn serve(addr: IpAddr, zone: Arc<ArcSwap<Zone>>, domain: String) {
     }
 }
 
-/// Points systemd-resolved at us for the domain on the TUN link (split DNS); `false` if
-/// resolvectl is not there or failed.
+/// Points systemd-resolved at us for the domain on the TUN link (split DNS) and lets it ask
+/// mDNS there (`<member>.local`); `false` if resolvectl is not there or failed.
 pub fn configure_resolved(tun: &str, addr: IpAddr, domain: &str) -> bool {
     let ok =
         |args: &[&str]| std::process::Command::new("resolvectl").args(args).output().is_ok_and(|o| o.status.success());
     let done = ok(&["dns", tun, &addr.to_string()]) && ok(&["domain", tun, &format!("~{domain}")]);
+    let _ = ok(&["mdns", tun, "resolve"]);
     if done {
         log::info!("DNS | systemd-resolved sends *.{domain} to {addr}");
     } else {
@@ -161,6 +236,21 @@ mod tests {
         assert_eq!((r[3] & 0x0f, u16::from_be_bytes([r[6], r[7]])), (0, 0), "TXT: name exists, no data");
         assert!(answer(&[0; 5], &z, "dvpn").is_none());
         assert!(answer(&r, &z, "dvpn").is_none(), "a response is not answered");
+    }
+
+    #[test]
+    fn mdns() {
+        let z = zone();
+        let mut q = query("phone.local", TYPE_A);
+        q[..2].copy_from_slice(&[0, 0]);
+        let (r, addrs) = mdns_answer(&q, &z, "dvpn").unwrap();
+        assert_eq!(addrs, vec!["10.10.33.40".parse::<IpAddr>().unwrap()]);
+        assert_eq!((r[2], u16::from_be_bytes([r[6], r[7]])), (0x84, 1));
+        assert_eq!(&r[r.len() - 4..], &[10, 10, 33, 40]);
+        assert!(mdns_answer(&query("nobody.local", TYPE_A), &z, "dvpn").is_none(), "no negative answers");
+        assert!(mdns_answer(&query("phone.dvpn", TYPE_A), &z, "dvpn").is_none(), "only .local");
+        let (r, _) = mdns_answer(&query("phone.local", 255), &z, "dvpn").unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 2, "ANY: A and AAAA");
     }
 
     #[test]

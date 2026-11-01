@@ -1043,6 +1043,7 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
     }
     if let (Some((domain, zone)), Some(addr), Some(net)) = (&dns, self_addr, &conf.net) {
         tokio::spawn(dvpn::dns::serve(std::net::IpAddr::V4(addr), zone.clone(), domain.clone()));
+        dvpn::dns::enable_multicast(&net.tun_name);
         if conf.dns.manage_resolved {
             let (tun, domain) = (net.tun_name.clone(), domain.clone());
             tokio::task::spawn_blocking(move || {

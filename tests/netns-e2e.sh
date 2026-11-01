@@ -405,6 +405,30 @@ print(".".join(map(str, r[-4:])))
     [ "$(dnsq b 10.10.33.2 c.dvpn)" = "10.10.33.3" ] || fail "b's DNS: c.dvpn"
     ! dnsq a 10.10.33.3 nobody.dvpn >/dev/null 2>&1 || fail "c's DNS answered for an unknown name"
     ok "DNS: members by name (b.dvpn, b.e2e.dvpn)"
+    # mDNS: what the system's resolver (avahi, systemd-resolved) asks for <name>.local on the
+    # tunnel interface is answered by the node
+    mdnsq() { # mdnsq NS OWN_ADDR NAME: the A record from the mDNS answer
+        nsx "$1" python3 -I -c '
+import socket, struct, sys
+own, name = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("", 5353))
+s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton("224.0.0.251") + socket.inet_aton(own))
+s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(own))
+s.settimeout(3)
+q = b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+q += b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\x00\x00\x01\x00\x01"
+s.sendto(q, ("224.0.0.251", 5353))
+while True:
+    r, _ = s.recvfrom(512)
+    if r[2] & 0x80 and r[7] > 0:
+        print(".".join(map(str, r[-4:])))
+        break
+' "$2" "$3"
+    }
+    [ "$(mdnsq a 10.10.33.1 c.local)" = "10.10.33.3" ] || fail "mDNS: c.local from a"
+    ok "mDNS: members as <name>.local"
 fi
 
 # Revocation (before the roaming check, which leaves A without a tracker session for a

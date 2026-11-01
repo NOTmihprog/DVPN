@@ -150,6 +150,58 @@ pub fn icmp_time_exceeded(from: IpAddr, quoted: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// UDP payload of an IPv4/IPv6 packet: (source port, destination port, payload). IPv6 extension
+/// headers are not followed.
+pub fn udp(p: &[u8]) -> Option<(u16, u16, &[u8])> {
+    let off = match version(p)? {
+        4 if p.len() >= IPV4_MIN_HEADER && p[9] == 17 => usize::from(p[0] & 0x0f) * 4,
+        6 if p.len() >= IPV6_HEADER && p[6] == 17 => IPV6_HEADER,
+        _ => return None,
+    };
+    let h = p.get(off..off + 8)?;
+    let len = usize::from(u16::from_be_bytes([h[4], h[5]]));
+    let data = p.get(off + 8..off + len.max(8))?;
+    Some((u16::from_be_bytes([h[0], h[1]]), u16::from_be_bytes([h[2], h[3]]), data))
+}
+
+/// A UDP packet (IPv4 or IPv6, by the addresses) with valid checksums.
+pub fn udp_packet(src: IpAddr, dst: IpAddr, sport: u16, dport: u16, payload: &[u8], ttl: u8) -> Option<Vec<u8>> {
+    let ulen = 8 + payload.len();
+    let mut udp = Vec::with_capacity(ulen);
+    udp.extend_from_slice(&sport.to_be_bytes());
+    udp.extend_from_slice(&dport.to_be_bytes());
+    udp.extend_from_slice(&(ulen as u16).to_be_bytes());
+    udp.extend_from_slice(&[0, 0]);
+    udp.extend_from_slice(payload);
+    match (src, dst) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => {
+            let c = checksum(&[&s.octets(), &d.octets(), &[0, 17], &(ulen as u16).to_be_bytes(), &udp]);
+            udp[6..8].copy_from_slice(&(if c == 0 { 0xffff } else { c }).to_be_bytes());
+            let total = IPV4_MIN_HEADER + ulen;
+            let mut p = vec![0x45, 0, 0, 0, 0, 0, 0, 0, ttl, 17, 0, 0];
+            p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+            p.extend_from_slice(&s.octets());
+            p.extend_from_slice(&d.octets());
+            let c = checksum(&[&p]);
+            p[10..12].copy_from_slice(&c.to_be_bytes());
+            p.extend_from_slice(&udp);
+            Some(p)
+        }
+        (IpAddr::V6(s), IpAddr::V6(d)) => {
+            let c = checksum(&[&s.octets(), &d.octets(), &(ulen as u32).to_be_bytes(), &[0, 0, 0, 17], &udp]);
+            udp[6..8].copy_from_slice(&(if c == 0 { 0xffff } else { c }).to_be_bytes());
+            let mut p = vec![0x60, 0, 0, 0];
+            p.extend_from_slice(&(ulen as u16).to_be_bytes());
+            p.extend_from_slice(&[17, ttl]);
+            p.extend_from_slice(&s.octets());
+            p.extend_from_slice(&d.octets());
+            p.extend_from_slice(&udp);
+            Some(p)
+        }
+        _ => None,
+    }
+}
+
 /// Source address of a quoted (truncated) packet.
 fn parse_quoted(q: &[u8]) -> Option<IpAddr> {
     match version(q)? {
