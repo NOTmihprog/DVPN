@@ -59,6 +59,8 @@ pub enum Body {
         eph: [u8; 32],
         sealed: Vec<u8>,
     },
+    /// The group's access rules (PLAN §7.4).
+    Acl(Box<crate::acl::Acl>),
 }
 
 impl Body {
@@ -68,6 +70,7 @@ impl Body {
             Body::Cert(c) => format!("cert/{}", c.body.node),
             Body::Epoch { .. } => "epoch".into(),
             Body::EpochKey { node, .. } => format!("epochkey/{node}"),
+            Body::Acl(_) => "acl".into(),
         }
     }
 }
@@ -173,7 +176,7 @@ impl Record {
             && match &e.body {
                 // signed by the group anyway, but must be a valid certificate of this group
                 Body::Cert(c) => c.verify(&e.group, None).is_ok(),
-                Body::Revoke { .. } | Body::Epoch { .. } | Body::EpochKey { .. } => true,
+                Body::Revoke { .. } | Body::Epoch { .. } | Body::EpochKey { .. } | Body::Acl(_) => true,
             };
         if !consistent {
             return Err(RecordError::Inconsistent);
@@ -368,6 +371,15 @@ impl StateStore {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The group's access rules, if an admin set any.
+    pub fn acl(&self, group: &GroupId) -> Option<crate::acl::Acl> {
+        let inner = self.inner.lock();
+        inner.live(group).find_map(|e| match &e.body {
+            Body::Acl(a) => Some((**a).clone()),
+            _ => None,
+        })
     }
 
     /// The newest psk epoch and its switch time (unix ms), if one was announced.

@@ -114,6 +114,8 @@ pub struct Node {
     exits: parking_lot::Mutex<(crate::config::Exits, Option<std::time::SystemTime>)>,
     exit4: parking_lot::Mutex<crate::exit::ExitChooser>,
     exit6: parking_lot::Mutex<crate::exit::ExitChooser>,
+    /// The ACL chain now installed (to re-render only on changes).
+    acl: parking_lot::Mutex<Option<String>>,
     /// `[gateway]`: NAT and NDP proxy for members' public IPv6 addresses.
     gateway: parking_lot::Mutex<Option<crate::gateway::Gateway>>,
     /// Further addresses to try for peers without a session (PLAN §9.1): the candidates they
@@ -169,6 +171,7 @@ impl Node {
             exit4: parking_lot::Mutex::new(Default::default()),
             exit6: parking_lot::Mutex::new(Default::default()),
             gateway: parking_lot::Mutex::new(None),
+            acl: parking_lot::Mutex::new(None),
             candidates: parking_lot::Mutex::new(HashMap::new()),
             last_peer_sync: parking_lot::Mutex::new(HashMap::new()),
         })
@@ -220,6 +223,7 @@ impl Node {
             }
         }
         routes.extend(self.group.routes.iter().copied());
+        self.apply_acl(&newest);
         if let Some(gw) = self.gateway.lock().as_mut() {
             let prefixes: Vec<ipnet::IpNet> = newest.values().flat_map(|c| c.body.prefixes.iter().copied()).collect();
             tokio::task::block_in_place(|| gw.apply(&prefixes));
@@ -230,6 +234,26 @@ impl Node {
             tokio::task::block_in_place(|| sys.apply(&wanted));
         }
         self.ckr.store(Arc::new(table));
+    }
+
+    /// Renders the group's ACL for this node over the members' current addresses and installs it
+    /// when it changed (PLAN §7.4).
+    fn apply_acl(&self, members: &HashMap<NodeId, Cert>) {
+        let Some(tun) = &self.tun else { return };
+        let me = self.storage.self_id();
+        let mut prefixes: HashMap<NodeId, Vec<ipnet::IpNet>> =
+            members.iter().map(|(n, c)| (*n, c.body.prefixes.iter().map(|p| p.trunc()).collect())).collect();
+        // members' group ULA addresses are theirs too
+        for (n, v) in prefixes.iter_mut() {
+            v.push(ipnet::IpNet::from(IpAddr::V6(crate::ckr::ula_addr(&self.group.id, n))));
+        }
+        let chain = self.group.store.acl(&self.group.id).and_then(|a| a.render(&me, &prefixes));
+        let mut cur = self.acl.lock();
+        if *cur != chain {
+            let name = tun.name().unwrap_or_default();
+            tokio::task::block_in_place(|| crate::acl::apply_nft(&name, chain.as_deref()));
+            *cur = chain;
+        }
     }
 
     /// Act as a gateway (`[gateway]`). Call before `start`.
@@ -1250,6 +1274,12 @@ impl Node {
         }
         if let Some(gw) = self.gateway.lock().as_mut() {
             tokio::task::block_in_place(|| gw.stop());
+        }
+        if self.acl.lock().take().is_some()
+            && let Some(tun) = &self.tun
+        {
+            let name = tun.name().unwrap_or_default();
+            tokio::task::block_in_place(|| crate::acl::apply_nft(&name, None));
         }
         for c in &self.clients {
             if let Some(p) = c.close() {

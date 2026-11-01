@@ -364,6 +364,24 @@ wait_for 30 sh -c "ip netns exec b ip -4 addr show dnet | grep -q '10.10.33.2/'"
 wait_for 20 nsx a ping -c1 -W1 10.10.33.2 || fail "a -> b at its old address again"
 ok "node set: new subnet for c and a new address for b reach everybody"
 
+# ACL: the admin forbids ping from B to C; C enforces it (nftables on its TUN), A still pings C.
+cat > "$W/acl.toml" <<'TOML'
+default = "allow"
+[[rule]]
+from = ["b"]
+to = ["c"]
+proto = "icmp"
+action = "deny"
+TOML
+"$D" --dir "$W/a" acl set "$W/acl.toml" >/dev/null || fail "acl set"
+wait_for 20 sh -c "ip netns exec c nft list table inet dvpn_acl >/dev/null 2>&1" || fail "c did not install the ACL"
+! nsx b ping -c2 -W1 10.10.33.3 >/dev/null 2>&1 || fail "ACL deny did not block b -> c"
+nsx a ping -c2 -W1 10.10.33.3 >/dev/null || fail "ACL blocked a -> c too"
+"$D" --dir "$W/a" acl show | grep -q 'action = "deny"' || fail "acl show"
+"$D" --dir "$W/a" acl clear >/dev/null || fail "acl clear"
+wait_for 20 nsx b ping -c1 -W1 10.10.33.3 || fail "b -> c still blocked after acl clear"
+ok "ACL: ping b -> c denied, a -> c allowed, cleared again"
+
 # Revocation (before the roaming check, which leaves A without a tracker session for a
 # while): the admin revokes B with the CLI while its node runs; the node spreads the record
 # (tracker + direct), C drops B and B can no longer reach anybody.

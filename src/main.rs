@@ -63,6 +63,9 @@ enum Command {
     /// Members: addresses, subnets and roles (admins change them with `node set`)
     #[command(subcommand)]
     Node(NodeCommand),
+    /// Access rules inside the group (admins set them; every node enforces them)
+    #[command(subcommand)]
+    Acl(AclCommand),
     /// Gateways to the internet, by priority (the first alive one is used), or none.
     /// Without options: show them. A running node follows the change within seconds
     Exit {
@@ -84,6 +87,26 @@ enum Command {
         /// Server bind port
         #[arg(short = 'p', long, default_value_t = 6485)]
         port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum AclCommand {
+    /// Print the rules (TOML, the format `set` reads)
+    Show {
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+    },
+    /// Check a TOML file and make it the group's rules (admins only)
+    Set {
+        file: PathBuf,
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+    },
+    /// Remove all rules: everybody may reach everybody (admins only)
+    Clear {
+        #[arg(short = 'g', long)]
+        group: Option<String>,
     },
 }
 
@@ -341,6 +364,56 @@ fn member_certs(conf: &Config, g: &GroupConfig, store: &StateStore) -> Vec<dvpn:
     let _ = conf;
     v.sort_by(|a, b| a.body.name.cmp(&b.body.name));
     v
+}
+
+fn cmd_acl(conf: &Config, dir: &Path, cmd: AclCommand) {
+    let store = StateStore::open(dir.join(STATE_FILE_NAME));
+    let group = match &cmd {
+        AclCommand::Show { group } | AclCommand::Set { group, .. } | AclCommand::Clear { group } => group,
+    };
+    let g = pick_group(conf, group).clone();
+    let certs = member_certs(conf, &g, &store);
+    let name =
+        |n: &NodeId| certs.iter().find(|c| c.body.node == *n).map_or_else(|| n.to_string(), |c| c.body.name.clone());
+    match cmd {
+        AclCommand::Show { .. } => match store.acl(&g.id) {
+            Some(a) => print!("{}", a.to_toml(&name)),
+            None => println!("# no rules: everybody may reach everybody\ndefault = \"allow\""),
+        },
+        AclCommand::Set { .. } | AclCommand::Clear { .. } if g.secret.is_none() => {
+            die(format!("only admins of {} can set the rules", g.name))
+        }
+        AclCommand::Set { file, .. } => {
+            if !dvpn::clock::trusted() {
+                die("the clock is earlier than this build: set it (NTP) first");
+            }
+            let text = std::fs::read_to_string(&file).unwrap_or_else(|e| die(format!("read {}: {e}", file.display())));
+            let member = |s: &str| -> Option<NodeId> {
+                s.parse().ok().or_else(|| {
+                    let hits: Vec<NodeId> = certs.iter().filter(|c| c.body.name == s).map(|c| c.body.node).collect();
+                    (hits.len() == 1).then(|| hits[0])
+                })
+            };
+            let acl =
+                dvpn::acl::Acl::parse(&text, &member).unwrap_or_else(|e| die(format!("{}: {e:#}", file.display())));
+            let secret = g.secret.as_ref().expect("checked");
+            store.add(secret, Body::Acl(Box::new(acl.clone())), false);
+            store.save();
+            println!(
+                "Rules of group {} set ({} rules, default {}):",
+                g.name,
+                acl.rules.len(),
+                if acl.default_deny { "deny" } else { "allow" }
+            );
+            print!("{}", acl.to_toml(&name));
+        }
+        AclCommand::Clear { .. } => {
+            let secret = g.secret.as_ref().expect("checked");
+            store.add(secret, Body::Acl(Box::default()), true);
+            store.save();
+            println!("Rules of group {} removed", g.name);
+        }
+    }
 }
 
 fn cmd_node(conf: &mut Config, dir: &Path, cmd: NodeCommand) {
@@ -1044,6 +1117,7 @@ fn main() {
         Some(Command::ShowKey { key: None }) => println!("{}", conf.identity.id()),
         Some(Command::Group(cmd)) => cmd_group(&mut conf, &dir, cmd),
         Some(Command::Node(cmd)) => cmd_node(&mut conf, &dir, cmd),
+        Some(Command::Acl(cmd)) => cmd_acl(&conf, &dir, cmd),
         Some(Command::Exit { v4, v6, none }) => {
             let mut e = conf.exits.clone();
             if none {
