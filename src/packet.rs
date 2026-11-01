@@ -97,11 +97,11 @@ pub fn quote(p: &[u8]) -> Vec<u8> {
 fn checksum(parts: &[&[u8]]) -> u16 {
     let mut sum: u32 = 0;
     for part in parts {
-        let mut chunks = part.chunks_exact(2);
-        for c in &mut chunks {
-            sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+        let (pairs, rest) = part.as_chunks::<2>();
+        for c in pairs {
+            sum += u32::from(u16::from_be_bytes(*c));
         }
-        if let [b] = chunks.remainder() {
+        if let [b] = rest {
             sum += u32::from(*b) << 8;
         }
     }
