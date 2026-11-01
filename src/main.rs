@@ -72,6 +72,15 @@ enum Command {
     Neighbors,
     /// Routes of the running node: mesh (through relays) and CKR (addresses and subnets)
     Routes,
+    /// Round trips to a member over our session with it (direct or through relays)
+    Ping {
+        /// Member name, node key or key prefix
+        #[arg(allow_hyphen_values = true)]
+        node: String,
+        /// How many
+        #[arg(short = 'c', long, default_value_t = 4)]
+        count: u32,
+    },
     /// The hops to a member through the mesh
     Path {
         /// Member name, node key or key prefix
@@ -1268,6 +1277,32 @@ fn main() {
                 .map(|r| vec![mps(r, "net"), mps(r, "to"), mps(r, "system")])
                 .collect();
             println!("\nCKR (destination: node)\n{}\n", github_table(&["Prefix", "To", "System route"], &ckr));
+        }
+        Some(Command::Ping { node, count }) => {
+            let (mut got, mut sum) = (0, 0.0);
+            for i in 0..count {
+                if i > 0 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                let v = diag(&rt, &conf, cli.api_addr.clone(), "ping", Some(node.clone()));
+                match v.as_str() {
+                    Some(err) => die(format!("{node}: {err}")),
+                    None if v.is_nil() => println!("{node}: no answer"),
+                    None => {
+                        let ms = mp(&v, "rtt_ms").as_f64().unwrap_or_default();
+                        println!("{node}: {ms:.2} ms ({})", mps(&v, "via"));
+                        got += 1;
+                        sum += ms;
+                    }
+                }
+            }
+            println!(
+                "{got} of {count} answered{}",
+                if got > 0 { format!(", average {:.2} ms", sum / f64::from(got)) } else { String::new() }
+            );
+            if got == 0 {
+                exit(1);
+            }
         }
         Some(Command::Path { node }) => {
             let v = diag(&rt, &conf, cli.api_addr, "path", Some(node.clone()));

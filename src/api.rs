@@ -405,10 +405,32 @@ impl Api {
                 log::info!("API | msgpack decode error from {from}");
                 continue;
             };
+            // a ping waits for the answer: in its own task, so the API stays responsive
+            let is_ping = field(&packet, "type").and_then(Value::as_str) == Some("get")
+                && field(&packet, "req").and_then(Value::as_str) == Some("ping")
+                && self.state.lock().conns.contains_key(&from);
+            if is_ping {
+                tokio::spawn(self.clone().ping_req(packet, from));
+                continue;
+            }
             if let Some(reply) = self.handle(&packet, &from).await {
                 self.sock.send(&reply, &from).await;
             }
         }
+    }
+
+    /// `get ping`: the round trip to a member over our session with it, or nil without answer.
+    async fn ping_req(self: Arc<Self>, p: Value, from: ApiAddr) {
+        let result = match self.peer_arg(&p) {
+            Ok(peer) => match self.node.ping(peer).await {
+                Some((ms, mesh)) => {
+                    map(vec![("rtt_ms", ms.into()), ("via", if mesh { "relays" } else { "direct" }.into())])
+                }
+                None => Value::Nil,
+            },
+            Err(e) => e.into(),
+        };
+        self.sock.send(&res(field(&p, "id"), result), &from).await;
     }
 
     async fn handle(&self, p: &Value, from: &ApiAddr) -> Option<Value> {

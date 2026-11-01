@@ -292,7 +292,8 @@ NFT
 blog() { tail -n +$from "$W/node-b.log" | sed 's/\x1b\[[0-9;]*m//g'; }
 wait_for 60 sh -c "tail -n +$from '$W/node-b.log' | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'kill switch on'" \
     || fail "b did not turn the kill switch on"
-! nsx b ping -c2 -W1 203.0.113.1 >/dev/null 2>&1 || fail "kill switch: b's internet leaked past the tunnel"
+ks=$(nsx b ping -c2 -W1 203.0.113.1 2>&1) && fail "kill switch: b's internet leaked past the tunnel"
+echo "$ks" | grep -q 'From ' || fail "kill switch: no ICMP 'prohibited' for the application: $ks"
 "$D" --dir "$W/b" exit --kill-switch off >/dev/null
 wait_for 10 nsx b ping -c1 -W1 203.0.113.1 || fail "kill switch off: b's internet did not go direct"
 "$D" --dir "$W/b" exit --kill-switch on >/dev/null
@@ -616,6 +617,7 @@ for x in "mb 2 --relay" "mc 3" "md 4 --relay"; do
     inv=$("$D" --dir "$W/ma" group invite -n "$1" -a "10.10.77.$2" ${3:-} 2>/dev/null) || fail "invite $1"
     "$D" --dir "$W/$1" group join "$inv" >/dev/null 2>&1 || fail "$1: join"
 done
+sed -i 's/^mtu = .*/mtu = 1420/' ma/config.toml
 for n in ma mb mc md; do bg "node-$n" $n "$D" --dir "$W/$n" -a 127.0.0.1:9902; done
 reach ma mc 10.10.77.3
 reach mc ma 10.10.77.1
@@ -630,12 +632,13 @@ ok "ma <-> mc through relay $via"
 # equally good, so the one in use is taken from the trace, not from when the session started.
 if command -v tracepath >/dev/null; then
     tp=$(nsx ma tracepath -n -m 5 10.10.77.3 2>&1 || true)
-    hop=$(echo "$tp" | awk '$1 == "1:" {print $2; exit}')
+    # the first hop that is not the target (path MTU discovery may put a line first)
+    hop=$(echo "$tp" | awk '$1 == "1:" && $2 != "10.10.77.3" {print $2; exit}')
     case $hop in 10.10.77.2) via=mb ;; 10.10.77.4) via=md ;; *) fail "tracepath ma -> mc shows no relay: $tp" ;; esac
     echo "$tp" | grep -q 'reached' || fail "tracepath ma -> mc did not reach mc: $tp"
     ula() { nsx "$1" ip -6 -o addr show dev dnet scope global | awk '{print $4}' | cut -d/ -f1; }
     tp6=$(nsx ma tracepath -6 -n -m 5 "$(ula mc)" 2>&1 || true)
-    hop6=$(echo "$tp6" | awk '$1 == "1:" {print $2; exit}')
+    hop6=$(echo "$tp6" | awk -v t="$(ula mc)" '$1 == "1:" && $2 != t {print $2; exit}')
     [ "$hop6" = "$(ula mb)" ] || [ "$hop6" = "$(ula md)" ] || fail "tracepath -6 ma -> mc shows no relay: $tp6"
     ok "traceroute shows relay $via (IPv4 and IPv6)"
 else
@@ -649,7 +652,17 @@ echo "$p" | grep -q " -> $via -> mc" || fail "path ma -> mc does not go through 
 dv ma status 2>&1 | grep -q 'group' || fail "status"
 dv ma neighbors 2>&1 | grep -q "| $via " || fail "neighbors of ma do not list $via"
 dv ma routes 2>&1 | grep -q "| mc .*| $via " || fail "routes of ma: mc not via $via"
-ok "diagnostics: dvpn path / status / neighbors / routes"
+pg=$(dv ma ping mc -c 2 2>&1) || fail "dvpn ping: $pg"
+echo "$pg" | grep -q 'ms (relays)' || fail "dvpn ping ma -> mc not through relays: $pg"
+ok "diagnostics: dvpn path / status / neighbors / routes / ping"
+
+# Path MTU through relays: MA's TUN takes 1420-byte packets, a relayed path carries 1368;
+# a too big packet with DF set gets "fragmentation needed" from MA itself, smaller ones pass
+out=$( (nsx ma ping -c1 -W1 -M do -s 1392 10.10.77.3 || true; nsx ma ping -c1 -W1 -M do -s 1392 10.10.77.3 || true) 2>&1)
+# the kernel learned the path MTU from that ICMP (ping may only say "message too long")
+nsx ma ip route get 10.10.77.3 | grep -q 'mtu 1368' || fail "no path MTU 1368 for ma -> mc through relays: $out $(nsx ma ip route get 10.10.77.3)"
+nsx ma ping -c1 -W2 -M do -s 1300 10.10.77.3 >/dev/null || fail "ma -> mc: a packet that fits did not pass"
+ok "path MTU through relays: fragmentation needed, mtu 1368"
 
 # the relay in use goes down: the other one takes over
 case $via in mb) other=md ;; *) other=mb ;; esac

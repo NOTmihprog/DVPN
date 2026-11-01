@@ -37,6 +37,13 @@ const KEEPALIVE: std::ops::Range<Duration> = Duration::from_secs(12)..Duration::
 /// The link loop runs at random intervals around a second, for the same reason.
 const LINK_TICK: std::ops::Range<Duration> = Duration::from_millis(700)..Duration::from_millis(1300);
 const LINK_TIMEOUT: Duration = Duration::from_secs(45);
+/// The largest IP packet a direct session carries within `obfs::MAX_WIRE`: DATA header, kind
+/// and tag; through relays the end-to-end layer and the FORWARD header come on top.
+const DIRECT_MTU: usize = crate::obfs::MAX_WIRE - (DATA_HDR + 1 + TAG_LEN);
+const RELAY_MTU: usize = DIRECT_MTU - (FORWARD_HDR + DATA_HDR + 1 + TAG_LEN);
+/// How long `ping` waits for the answer.
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A neighbour silent this long (keepalives answer every 12-18 s) is no longer announced as a
 /// link nor used as a first hop, so routes move to another relay quickly.
 const NEIGHBOR_ALIVE: Duration = Duration::from_secs(25);
@@ -129,6 +136,8 @@ pub struct Node {
     /// Packets sent with a TTL within the hop limit (traceroute probes), by probe id: what an
     /// ICMP Time Exceeded quotes when a relay reports the probe ran out (PLAN §6.4).
     probes: parking_lot::Mutex<HashMap<u16, (Vec<u8>, Instant)>>,
+    /// `dvpn ping` waiting for answers, by the echoed timestamp.
+    pings: parking_lot::Mutex<HashMap<u64, tokio::sync::oneshot::Sender<f64>>>,
     /// Reports sent in the current second (rate limit).
     reports: parking_lot::Mutex<(Instant, u32)>,
     /// `[exit]` and the config file's mtime it was read at; the chosen IPv4 / IPv6 gateways.
@@ -191,6 +200,7 @@ impl Node {
             scores: parking_lot::Mutex::new(Scores::default()),
             probes: parking_lot::Mutex::new(HashMap::new()),
             reports: parking_lot::Mutex::new((Instant::now(), 0)),
+            pings: parking_lot::Mutex::new(HashMap::new()),
             exits: parking_lot::Mutex::new(exits),
             exit4: parking_lot::Mutex::new(Default::default()),
             exit6: parking_lot::Mutex::new(Default::default()),
@@ -842,6 +852,42 @@ impl Node {
         }
     }
 
+    /// `dvpn ping`: the round trip to `peer` over our session with it (direct or end to end
+    /// through relays): (milliseconds, through relays). `None` if no answer came.
+    pub async fn ping(&self, peer: NodeId) -> Option<(f64, bool)> {
+        let ts = loop {
+            let ts = self.epoch.elapsed().as_nanos() as u64;
+            if !self.pings.lock().contains_key(&ts) {
+                break ts;
+            }
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pings.lock().insert(ts, tx);
+        let body = Self::control(CONTROL_PING, ts);
+        let mesh = self.links.current(&peer).is_none();
+        let sent = if mesh {
+            // a first end-to-end packet only starts the session: give it a moment
+            self.send_e2e(peer, KIND_CONTROL, &body, MAX_HOPS, 0).await || {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                self.send_e2e(peer, KIND_CONTROL, &body, MAX_HOPS, 0).await
+            }
+        } else {
+            self.send_kind(&peer, KIND_CONTROL, &body).await
+        };
+        let r = if sent { tokio::time::timeout(PING_TIMEOUT, rx).await.ok().and_then(Result::ok) } else { None };
+        self.pings.lock().remove(&ts);
+        r.map(|ms| (ms, mesh))
+    }
+
+    /// A pong for `dvpn ping`.
+    fn ping_answered(&self, echo_ts: u64) -> Option<f64> {
+        let ms = self.epoch.elapsed().as_nanos().checked_sub(u128::from(echo_ts))? as f64 / 1e6;
+        if let Some(tx) = self.pings.lock().remove(&echo_ts) {
+            let _ = tx.send(ms);
+        }
+        Some(ms)
+    }
+
     async fn handle_control(&self, peer: NodeId, c: &[u8]) {
         if c.len() < CONTROL_LEN - 1 {
             return;
@@ -854,9 +900,7 @@ impl Node {
                 log::debug!("Ping | receive ping from {}", node(peer));
             }
             CONTROL_PONG => {
-                let now = self.epoch.elapsed().as_nanos() as u64;
-                let Some(rtt) = now.checked_sub(echo_ts) else { return };
-                let ms = rtt as f64 / 1e6;
+                let Some(ms) = self.ping_answered(echo_ts) else { return };
                 self.storage.update_link(&peer, |l| l.rtt_ms = Some(ms));
                 self.storage.emit(Event::Ping { peer_id: peer, ms });
                 log::debug!("Ping | receive pong from {} ping: {ms:.3}", node(peer));
@@ -1293,7 +1337,8 @@ impl Node {
     }
 
     /// Reports to the source that its probe ran out of hops here (rate limited).
-    async fn send_report(&self, src: ShortId, probe: u16) {
+    /// `code`: 0 the hop limit ran out, 1 no way on from here.
+    async fn send_report(&self, src: ShortId, probe: u16, code: u8) {
         {
             let mut r = self.reports.lock();
             if r.0.elapsed() >= Duration::from_secs(1) {
@@ -1310,7 +1355,7 @@ impl Node {
         b.extend_from_slice(&src);
         b.extend_from_slice(&probe.to_le_bytes());
         b.extend_from_slice(self.storage.self_id().as_bytes());
-        b.push(0); // time exceeded
+        b.push(code);
         self.send_kind(&next, KIND_REPORT, &b).await;
     }
 
@@ -1336,7 +1381,8 @@ impl Node {
             _ => Some(IpAddr::V6(crate::ckr::ula_addr(&self.group.id, &reporter))),
         };
         let (Some(addr), Some(tun)) = (addr, &self.tun) else { return };
-        if let Some(icmp) = packet::icmp_time_exceeded(addr, &quoted) {
+        let kind = if body[42] == 1 { packet::IcmpError::HostUnreachable } else { packet::IcmpError::TimeExceeded };
+        if let Some(icmp) = packet::icmp_error(kind, addr, &quoted) {
             let _ = tun.send(&icmp).await;
         }
     }
@@ -1363,13 +1409,19 @@ impl Node {
             log::debug!("Mesh | FORWARD from {} dropped: hop limit", node(from));
             let probe = u16::from_le_bytes([body[2], body[3]]);
             if probe != 0 {
-                self.send_report(src, probe).await;
+                self.send_report(src, probe, 0).await;
             }
             return;
         }
         let routes = self.routes.load();
-        let Some(dst_id) = routes.resolve(&dst) else { return };
-        let Some(next) = self.next_hop(&dst_id) else { return };
+        let probe = u16::from_le_bytes([body[2], body[3]]);
+        let Some(next) = routes.resolve(&dst).and_then(|d| self.next_hop(&d)) else {
+            // no way on: a traceroute probe learns it (!H), other packets are just dropped
+            if probe != 0 {
+                self.send_report(src, probe, 1).await;
+            }
+            return;
+        };
         if next == from {
             return; // routes not converged yet: do not bounce
         }
@@ -1412,6 +1464,19 @@ impl Node {
                             self.deliver_ip(peer, &ip).await;
                         }
                     }
+                    KIND_CONTROL if body.len() >= CONTROL_LEN - 1 => {
+                        let echo_ts = u64::from_le_bytes(body[1..9].try_into().unwrap());
+                        match body[0] {
+                            CONTROL_PING => {
+                                self.send_e2e(peer, KIND_CONTROL, &Self::control(CONTROL_PONG, echo_ts), MAX_HOPS, 0)
+                                    .await;
+                            }
+                            CONTROL_PONG => {
+                                self.ping_answered(echo_ts);
+                            }
+                            _ => {}
+                        }
+                    }
                     k if k >= KIND_API_MIN => {
                         if let Some(tx) = self.api_tx.get() {
                             let _ = tx.try_send((k, peer, body.to_vec()));
@@ -1420,6 +1485,29 @@ impl Node {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// An ICMP error about `ip` (a packet from the TUN) back into the TUN, from its destination
+    /// address (our own address would be dropped as a martian source).
+    async fn icmp_back(&self, kind: packet::IcmpError, ip: &[u8]) {
+        self.icmp_from(kind, ip, None).await;
+    }
+
+    /// Like `icmp_back`, from `from` if given.
+    async fn icmp_from(&self, kind: packet::IcmpError, ip: &[u8], from: Option<IpAddr>) {
+        let (Some(tun), Some(info)) = (&self.tun, packet::parse(ip)) else { return };
+        if let Some(icmp) = packet::icmp_error(kind, from.unwrap_or(info.dst), &packet::quote(ip)) {
+            let _ = tun.send(&icmp).await;
+        }
+    }
+
+    /// A member's address in the group: its IPv4 from the certificate, or its ULA.
+    fn overlay_addr(&self, n: &NodeId, v6: bool) -> Option<IpAddr> {
+        if v6 {
+            Some(IpAddr::V6(crate::ckr::ula_addr(&self.group.id, n)))
+        } else {
+            self.peer_certs.lock().get(n).and_then(|c| c.body.ipv4()).map(IpAddr::V4)
         }
     }
 
@@ -1447,10 +1535,30 @@ impl Node {
             }
             // Any source: our own address, a LAN host behind us (site-to-site), or the internet
             // if we are an exit; the receiver checks it by the reverse path.
-            let Some(peer) = self.ckr.load().lookup(dst) else {
-                log::trace!("TUN | no route to {dst}");
-                continue;
+            let table = self.ckr.load();
+            let peer = match table.target(dst) {
+                Some(crate::ckr::Target::Node(p)) => p,
+                Some(crate::ckr::Target::Blackhole) => {
+                    // kill switch: tell the application at once instead of a silent timeout
+                    self.icmp_back(packet::IcmpError::Prohibited, &buf[OFF..OFF + n]).await;
+                    continue;
+                }
+                _ => {
+                    log::trace!("TUN | no route to {dst}");
+                    continue;
+                }
             };
+            let direct = self.links.current(&peer).is_some();
+            let mtu = if direct { DIRECT_MTU } else { RELAY_MTU };
+            if n > mtu && packet::dont_fragment(&buf[OFF..OFF + n]) {
+                // does not fit the path: the sender lowers its packet size (path MTU discovery);
+                // through relays the path narrows at the first one, so the error comes from it
+                let ip = buf[OFF..OFF + n].to_vec();
+                let relay = (!direct).then(|| self.routes.load().next_hop(&peer)).flatten();
+                let from = relay.and_then(|r| self.overlay_addr(&r, dst.is_ipv6()));
+                self.icmp_from(packet::IcmpError::TooBig(mtu as u16), &ip, from).await;
+                continue;
+            }
             let (Some(session), Some(route)) = (self.links.current(&peer), self.storage.route_by_id(&peer)) else {
                 // no direct session: through the mesh if there is a route (link_loop keeps
                 // trying the direct path meanwhile), else first contact
@@ -1459,7 +1567,15 @@ impl Node {
                 let (limit, probe) = if ttl <= MAX_HOPS { (ttl.max(1), self.new_probe(ip)) } else { (MAX_HOPS, 0) };
                 if !self.send_e2e(peer, KIND_IP, ip, limit, probe).await && self.routes.load().next_hop(&peer).is_none()
                 {
-                    self.handshake(peer, PUNCH_INTERVAL).await;
+                    let nothing_to_try = self.storage.route_by_id(&peer).is_none()
+                        && self.candidates.lock().get(&peer).is_none_or(|c| c.is_empty());
+                    if nothing_to_try {
+                        // no address, no relay: unreachable for now, say so at once
+                        let ip = buf[OFF..OFF + n].to_vec();
+                        self.icmp_back(packet::IcmpError::HostUnreachable, &ip).await;
+                    } else {
+                        self.handshake(peer, PUNCH_INTERVAL).await;
+                    }
                 }
                 continue;
             };

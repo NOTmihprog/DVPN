@@ -111,15 +111,45 @@ fn checksum(parts: &[&[u8]]) -> u16 {
     !(sum as u16)
 }
 
-/// ICMP Time Exceeded (IPv4 type 11 / ICMPv6 type 3) from `from` to the source of the quoted
-/// packet, as a relay on the path would send it, for traceroute through the mesh. `None` if
-/// `from` is not of the quoted packet's family.
-pub fn icmp_time_exceeded(from: IpAddr, quoted: &[u8]) -> Option<Vec<u8>> {
+/// The ICMP errors DVPN generates on behalf of the path (PLAN §6.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IcmpError {
+    /// A relay: the hop limit ran out (traceroute).
+    TimeExceeded,
+    /// No way to the destination node (from a relay, or nothing to try at the source).
+    HostUnreachable,
+    /// The kill switch: the internet is blocked while no gateway is alive.
+    Prohibited,
+    /// Does not fit the path: IPv4 "fragmentation needed" (DF set) / ICMPv6 "packet too big".
+    TooBig(u16),
+}
+
+impl IcmpError {
+    /// (type, code, the 32 bits after the checksum) for IPv4 and IPv6.
+    fn codes(self, v6: bool) -> (u8, u8, u32) {
+        match (self, v6) {
+            (IcmpError::TimeExceeded, false) => (11, 0, 0),
+            (IcmpError::TimeExceeded, true) => (3, 0, 0),
+            (IcmpError::HostUnreachable, false) => (3, 1, 0),
+            (IcmpError::HostUnreachable, true) => (1, 3, 0),
+            (IcmpError::Prohibited, false) => (3, 13, 0),
+            (IcmpError::Prohibited, true) => (1, 1, 0),
+            (IcmpError::TooBig(mtu), false) => (3, 4, u32::from(mtu)),
+            (IcmpError::TooBig(mtu), true) => (2, 0, u32::from(mtu)),
+        }
+    }
+}
+
+/// An ICMP error from `from` to the source of the quoted packet, as a router on the path would
+/// send it. `None` if `from` is not of the quoted packet's family.
+pub fn icmp_error(kind: IcmpError, from: IpAddr, quoted: &[u8]) -> Option<Vec<u8>> {
     let orig = parse_quoted(quoted)?;
+    let (ty, code, rest) = kind.codes(orig.is_ipv6());
+    let mut icmp = vec![ty, code, 0, 0];
+    icmp.extend_from_slice(&rest.to_be_bytes());
+    icmp.extend_from_slice(quoted);
     match (from, orig) {
         (IpAddr::V4(f), IpAddr::V4(to)) => {
-            let mut icmp = vec![11, 0, 0, 0, 0, 0, 0, 0];
-            icmp.extend_from_slice(quoted);
             let c = checksum(&[&icmp]);
             icmp[2..4].copy_from_slice(&c.to_be_bytes());
             let total = IPV4_MIN_HEADER + icmp.len();
@@ -133,8 +163,6 @@ pub fn icmp_time_exceeded(from: IpAddr, quoted: &[u8]) -> Option<Vec<u8>> {
             Some(p)
         }
         (IpAddr::V6(f), IpAddr::V6(to)) => {
-            let mut icmp = vec![3, 0, 0, 0, 0, 0, 0, 0];
-            icmp.extend_from_slice(quoted);
             let len = (icmp.len() as u32).to_be_bytes();
             let c = checksum(&[&f.octets(), &to.octets(), &len, &[0, 0, 0, 58], &icmp]);
             icmp[2..4].copy_from_slice(&c.to_be_bytes());
@@ -147,6 +175,19 @@ pub fn icmp_time_exceeded(from: IpAddr, quoted: &[u8]) -> Option<Vec<u8>> {
             Some(p)
         }
         _ => None,
+    }
+}
+
+/// ICMP Time Exceeded (IPv4 type 11 / ICMPv6 type 3), for traceroute through the mesh.
+pub fn icmp_time_exceeded(from: IpAddr, quoted: &[u8]) -> Option<Vec<u8>> {
+    icmp_error(IcmpError::TimeExceeded, from, quoted)
+}
+
+/// Whether an IPv4 packet has "don't fragment" set (IPv6 packets are never fragmented on the way).
+pub fn dont_fragment(p: &[u8]) -> bool {
+    match version(p) {
+        Some(4) => p.get(6).is_some_and(|b| b & 0x40 != 0),
+        _ => true,
     }
 }
 
@@ -370,5 +411,27 @@ pub(crate) mod tests {
         let len = (icmp.len() as u32).to_be_bytes();
         assert_eq!(super::checksum(&[&r6.octets(), &s6.octets(), &len, &[0, 0, 0, 58], icmp]), 0);
         assert!(icmp_time_exceeded("10.0.0.2".parse().unwrap(), &quote(&p6)).is_none(), "family mismatch");
+    }
+
+    #[test]
+    fn icmp_errors() {
+        let p = v4([10, 0, 0, 1], [10, 0, 0, 3], 64, 1400);
+        let from: IpAddr = "10.0.0.3".parse().unwrap();
+        let tb = icmp_error(IcmpError::TooBig(1368), from, &quote(&p)).unwrap();
+        assert_eq!((tb[20], tb[21]), (3, 4));
+        assert_eq!(u16::from_be_bytes([tb[26], tb[27]]), 1368, "next-hop MTU");
+        assert_eq!(super::checksum(&[&tb[20..]]), 0);
+        let un = icmp_error(IcmpError::HostUnreachable, from, &quote(&p)).unwrap();
+        assert_eq!((un[20], un[21]), (3, 1));
+        let p6 = v6("fd00::1".parse().unwrap(), "fd00::3".parse().unwrap(), 64, 1400);
+        let tb6 = icmp_error(IcmpError::TooBig(1368), "fd00::3".parse().unwrap(), &quote(&p6)).unwrap();
+        assert_eq!((tb6[40], tb6[41]), (2, 0));
+        assert_eq!(u32::from_be_bytes(tb6[44..48].try_into().unwrap()), 1368);
+        let pr6 = icmp_error(IcmpError::Prohibited, "fd00::3".parse().unwrap(), &quote(&p6)).unwrap();
+        assert_eq!((pr6[40], pr6[41]), (1, 1));
+        let mut df = v4([10, 0, 0, 1], [10, 0, 0, 3], 64, 8);
+        assert!(!dont_fragment(&df));
+        df[6] |= 0x40;
+        assert!(dont_fragment(&df));
     }
 }
