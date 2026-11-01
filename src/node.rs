@@ -35,6 +35,9 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(45);
 const PEER_SYNC: Duration = Duration::from_secs(60);
 /// Admins renew certificates that expire sooner than this.
 const RENEW_BEFORE: u64 = 10 * 24 * 3600;
+/// After a psk epoch switch the old psk is still accepted this long, for nodes that learned
+/// about the switch late (PLAN §4.4). Longer than a session lives, so no session is cut short.
+const EPOCH_GRACE_MS: u64 = 10 * 60 * 1000;
 
 /// The node's group: its records, our certificate, and the secret if we are an admin.
 pub struct GroupCtx {
@@ -42,9 +45,17 @@ pub struct GroupCtx {
     pub secret: Option<GroupSecret>,
     pub cert: Cert,
     pub store: Arc<StateStore>,
+    /// The psk epoch we are in (from the config) and its psk.
+    pub epoch: u32,
+    pub psk: [u8; 32],
+    pub identity: Arc<crate::identity::Identity>,
     /// Called with our certificate when an admin renewed it, to persist it.
     pub on_cert: Box<dyn Fn(&Cert) + Send + Sync>,
+    /// Called with (epoch, psk) once a new psk epoch is active, to persist it.
+    pub on_epoch: Box<dyn Fn(u32, [u8; 32]) + Send + Sync>,
 }
+
+type EpochPsk = (u32, [u8; 32]);
 
 /// A packet for an API client: (route, from peer, payload).
 pub type ApiPacket = (u8, NodeId, Vec<u8>);
@@ -64,6 +75,10 @@ pub struct Node {
     /// The verified certificates of peers we have seen, for re-checking them when records change.
     peer_certs: parking_lot::Mutex<HashMap<NodeId, Cert>>,
     last_peer_sync: parking_lot::Mutex<HashMap<NodeId, Instant>>,
+    /// The psk epoch we are in, and the previous one while it is still accepted (until unix ms).
+    psk: parking_lot::Mutex<(EpochPsk, Option<(EpochPsk, u64)>)>,
+    /// Last psk epoch we warned about not having a key for.
+    epoch_warned: std::sync::atomic::AtomicU32,
 }
 
 impl Node {
@@ -89,6 +104,8 @@ impl Node {
             api_tx: OnceLock::new(),
             epoch: Instant::now(),
             cert: parking_lot::RwLock::new(group.cert.clone()),
+            psk: parking_lot::Mutex::new(((group.epoch, group.psk), None)),
+            epoch_warned: std::sync::atomic::AtomicU32::new(0),
             group,
             peer_certs: parking_lot::Mutex::new(HashMap::new()),
             last_peer_sync: parking_lot::Mutex::new(HashMap::new()),
@@ -123,6 +140,7 @@ impl Node {
             self.links.drop_peer(&id);
             self.storage.del_peer(&id);
         }
+        self.update_psks();
         let me = self.storage.self_id();
         if m.revoked.contains(&me) {
             log::error!("Group | this node is revoked from the group");
@@ -175,23 +193,75 @@ impl Node {
         }
         let Some(secret) = &self.group.secret else { return };
         let store = &self.group.store;
-        let renew = cert.grant.is_some() || cert.body.not_after < now_unix() + RENEW_BEFORE;
-        let issued = store.cert(&self.group.id, &id).is_some_and(|c| c.body.not_after > cert.body.not_after);
-        if !renew || issued || !Membership::of(store, &self.group.id).admits(cert) {
+        let g = self.group.id;
+        if !Membership::of(store, &g).admits(cert) {
             return;
         }
-        let mut body = cert.body.clone();
-        body.not_after = now_unix() + CERT_TTL_SECS;
-        body.serial = rand::random();
-        let mut changed = vec![store.add(secret, Body::Cert(Box::new(secret.issue(body))), false)];
-        if let Some(jk) = cert.join_key() {
-            changed.push(store.add(secret, Body::Revoke { key: jk }, false));
-            log::info!("Group | {} joined by invite: regular certificate issued, invite used up", node(id));
-        } else {
-            log::info!("Group | certificate of {} renewed", node(id));
+        let mut changed = Vec::new();
+        let renew = cert.grant.is_some() || cert.body.not_after < now_unix() + RENEW_BEFORE;
+        let issued = store.cert(&g, &id).is_some_and(|c| c.body.not_after > cert.body.not_after);
+        if renew && !issued {
+            let mut body = cert.body.clone();
+            body.not_after = now_unix() + CERT_TTL_SECS;
+            body.serial = rand::random();
+            changed.push(store.add(secret, Body::Cert(Box::new(secret.issue(body))), false));
+            if let Some(jk) = cert.join_key() {
+                changed.push(store.add(secret, Body::Revoke { key: jk }, false));
+                log::info!("Group | {} joined by invite: regular certificate issued, invite used up", node(id));
+            } else {
+                log::info!("Group | certificate of {} renewed", node(id));
+            }
+        }
+        // a member that joined after the last psk change needs that epoch's psk too
+        if let Some((n, _)) = store.epoch(&g)
+            && !store.has_epoch_key(&g, &id, n)
+        {
+            changed.push(store.add(secret, crate::state::seal_psk(&g, &id, n, &secret.psk(n)), false));
+        }
+        if changed.is_empty() {
+            return;
         }
         self.apply(&changed);
         self.spread(&changed).await;
+    }
+
+    /// Follows the psk epoch records: accept a new psk as soon as we have it, send with it from
+    /// its switch time on, keep accepting the old one for a while after.
+    fn update_psks(&self) {
+        let g = &self.group;
+        let now = crate::state::now_ms();
+        let mut st = self.psk.lock();
+        let (cur, _) = *st;
+        let mut next = None;
+        if let Some((n, at)) = g.store.epoch(&g.id)
+            && n > cur.0
+        {
+            let psk = match &g.secret {
+                Some(secret) => Some(secret.psk(n)),
+                None => g.store.epoch_psk(&g.id, &g.identity, n),
+            };
+            match psk {
+                Some(psk) if now >= at => {
+                    log::info!("Group | psk epoch {n} active");
+                    *st = ((n, psk), Some((cur, at + EPOCH_GRACE_MS)));
+                    (g.on_epoch)(n, psk);
+                }
+                Some(psk) => next = Some((n, psk)),
+                None => {
+                    let warned = &self.epoch_warned;
+                    if now >= at && warned.swap(n, std::sync::atomic::Ordering::Relaxed) != n {
+                        log::warn!("Group | psk epoch {n} is active but there is no key for this node");
+                    }
+                }
+            }
+        }
+        let (cur, prev) = *st;
+        let prev = prev.filter(|(_, until)| now < *until).map(|(p, _)| p);
+        if st.1.is_some() && prev.is_none() {
+            st.1 = None;
+        }
+        drop(st);
+        self.links.set_psks(cur, next.or(prev));
     }
 
     async fn sync_peer(&self, peer: NodeId) {
@@ -220,6 +290,7 @@ impl Node {
 
     pub fn start(self: &Arc<Self>) {
         self.links.set_membership(Membership::of(&self.group.store, &self.group.id));
+        self.update_psks();
         {
             let me = self.clone();
             tokio::spawn(async move {
@@ -326,6 +397,7 @@ impl Node {
             let changed = self.group.store.reload();
             self.apply(&changed);
             self.spread(&changed).await;
+            self.update_psks();
             for (id, link) in self.storage.links() {
                 if link.last_seen.unwrap_or(link.since).elapsed() > LINK_TIMEOUT {
                     log::info!("Link | peer {} timed out, endpoint dropped", node(id));

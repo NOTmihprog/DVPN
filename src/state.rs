@@ -7,9 +7,14 @@
 //! restarts. Stage 6 adds node info and settings to the same store.
 //!
 //! ```text
-//! revoke/<key>   Revoke { key }   certificates of `key`, or made with join key `key`, are invalid
-//! cert/<node>    Cert(cert)       a certificate an admin issued or renewed for `node`
+//! revoke/<key>     Revoke { key }    certificates of `key`, or made with join key `key`, are invalid
+//! cert/<node>      Cert(cert)        a certificate an admin issued or renewed for `node`
+//! epoch            Epoch             psk epoch `epoch` is used from `active_from` on (PLAN §4.4, §5.2)
+//! epochkey/<node>  EpochKey          that epoch's psk, sealed to `node`'s key
 //! ```
+//!
+//! The psk of a new epoch is sealed to each member separately (X25519 with the node key), so a
+//! revoked node, which gets no sealed copy, cannot read it although every record is public.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,7 +26,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::group::{Cert, GroupId, GroupSecret};
-use crate::identity::NodeId;
+use crate::identity::{Identity, NodeId};
 
 pub type RecordKey = [u8; 16];
 
@@ -41,8 +46,21 @@ pub fn now_ms() -> u64 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Body {
-    Revoke { key: NodeId },
+    Revoke {
+        key: NodeId,
+    },
     Cert(Box<Cert>),
+    /// Unix milliseconds.
+    Epoch {
+        epoch: u32,
+        active_from: u64,
+    },
+    EpochKey {
+        node: NodeId,
+        epoch: u32,
+        eph: [u8; 32],
+        sealed: Vec<u8>,
+    },
 }
 
 impl Body {
@@ -50,8 +68,44 @@ impl Body {
         match self {
             Body::Revoke { key } => format!("revoke/{key}"),
             Body::Cert(c) => format!("cert/{}", c.body.node),
+            Body::Epoch { .. } => "epoch".into(),
+            Body::EpochKey { node, .. } => format!("epochkey/{node}"),
         }
     }
+}
+
+fn epoch_seal_key(
+    group: &GroupId,
+    node: &NodeId,
+    epoch: u32,
+    eph: &[u8; 32],
+    shared: &[u8; 32],
+) -> chacha20poly1305::Key {
+    let mut k = [0u8; 32];
+    let info: [&[u8]; 5] = [b"dvpn/4 epoch psk", group.as_bytes(), node.as_bytes(), &epoch.to_le_bytes(), eph];
+    hkdf::Hkdf::<sha2::Sha256>::new(None, shared).expand_multi_info(&info, &mut k).expect("32 bytes");
+    k.into()
+}
+
+/// The psk of `epoch` sealed to `node` (an `EpochKey` body).
+pub fn seal_psk(group: &GroupId, node: &NodeId, epoch: u32, psk: &[u8; 32]) -> Body {
+    use chacha20poly1305::aead::Aead;
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+    let secret = x25519_dalek::StaticSecret::from(crate::crypto::random_bytes::<32>());
+    let eph = x25519_dalek::PublicKey::from(&secret).to_bytes();
+    let shared = secret.diffie_hellman(&node.x25519_public());
+    let key = epoch_seal_key(group, node, epoch, &eph, shared.as_bytes());
+    // the key is used once (fresh ephemeral), so a zero nonce is fine
+    let sealed = ChaCha20Poly1305::new(&key).encrypt(&Default::default(), &psk[..]).expect("encrypt");
+    Body::EpochKey { node: *node, epoch, eph, sealed }
+}
+
+fn open_psk(group: &GroupId, identity: &Identity, epoch: u32, eph: &[u8; 32], sealed: &[u8]) -> Option<[u8; 32]> {
+    use chacha20poly1305::aead::Aead;
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+    let shared = identity.x25519_secret().diffie_hellman(&x25519_dalek::PublicKey::from(*eph));
+    let key = epoch_seal_key(group, &identity.id(), epoch, eph, shared.as_bytes());
+    ChaCha20Poly1305::new(&key).decrypt(&Default::default(), sealed).ok()?.try_into().ok()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,7 +175,7 @@ impl Record {
             && match &e.body {
                 // signed by the group anyway, but must be a valid certificate of this group
                 Body::Cert(c) => c.verify(&e.group, None).is_ok(),
-                Body::Revoke { .. } => true,
+                Body::Revoke { .. } | Body::Epoch { .. } | Body::EpochKey { .. } => true,
             };
         if !consistent {
             return Err(RecordError::Inconsistent);
@@ -315,6 +369,50 @@ impl StateStore {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The newest psk epoch and its switch time (unix ms), if one was announced.
+    pub fn epoch(&self, group: &GroupId) -> Option<(u32, u64)> {
+        let inner = self.inner.lock();
+        inner.live(group).find_map(|e| match e.body {
+            Body::Epoch { epoch, active_from } => Some((epoch, active_from)),
+            _ => None,
+        })
+    }
+
+    /// The psk of `epoch` sealed to us, if there is one.
+    pub fn epoch_psk(&self, group: &GroupId, identity: &Identity, epoch: u32) -> Option<[u8; 32]> {
+        let inner = self.inner.lock();
+        let s = inner.groups.get(group)?.get(&record_key(group, &format!("epochkey/{}", identity.id())))?;
+        match &s.entry.body {
+            Body::EpochKey { epoch: e, eph, sealed, .. } if *e == epoch && !s.entry.deleted => {
+                open_psk(group, identity, epoch, eph, sealed)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `node` has the psk of `epoch` sealed to it.
+    pub fn has_epoch_key(&self, group: &GroupId, node: &NodeId, epoch: u32) -> bool {
+        let inner = self.inner.lock();
+        inner
+            .live(group)
+            .any(|e| matches!(e.body, Body::EpochKey { node: n, epoch: x, .. } if n == *node && x == epoch))
+    }
+
+    /// Starts psk epoch `after + 1` (or the next after any announced one) at `now + lead_ms`:
+    /// the epoch record and the new psk sealed to every member with an issued certificate that is
+    /// not revoked. Returns the new records.
+    pub fn rotate(&self, secret: &GroupSecret, after: u32, lead_ms: u64) -> Vec<Entry> {
+        let g = secret.id();
+        let epoch = self.epoch(&g).map_or(after, |(e, _)| e.max(after)) + 1;
+        let psk = secret.psk(epoch);
+        let m = Membership::of(self, &g);
+        let mut out = vec![self.add(secret, Body::Epoch { epoch, active_from: now_ms() + lead_ms }, false)];
+        for c in self.certs(&g).iter().filter(|c| m.admits(c)) {
+            out.push(self.add(secret, seal_psk(&g, &c.body.node, epoch, &psk), false));
+        }
+        out
     }
 
     pub fn summary(&self, group: &GroupId) -> Vec<(RecordKey, u64)> {
@@ -576,6 +674,38 @@ mod tests {
         s.add(&g, Body::Revoke { key: a }, false);
         let m = Membership::of(&s, &g.id());
         assert!(!m.admits(&ca) && !m.admits(&g.issue(ca.body.clone())));
+    }
+
+    #[test]
+    fn psk_rotation_reaches_members_only() {
+        let g = GroupSecret::generate();
+        let s = StateStore::memory();
+        let (a, b, x) = (Identity::generate(), Identity::generate(), Identity::generate());
+        for i in [&a, &b, &x] {
+            s.add(&g, Body::Cert(Box::new(g.issue(CertBody::new(i.id(), "n", vec![])))), false);
+        }
+        s.add(&g, Body::Revoke { key: x.id() }, false);
+        let changed = s.rotate(&g, 0, 60_000);
+        assert_eq!(changed.len(), 3, "epoch + a + b, not the revoked x");
+        let (epoch, at) = s.epoch(&g.id()).unwrap();
+        assert_eq!(epoch, 1);
+        assert!(at > now_ms());
+        assert_eq!(s.epoch_psk(&g.id(), &a, 1), Some(g.psk(1)));
+        assert_eq!(s.epoch_psk(&g.id(), &b, 1), Some(g.psk(1)));
+        assert_eq!(s.epoch_psk(&g.id(), &x, 1), None);
+        assert_eq!(s.epoch_psk(&g.id(), &a, 2), None);
+        // the record must be readable only with a's key
+        let Some(Body::EpochKey { eph, sealed, .. }) = s.inner.lock().live(&g.id()).find_map(|e| match &e.body {
+            Body::EpochKey { node, .. } if *node == a.id() => Some(e.body.clone()),
+            _ => None,
+        }) else {
+            panic!()
+        };
+        assert_eq!(open_psk(&g.id(), &b, 1, &eph, &sealed), None);
+        assert!(
+            s.rotate(&g, 0, 0).len() == 3 && s.epoch(&g.id()).unwrap().0 == 2,
+            "next rotation goes on from the announced epoch"
+        );
     }
 
     #[test]

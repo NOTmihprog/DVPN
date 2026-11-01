@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use rand::RngExt;
 
@@ -161,6 +162,7 @@ fn data_receiver_idx(packet: &[u8]) -> Option<u32> {
 struct Pending {
     peer: NodeId,
     initiator: Initiator,
+    key: Arc<Key>,
     sent: Instant,
 }
 
@@ -225,6 +227,22 @@ pub enum Received {
     Data { session: Arc<Session>, plain: Range<usize> },
 }
 
+/// One psk of the group and the header protection derived from it. Sessions remember the key
+/// their handshake used (through its `Obfs`).
+pub struct Key {
+    pub epoch: u32,
+    psk: [u8; 32],
+    obfs: Arc<Obfs>,
+}
+
+/// The psk to send with, and all psks accepted (the send one first). Two during a psk epoch
+/// change (PLAN §4.4): before the switch we send with the old one and accept both, after it we
+/// send with the new one and still accept the old one for a while.
+struct Keys {
+    send: Arc<Key>,
+    accept: Vec<Arc<Key>>,
+}
+
 pub struct Links {
     identity: Arc<Identity>,
     group: Group,
@@ -232,21 +250,51 @@ pub struct Links {
     cert: RwLock<Cert>,
     /// Revocations from the group records.
     membership: RwLock<Membership>,
-    obfs: Arc<Obfs>,
+    keys: ArcSwap<Keys>,
     inner: RwLock<Inner>,
 }
 
 impl Links {
     pub fn new(identity: Arc<Identity>, group: Group) -> Self {
-        let obfs = Arc::new(Obfs::new(&group.psk, group.obfs.clone()));
+        let key = Arc::new(Key { epoch: 0, psk: group.psk, obfs: Arc::new(Obfs::new(&group.psk, group.obfs.clone())) });
         Links {
             identity,
             cert: RwLock::new(group.cert.clone()),
             group,
             membership: RwLock::new(Membership::default()),
-            obfs,
+            keys: ArcSwap::from_pointee(Keys { send: key.clone(), accept: vec![key] }),
             inner: RwLock::new(Inner::default()),
         }
+    }
+
+    /// Sets the psk to send with (`send`) and an extra accepted one (`also`), as (epoch, psk).
+    /// Keys already in use are kept, so their sessions go on.
+    pub fn set_psks(&self, send: (u32, [u8; 32]), also: Option<(u32, [u8; 32])>) {
+        let cur = self.keys.load();
+        let make = |(epoch, psk): (u32, [u8; 32])| {
+            cur.accept.iter().find(|k| k.psk == psk).cloned().unwrap_or_else(|| {
+                Arc::new(Key { epoch, psk, obfs: Arc::new(Obfs::new(&psk, self.group.obfs.clone())) })
+            })
+        };
+        let send = make(send);
+        let mut accept = vec![send.clone()];
+        if let Some(a) = also.filter(|a| a.1 != send.psk) {
+            accept.push(make(a));
+        }
+        if cur.send.psk == send.psk && cur.accept.len() == accept.len() {
+            return;
+        }
+        log::info!(
+            "Link | sending with psk epoch {}, accepting {:?}",
+            send.epoch,
+            accept.iter().map(|k| k.epoch).collect::<Vec<_>>()
+        );
+        self.keys.store(Arc::new(Keys { send, accept }));
+    }
+
+    /// The psk epoch handshakes are sent with.
+    pub fn send_epoch(&self) -> u32 {
+        self.keys.load().send.epoch
     }
 
     /// Sends this certificate in handshakes from now on.
@@ -261,12 +309,12 @@ impl Links {
     }
 
     /// Pads and masks a finished handshake packet in `out` (header with a zero pad field).
-    fn finish_handshake(&self, ty: u8, mut out: Vec<u8>) -> Vec<u8> {
+    fn finish_handshake(&self, key: &Key, ty: u8, mut out: Vec<u8>) -> Vec<u8> {
         let len = out.len();
-        let pad = self.obfs.pad_len(ty, len, MAX_PAD);
+        let pad = key.obfs.pad_len(ty, len, MAX_PAD);
         out[1..3].copy_from_slice(&pad.to_le_bytes());
         out.resize(len + pad as usize, 0);
-        let n = self.obfs.finish(&mut out, len, pad);
+        let n = key.obfs.finish(&mut out, len, pad);
         out.truncate(n);
         out
     }
@@ -307,6 +355,7 @@ impl Links {
         if st.last_init_sent.is_some_and(|t| t.elapsed() < min_interval) {
             return None;
         }
+        let key = self.keys.load().send.clone();
         st.last_init_sent = Some(Instant::now());
         let idx = inner.fresh_idx();
         let mut out = Vec::with_capacity(HS_INIT_HDR + noise::INIT_OVERHEAD + 64 + MAX_PAD);
@@ -315,17 +364,16 @@ impl Links {
         let remote = peer.x25519_public().to_bytes();
         let (e, repr) = elligator::ephemeral();
         let ini =
-            Initiator::start(self.identity.x25519_secret(), &remote, &self.group.psk, e, &self.payload(), &mut out)
-                .ok()?;
+            Initiator::start(self.identity.x25519_secret(), &remote, &key.psk, e, &self.payload(), &mut out).ok()?;
         out[HS_INIT_HDR..HS_INIT_HDR + 32].copy_from_slice(&repr);
-        inner.pending.insert(idx, Pending { peer, initiator: ini, sent: Instant::now() });
+        inner.pending.insert(idx, Pending { peer, initiator: ini, key: key.clone(), sent: Instant::now() });
         drop(inner);
-        let mut packets = self.obfs.prelude();
-        packets.push(self.finish_handshake(HS_INIT, out));
+        let mut packets = key.obfs.prelude();
+        packets.push(self.finish_handshake(&key, HS_INIT, out));
         Some(packets)
     }
 
-    fn handle_init(&self, packet: &[u8]) -> Option<Received> {
+    fn handle_init(&self, key: &Key, packet: &[u8]) -> Option<Received> {
         let sender_idx = u32::from_le_bytes(packet.get(3..HS_INIT_HDR)?.try_into().unwrap());
         let msg = with_decoded_ephemeral(&packet[HS_INIT_HDR..])?;
         let (resp, rs, payload) = Responder::read(self.identity.x25519_secret(), &msg).ok()?;
@@ -349,21 +397,22 @@ impl Links {
         out.extend_from_slice(&idx.to_le_bytes());
         out.extend_from_slice(&sender_idx.to_le_bytes());
         let (e, repr) = elligator::ephemeral();
-        let transport = resp.reply(&self.group.psk, e, &self.payload(), &mut out).ok()?;
+        // answer with the psk the initiator masked its packet with
+        let transport = resp.reply(&key.psk, e, &self.payload(), &mut out).ok()?;
         out[HS_RESP_HDR..HS_RESP_HDR + 32].copy_from_slice(&repr);
-        inner.install(Arc::new(Session::new(peer, idx, sender_idx, transport, self.obfs.clone(), false)));
+        inner.install(Arc::new(Session::new(peer, idx, sender_idx, transport, key.obfs.clone(), false)));
         drop(inner);
-        Some(Received::Handshake { peer, cert: Box::new(cert), reply: Some(self.finish_handshake(HS_RESP, out)) })
+        Some(Received::Handshake { peer, cert: Box::new(cert), reply: Some(self.finish_handshake(key, HS_RESP, out)) })
     }
 
-    fn handle_resp(&self, packet: &[u8]) -> Option<Received> {
+    fn handle_resp(&self, key: &Arc<Key>, packet: &[u8]) -> Option<Received> {
         let sender_idx = u32::from_le_bytes(packet.get(3..7)?.try_into().unwrap());
         let receiver_idx = u32::from_le_bytes(packet.get(7..HS_RESP_HDR)?.try_into().unwrap());
         // Verify before removing the pending handshake: the index travels in clear, so a forged
         // HS_RESP must not be able to cancel it.
         let (peer, ini) = {
             let inner = self.inner.read();
-            let p = inner.pending.get(&receiver_idx)?;
+            let p = inner.pending.get(&receiver_idx).filter(|p| Arc::ptr_eq(&p.key, key))?;
             (p.peer, p.initiator.clone())
         };
         let (transport, payload) = ini.finish(&with_decoded_ephemeral(&packet[HS_RESP_HDR..])?).ok()?;
@@ -371,14 +420,14 @@ impl Links {
         let cert = self.member_cert(&payload).filter(|c| c.body.node == peer)?;
         let mut inner = self.inner.write();
         inner.pending.remove(&receiver_idx)?;
-        inner.install(Arc::new(Session::new(peer, receiver_idx, sender_idx, transport, self.obfs.clone(), true)));
+        inner.install(Arc::new(Session::new(peer, receiver_idx, sender_idx, transport, key.obfs.clone(), true)));
         Some(Received::Handshake { peer, cert: Box::new(cert), reply: None })
     }
 
-    fn handle_data(&self, packet: &mut [u8]) -> Option<Received> {
+    fn handle_data(&self, key: &Key, packet: &mut [u8]) -> Option<Received> {
         let idx = data_receiver_idx(packet)?;
         let session = self.inner.read().by_idx.get(&idx)?.clone();
-        if !session.usable() {
+        if !session.usable() || !Arc::ptr_eq(&session.obfs, &key.obfs) {
             return None;
         }
         let plain = session.open(packet)?;
@@ -392,12 +441,30 @@ impl Links {
     /// Handles a wire packet from a peer: unmasks it, then processes the HS_INIT, HS_RESP or DATA
     /// inside. Packets that do not authenticate give `None`. `Data::plain` indexes into `packet`.
     pub fn receive(&self, packet: &mut [u8]) -> Option<Received> {
-        let len = self.obfs.open(packet)?;
+        let keys = self.keys.load();
+        if let [key] = keys.accept.as_slice() {
+            return self.receive_with(key, packet);
+        }
+        // During a psk change: unmasking is in place, so each further key starts from a copy.
+        let orig = packet.to_vec();
+        for (i, key) in keys.accept.iter().enumerate() {
+            if i > 0 {
+                packet.copy_from_slice(&orig);
+            }
+            if let Some(r) = self.receive_with(key, packet) {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    fn receive_with(&self, key: &Arc<Key>, packet: &mut [u8]) -> Option<Received> {
+        let len = key.obfs.open(packet)?;
         let packet = &mut packet[..len];
         match packet[0] {
-            HS_INIT => self.handle_init(packet),
-            HS_RESP => self.handle_resp(packet),
-            DATA => self.handle_data(packet),
+            HS_INIT => self.handle_init(key, packet),
+            HS_RESP => self.handle_resp(key, packet),
+            DATA => self.handle_data(key, packet),
             _ => None,
         }
     }
@@ -529,6 +596,31 @@ mod tests {
         a.links.set_membership(Membership { revoked: [b.id].into(), ..Default::default() });
         b.links.set_membership(Membership::default());
         assert!(!handshake(&b, &a) && !handshake(&a, &b), "a refuses revoked b, also as initiator");
+    }
+
+    #[test]
+    fn psk_change_with_overlap() {
+        let (a, b) = pair();
+        let (p0, p1) = (a.links.group.psk, [7u8; 32]);
+        assert!(handshake(&a, &b));
+        let old = data(&a, &b.id, b"old").unwrap();
+        // a has switched to epoch 1 already, b has the record but not reached the switch time
+        a.links.set_psks((1, p1), Some((0, p0)));
+        b.links.set_psks((0, p0), Some((1, p1)));
+        assert_eq!(deliver(&b, old).unwrap().1[1..], *b"old", "session from before the change goes on");
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(handshake(&a, &b), "a sends with the new psk, b accepts it");
+        assert!(deliver(&b, data(&a, &b.id, b"x").unwrap()).is_some());
+        assert!(deliver(&a, data(&b, &a.id, b"y").unwrap()).is_some());
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(handshake(&b, &a), "b still sends with the old psk, a still accepts it");
+        assert!(deliver(&a, data(&b, &a.id, b"z").unwrap()).is_some());
+        // after the grace period only the new psk counts
+        a.links.set_psks((1, p1), None);
+        b.links.set_psks((0, p0), None);
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(!handshake(&a, &b) && !handshake(&b, &a), "different psks, no overlap: no session");
+        assert_eq!(a.links.send_epoch(), 1);
     }
 
     #[test]

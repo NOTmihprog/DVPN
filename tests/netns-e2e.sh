@@ -232,13 +232,25 @@ ok "invite certificates replaced by regular ones"
 # Revocation (before the roaming check, which leaves A without a tracker session for a
 # while): the admin revokes B with the CLI while its node runs; the node spreads the record
 # (tracker + direct), C drops B and B can no longer reach anybody.
-"$D" --dir "$W/a" group revoke b >/dev/null || fail "group revoke"
+"$D" --dir "$W/a" group revoke b --in 6 >/dev/null || fail "group revoke"
 wait_for 20 grep -q 'revoked, dropped' "$W/node-c.log" || fail "c did not drop revoked b"
 wait_for 20 grep -q 'this node is revoked' "$W/node-b.log" || fail "b did not learn it is revoked"
 ! nsx c ping -c2 -W1 10.10.33.2 >/dev/null 2>&1 || fail "c still reaches revoked b"
 ! nsx b ping -c2 -W1 10.10.33.1 >/dev/null 2>&1 || fail "revoked b still reaches a"
 nsx a ping -c2 -W1 10.10.33.3 >/dev/null || fail "a -> c broken by the revocation"
 ok "revoked b is cut off, a <-> c unaffected"
+
+# The revocation also changed the group psk (sealed to A and C only), switching 6 s later;
+# A and C keep talking across the switch, B does not get the new psk.
+for n in a c; do
+    wait_for 20 grep -q 'psk epoch 1 active' "$W/node-$n.log" || fail "$n did not switch to psk epoch 1"
+done
+grep -q '^epoch = 1' c/config.toml || fail "c did not save the new psk epoch"
+grep -q '^epoch = 0' b/config.toml || fail "revoked b got the new psk"
+sleep 1
+nsx a ping -c3 -i0.2 -W1 10.10.33.3 >/dev/null || fail "a -> c lost after the psk change"
+nsx c ping -c3 -i0.2 -W1 10.10.33.1 >/dev/null || fail "c -> a lost after the psk change"
+ok "psk changed after the revocation, a <-> c unaffected"
 
 # Roaming: nat1 gets a new public address, so A's packets suddenly come from elsewhere
 # (removing the address also drops nat1's masquerade mappings). C must follow A to the new

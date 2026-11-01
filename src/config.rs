@@ -471,6 +471,22 @@ impl Config {
         true
     }
 
+    /// Records the psk epoch now in force (members store its psk; admins derive it).
+    pub fn set_group_epoch(&mut self, id: &GroupId, epoch: u32, psk: &[u8; 32]) -> bool {
+        let Some(i) = self.groups.iter().position(|g| &g.id == id) else { return false };
+        let g = &mut self.groups[i];
+        g.epoch = epoch;
+        g.psk = *psk;
+        let admin = g.secret.is_some();
+        if let Some(t) = self.doc.get_mut("groups").and_then(Item::as_array_of_tables_mut).and_then(|a| a.get_mut(i)) {
+            t["epoch"] = value(i64::from(epoch));
+            if !admin {
+                t["psk"] = value(encode_b64(psk));
+            }
+        }
+        true
+    }
+
     pub fn remove_group(&mut self, id: &GroupId) -> bool {
         let Some(i) = self.groups.iter().position(|g| &g.id == id) else { return false };
         self.groups.remove(i);

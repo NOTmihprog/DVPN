@@ -116,7 +116,8 @@ enum GroupCommand {
         #[arg(short = 'g', long)]
         group: Option<String>,
     },
-    /// Exclude a node from the group (admins only); a running node spreads it within seconds
+    /// Exclude a node from the group (admins only) and change the group psk; a running node of
+    /// this admin spreads it within seconds
     Revoke {
         /// Node key, a unique key prefix, or a member name (see `group members`)
         #[arg(allow_hyphen_values = true)]
@@ -124,6 +125,21 @@ enum GroupCommand {
         /// Group name or id (default: the only group)
         #[arg(short = 'g', long)]
         group: Option<String>,
+        /// Seconds until the new psk is used (members need to receive it first)
+        #[arg(long = "in", default_value_t = 120)]
+        lead: u64,
+        /// Keep the group psk (the revoked node can then still unmask packet headers)
+        #[arg(long)]
+        no_rotate: bool,
+    },
+    /// Change the group psk (admins only), e.g. if it may have leaked
+    Rotate {
+        /// Group name or id (default: the only group)
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+        /// Seconds until the new psk is used (members need to receive it first)
+        #[arg(long = "in", default_value_t = 120)]
+        lead: u64,
     },
     /// Leave a group (removes it from config.toml)
     Leave {
@@ -183,6 +199,16 @@ fn pick_group<'a>(conf: &'a Config, group: &Option<String>) -> &'a GroupConfig {
         None if conf.groups.is_empty() => die("not in any group"),
         None => die("give the group with --group"),
     }
+}
+
+fn epoch_of(changed: &[dvpn::state::Entry]) -> u32 {
+    changed
+        .iter()
+        .find_map(|e| match e.body {
+            Body::Epoch { epoch, .. } => Some(epoch),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
@@ -335,7 +361,20 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
                 println!("No records yet: members appear once an admin node has seen them online.");
             }
         }
-        GroupCommand::Revoke { node, group } => {
+        GroupCommand::Rotate { group, lead } => {
+            let g = pick_group(conf, &group);
+            let Some(secret) = &g.secret else { die(format!("only admins of {} can change the psk", g.name)) };
+            let store = state();
+            let changed = store.rotate(secret, g.epoch, lead * 1000);
+            store.save();
+            println!(
+                "psk epoch {} of group {} starts in {lead} s, sealed to {} members",
+                epoch_of(&changed),
+                g.name,
+                changed.len() - 1
+            );
+        }
+        GroupCommand::Revoke { node, group, lead, no_rotate } => {
             let g = pick_group(conf, &group);
             let Some(secret) = &g.secret else { die(format!("only admins of {} can revoke", g.name)) };
             let store = state();
@@ -359,10 +398,14 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
                 die("an admin cannot revoke itself; leave the group instead");
             }
             store.add(secret, Body::Revoke { key }, false);
-            store.save();
             let name =
                 certs.iter().find(|c| c.body.node == key).map_or_else(String::new, |c| format!(" ({})", c.body.name));
             println!("Revoked {key}{name} in group {}", g.name);
+            if !no_rotate {
+                let changed = store.rotate(secret, g.epoch, lead * 1000);
+                println!("New group psk (epoch {}) starts in {lead} s", epoch_of(&changed));
+            }
+            store.save();
             println!("A running node of this admin spreads it to the trackers and members within seconds.");
         }
         GroupCommand::Leave { group } => {
@@ -469,17 +512,28 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         .map(|s| TrackerClient::new(s.name.clone(), s.addr, s.key, identity.clone(), vec![cert.clone()], store.clone()))
         .collect();
     let group_id = group.id;
+    let dir2 = dir.clone();
     let ctx = node::GroupCtx {
         id: group.id,
         secret: group.secret.clone(),
         cert: cert.clone(),
         store,
+        epoch: group.epoch,
+        psk: group.psk,
+        identity: identity.clone(),
         on_cert: Box::new(move |c| match Config::load(&dir) {
             Ok(mut conf) => {
                 conf.set_group_cert(&group_id, c);
                 conf.save();
             }
             Err(e) => log::warn!("Config | renewed certificate not saved: {e:#}"),
+        }),
+        on_epoch: Box::new(move |epoch, psk| match Config::load(&dir2) {
+            Ok(mut conf) => {
+                conf.set_group_epoch(&group_id, epoch, &psk);
+                conf.save();
+            }
+            Err(e) => log::warn!("Config | new psk epoch not saved: {e:#}"),
         }),
     };
     let node = node::Node::new(storage.clone(), transport, links, clients, tun, self_addr, ctx);
