@@ -7,6 +7,7 @@ use rand::RngExt;
 use tokio::sync::mpsc;
 use tun_rs::AsyncDevice;
 
+use crate::ckr::CkrTable;
 use crate::group::{CERT_TTL_SECS, Cert, GroupId, GroupSecret, now_unix};
 use crate::identity::NodeId;
 use crate::link::{Links, Received};
@@ -59,6 +60,8 @@ pub struct GroupCtx {
     pub on_epoch: Box<dyn Fn(u32, [u8; 32]) + Send + Sync>,
     /// `[[static_peers]]`: connected to directly, without a tracker (PLAN §10).
     pub statics: Vec<crate::group::StaticRef>,
+    /// `[ckr.remote_subnets]`: manual routes on top of the members' certificates (PLAN §7).
+    pub routes: Vec<crate::ckr::Route>,
 }
 
 type EpochPsk = (u32, [u8; 32]);
@@ -80,6 +83,10 @@ pub struct Node {
     cert: parking_lot::RwLock<Cert>,
     /// The verified certificates of peers we have seen, for re-checking them when records change.
     peer_certs: parking_lot::Mutex<HashMap<NodeId, Cert>>,
+    /// Destination -> node, from `peer_certs` and the manual routes (rebuilt when they change).
+    ckr: arc_swap::ArcSwap<CkrTable>,
+    /// System routes for the CKR table, with the prefixes already on the TUN interface.
+    sys_routes: parking_lot::Mutex<Option<(crate::sysroute::SysRoutes, Vec<ipnet::IpNet>)>>,
     /// Further addresses to try for peers without a session (PLAN §9.1): the candidates they
     /// announced to the tracker, or all addresses of a static peer.
     candidates: parking_lot::Mutex<HashMap<NodeId, Vec<SocketAddr>>>,
@@ -117,6 +124,8 @@ impl Node {
             epoch_warned: std::sync::atomic::AtomicU32::new(0),
             group,
             peer_certs: parking_lot::Mutex::new(HashMap::new()),
+            ckr: arc_swap::ArcSwap::from_pointee(CkrTable::default()),
+            sys_routes: parking_lot::Mutex::new(None),
             candidates: parking_lot::Mutex::new(HashMap::new()),
             last_peer_sync: parking_lot::Mutex::new(HashMap::new()),
         })
@@ -124,6 +133,42 @@ impl Node {
 
     pub fn group_id(&self) -> GroupId {
         self.group.id
+    }
+
+    /// The CKR table now in use.
+    pub fn ckr(&self) -> Arc<CkrTable> {
+        self.ckr.load_full()
+    }
+
+    /// Rebuilds the CKR table: every member's certificate prefixes and IPv6 ULA (sorted by key,
+    /// so conflicts resolve the same way everywhere), then the manual routes over them.
+    fn rebuild_ckr(&self) {
+        let certs = self.peer_certs.lock();
+        let mut peers: Vec<&Cert> = certs.values().collect();
+        peers.sort_by_key(|c| c.body.node);
+        let mut routes = Vec::new();
+        for c in peers {
+            let target = crate::ckr::Target::Node(c.body.node);
+            for net in &c.body.prefixes {
+                routes.push(crate::ckr::Route { net: net.trunc(), target, system: true });
+            }
+            let ula = crate::ckr::ula_addr(&self.group.id, &c.body.node);
+            routes.push(crate::ckr::Route { net: ipnet::IpNet::from(IpAddr::V6(ula)), target, system: false });
+        }
+        drop(certs);
+        routes.extend(self.group.routes.iter().copied());
+        let table = CkrTable::new(routes);
+        if let Some((sys, connected)) = self.sys_routes.lock().as_mut() {
+            let wanted = crate::sysroute::wanted(table.routes(), connected);
+            tokio::task::block_in_place(|| sys.apply(&wanted));
+        }
+        self.ckr.store(Arc::new(table));
+    }
+
+    /// Manage system routes for the overlay on the TUN interface `tun` (whose own prefixes
+    /// are `connected`). Call before `start`.
+    pub fn manage_routes(&self, tun: &str, connected: Vec<ipnet::IpNet>) {
+        *self.sys_routes.lock() = Some((crate::sysroute::SysRoutes::new(tun), connected));
     }
 
     pub fn store(&self) -> &StateStore {
@@ -147,6 +192,7 @@ impl Node {
         for id in gone {
             log::info!("Group | {} revoked, dropped", node(id));
             self.peer_certs.lock().remove(&id);
+            self.rebuild_ckr();
             self.links.drop_peer(&id);
             self.storage.del_peer(&id);
         }
@@ -199,7 +245,19 @@ impl Node {
     async fn member_seen(&self, cert: &Cert) {
         let id = cert.body.node;
         if id != self.storage.self_id() {
-            self.peer_certs.lock().insert(id, cert.clone());
+            let changed = {
+                let mut certs = self.peer_certs.lock();
+                match certs.get(&id) {
+                    Some(old) if old == cert || old.body.not_after > cert.body.not_after => false,
+                    _ => {
+                        certs.insert(id, cert.clone());
+                        true
+                    }
+                }
+            };
+            if changed {
+                self.rebuild_ckr();
+            }
         }
         let Some(secret) = &self.group.secret else { return };
         if !crate::clock::trusted() {
@@ -302,6 +360,7 @@ impl Node {
     }
 
     pub fn start(self: &Arc<Self>) {
+        self.rebuild_ckr();
         self.links.set_membership(Membership::of(&self.group.store, &self.group.id));
         self.update_psks();
         {
@@ -610,11 +669,10 @@ impl Node {
                 match kind {
                     KIND_IP => {
                         let Some(tun) = &self.tun else { return };
-                        // A peer may only inject packets from its own LAN address.
-                        let own = matches!(
-                            packet::parse(body),
-                            Some(IpInfo { src: IpAddr::V4(src), .. }) if storage.peer_addr(&peer) == Some(src)
-                        );
+                        // Reverse path (PLAN §7.2): the source must route back to the sender, so
+                        // a peer injects only from its own addresses and subnets (its
+                        // certificate), or from the internet if it is our exit.
+                        let own = packet::parse(body).is_some_and(|i| self.ckr.load().lookup(i.src) == Some(peer));
                         if !own {
                             log::debug!("Link | packet from {} with foreign source dropped", node(peer));
                             return;
@@ -638,7 +696,6 @@ impl Node {
 
     async fn tun_loop(self: Arc<Self>) {
         let tun = self.tun.clone().unwrap();
-        let Some(self_addr) = self.self_addr else { return };
         // Layout: [DATA header][KIND_IP][ip packet][tag]; the IP packet is read in place.
         const OFF: usize = DATA_HDR + 1;
         let mut buf = vec![0u8; OFF + MAX_DATAGRAM + TAG_LEN + MAX_PAD];
@@ -651,20 +708,15 @@ impl Node {
                     break;
                 }
             };
-            // IPv4 only until the IPv6 overlay (PLAN stage 4).
-            let Some(IpInfo { src: IpAddr::V4(src), dst: IpAddr::V4(dst), .. }) = packet::parse(&buf[OFF..OFF + n])
-            else {
+            let Some(IpInfo { dst, .. }) = packet::parse(&buf[OFF..OFF + n]) else { continue };
+            // Any source: our own address, a LAN host behind us (site-to-site), or the internet
+            // if we are an exit; the receiver checks it by the reverse path.
+            let Some(peer) = self.ckr.load().lookup(dst) else {
+                log::trace!("TUN | no route to {dst}");
                 continue;
             };
-            if src != self_addr {
-                continue;
-            }
-            let Some(route) = self.storage.route_by_addr(dst) else {
-                log::trace!("TUN | Packet to {dst} peer not found");
-                continue;
-            };
-            let Some(session) = self.links.current(&route.peer_id) else {
-                self.handshake(route.peer_id, PUNCH_INTERVAL).await;
+            let (Some(session), Some(route)) = (self.links.current(&peer), self.storage.route_by_id(&peer)) else {
+                self.handshake(peer, PUNCH_INTERVAL).await;
                 continue;
             };
             buf[DATA_HDR] = KIND_IP;
@@ -676,6 +728,9 @@ impl Node {
     }
 
     pub async fn shutdown(&self) {
+        if let Some((sys, _)) = self.sys_routes.lock().as_mut() {
+            tokio::task::block_in_place(|| sys.clear());
+        }
         for c in &self.clients {
             if let Some(p) = c.close() {
                 self.transport.send_to(&p, c.addr()).await;

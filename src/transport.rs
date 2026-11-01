@@ -53,6 +53,11 @@ pub fn bind_udp(addr: IpAddr, port: u16) -> io::Result<(UdpSocket, Families)> {
         }
     };
     sock.set_nonblocking(true)?;
+    // our own packets bypass the overlay routes (sysroute.rs); needs CAP_NET_ADMIN
+    #[cfg(target_os = "linux")]
+    if let Err(e) = sock.set_mark(crate::sysroute::FWMARK) {
+        log::debug!("Transport | no fwmark on the socket: {e}");
+    }
     sock.bind(&sa.into())?;
     Ok((UdpSocket::from_std(sock.into())?, families))
 }

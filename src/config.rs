@@ -71,6 +71,8 @@ pub struct NetConfig {
     pub mtu: u16,
     /// Prefix length of the group network; the address itself comes from the certificate.
     pub prefix: u8,
+    /// Install system routes for subnets behind other nodes and exits (default on).
+    pub manage_routes: bool,
 }
 
 pub struct ServerConfig {
@@ -119,6 +121,8 @@ pub struct Config {
     pub groups: Vec<GroupConfig>,
     /// `[[static_peers]]`: nodes connected to directly, without a tracker (PLAN §10).
     pub static_peers: Vec<StaticRef>,
+    /// `[ckr.remote_subnets]`: manual routes, `"<node key>" = ["192.168.50.0/24", "~10.0.0.0/8"]`.
+    pub remote_subnets: Vec<crate::ckr::Route>,
     pub peer: PeerConfig,
     pub net: Option<NetConfig>,
     pub servers: Vec<ServerConfig>,
@@ -244,6 +248,19 @@ pub fn check_endpoint(s: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_remote_subnets(t: &dyn toml_edit::TableLike) -> anyhow::Result<Vec<crate::ckr::Route>> {
+    let mut out = Vec::new();
+    for (k, v) in t.iter() {
+        let node: crate::identity::NodeId = k.parse().map_err(|e| anyhow!("\"{k}\": {e} (give the full node key)"))?;
+        let arr = v.as_array().ok_or_else(|| anyhow!("\"{k}\": expected a list of prefixes"))?;
+        for item in arr {
+            let spec = item.as_str().ok_or_else(|| anyhow!("\"{k}\": expected strings"))?;
+            out.extend(crate::ckr::parse_spec(spec, node).map_err(|e| anyhow!("\"{k}\": {e}"))?);
+        }
+    }
+    Ok(out)
+}
+
 fn parse_static_peer(t: &Table) -> anyhow::Result<StaticRef> {
     let key = get_str(t, "key")?.parse().map_err(|e| anyhow!("key: {e}"))?;
     let arr = t.get("endpoints").and_then(Item::as_array).ok_or_else(|| anyhow!("endpoints: expected a list"))?;
@@ -342,7 +359,11 @@ fn parse_net(t: &Table) -> anyhow::Result<NetConfig> {
     let mtu = get_str_or_int(t, "mtu")?.parse().context("mtu")?;
     // a v3 / early v4 `addr` key is ignored: the address comes from the group certificate
     let prefix = parse_mask(&get_str_or_int(t, "mask")?).context("mask")?;
-    Ok(NetConfig { tun_name, mtu, prefix })
+    let manage_routes = match t.get("manage_routes") {
+        Some(v) => v.as_bool().ok_or_else(|| anyhow!("manage_routes: expected true or false"))?,
+        None => true,
+    };
+    Ok(NetConfig { tun_name, mtu, prefix, manage_routes })
 }
 
 fn parse_server(name: &str, t: &Table) -> anyhow::Result<ServerConfig> {
@@ -466,11 +487,30 @@ impl Config {
                     .push(parse_static_peer(t).map_err(|e| anyhow!("[[static_peers]] #{} {e:#} in {file}", i + 1))?);
             }
         }
+        let remote_subnets = match section(&doc, "ckr").and_then(|c| c.get("remote_subnets")) {
+            Some(item) => {
+                let t = item.as_table_like().ok_or_else(|| anyhow!("[ckr.remote_subnets] is not a table in {file}"))?;
+                parse_remote_subnets(t).map_err(|e| anyhow!("[ckr.remote_subnets] {e:#} in {file}"))?
+            }
+            None => Vec::new(),
+        };
         if section(&doc, "group").is_some() {
             log::warn!("[group] psk in {file} is ignored: create or join a group (dvpn group --help)");
         }
 
-        Ok(Config { path, doc, identity, groups, static_peers, peer, net, servers, log_level, local_server_key })
+        Ok(Config {
+            path,
+            doc,
+            identity,
+            groups,
+            static_peers,
+            remote_subnets,
+            peer,
+            net,
+            servers,
+            log_level,
+            local_server_key,
+        })
     }
 
     pub fn group(&self, name_or_id: &str) -> Option<&GroupConfig> {
@@ -835,6 +875,22 @@ mod tests {
             let err = format!("{:#}", with_group(&format!("[groups.obfs]\n{bad}\n")).err().unwrap());
             assert!(err.contains(why) && err.contains("[groups.obfs]"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn remote_subnets() {
+        let k = Identity::generate().id();
+        let c = with_group(&format!(
+            "[ckr.remote_subnets]\n\"{k}\" = [\"192.168.50.0/24\", \"~10.0.0.0/8\", \"inetv6\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(c.remote_subnets.len(), 3);
+        assert!(!c.remote_subnets[1].system);
+        let err = format!("{:#}", with_group("[ckr.remote_subnets]\nabc = [\"10.0.0.0/8\"]\n").err().unwrap());
+        assert!(err.contains("full node key"), "{err}");
+        let err =
+            format!("{:#}", with_group(&format!("[ckr.remote_subnets]\n\"{k}\" = [\"10.0.0.0/99\"]\n")).err().unwrap());
+        assert!(err.contains("10.0.0.0/99"), "{err}");
     }
 
     #[test]

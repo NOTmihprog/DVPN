@@ -150,12 +150,21 @@ impl CertBody {
         }
     }
 
-    /// The node's IPv4 address in the group: the first IPv4 prefix (a /32 host).
+    /// The node's IPv4 address in the group: the first IPv4 host prefix (/32). Wider prefixes
+    /// are subnets behind the node (site-to-site).
     pub fn ipv4(&self) -> Option<std::net::Ipv4Addr> {
         self.prefixes.iter().find_map(|p| match p {
-            IpNet::V4(n) => Some(n.addr()),
-            IpNet::V6(_) => None,
+            IpNet::V4(n) if n.prefix_len() == 32 => Some(n.addr()),
+            _ => None,
         })
+    }
+
+    /// Subnets behind the node: the prefixes other than its own host address.
+    pub fn routes(&self) -> impl Iterator<Item = &IpNet> {
+        let own = self.ipv4();
+        self.prefixes
+            .iter()
+            .filter(move |p| !matches!(p, IpNet::V4(n) if Some(n.addr()) == own && n.prefix_len() == 32))
     }
 
     fn signed_message(&self, ctx: &[u8]) -> Vec<u8> {

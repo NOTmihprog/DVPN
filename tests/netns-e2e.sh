@@ -105,6 +105,28 @@ wan_port c 203.0.113.20
 nat nat1 a 1
 nat nat2 b 2
 nsx a ping -c1 -W2 203.0.113.1 >/dev/null || fail "A cannot reach the wan"
+# LANs behind nodes for site-to-site: la behind A (192.168.10.0/24), lc behind C (192.168.30.0/24)
+lan() { # lan NODE_NS LAN_NS N
+    ip link add lan1 type veth peer name up1
+    ip link set lan1 netns "$1"; ip link set up1 netns "$2"
+    nsx "$1" ip addr add "192.168.$3.1/24" dev lan1; nsx "$1" ip link set lan1 up
+    nsx "$2" ip addr add "192.168.$3.2/24" dev up1; nsx "$2" ip link set up1 up
+    nsx "$2" ip route add default via "192.168.$3.1"
+    nsx "$1" sysctl -qw net.ipv4.ip_forward=1
+}
+for ns in la lc; do ip netns add $ns; nsx $ns ip link set lo up; done
+lan a la 10
+lan c lc 30
+# C is also an exit to the "internet" for B: it forwards and masquerades (set up by hand here;
+# managing NAT on gateways is stage 6)
+nsx c nft -f - <<NFT
+table ip exitnat {
+    counter exited { }
+    chain post { type nat hook postrouting priority 100; oifname "wan0" ip saddr 10.10.33.0/24 masquerade; }
+    # NAT rules only see a flow's first packet: count the forwarded ones here
+    chain exits { type filter hook forward priority 0; iifname "dnet" oifname "wan0" counter name exited; }
+}
+NFT
 ok "topology up"
 
 # ---- tracker --------------------------------------------------------------------------
@@ -146,14 +168,22 @@ addr = "203.0.113.1"
 port = 6485
 key = "$TKEY"
 TOML
-"$D" --dir "$W/a" group create e2e -a 10.10.33.1 -n a >/dev/null || fail "group create"
-join() { # join NAME ADDR
-    inv=$("$D" --dir "$W/a" group invite -n "$1" -a "$2" 2>/dev/null) || fail "invite for $1"
+"$D" --dir "$W/a" group create e2e -a 10.10.33.1 -n a --route 192.168.10.0/24 >/dev/null || fail "group create"
+join() { # join NAME ADDR [invite options]
+    n=$1 addr=$2; shift 2
+    inv=$("$D" --dir "$W/a" group invite -n "$n" -a "$addr" "$@" 2>/dev/null) || fail "invite for $n"
+    set -- "$n"
     "$D" --dir "$W/$1" group join "$inv" >/dev/null || fail "$1 could not join"
     grep -q '203.0.113.1' "$1/config.toml" || fail "$1: the invite did not add the tracker"
 }
 join b 10.10.33.2
-join c 10.10.33.3
+join c 10.10.33.3 --route 192.168.30.0/24
+# B sends its internet traffic through C (manual CKR routes: an exit)
+cat >> b/config.toml <<TOML
+
+[ckr.remote_subnets]
+"$("$D" --dir "$W/c" show-key)" = ["0.0.0.0/1", "128.0.0.0/1"]
+TOML
 "$D" --dir "$W/b" group list | grep -q 'e2e.*member.*10.10.33.2' || fail "b: group list"
 
 # The admin's secret survives the admin node: a password-protected backup restores the group on
@@ -201,6 +231,28 @@ reach b c 10.10.33.3
 reach c a 10.10.33.1
 reach a b 10.10.33.2   # both behind NAT: hole punching
 reach b a 10.10.33.1
+
+# Site-to-site: hosts in the LANs behind A and C reach each other through the A <-> C tunnel;
+# A and C installed routes to the other LAN from the certificates (a separate routing table).
+wait_for 20 nsx la ping -c1 -W1 192.168.30.2 || fail "la -> lc (site-to-site)"
+nsx lc ping -c3 -i0.2 -W1 192.168.10.2 >/dev/null || fail "lc -> la (site-to-site)"
+nsx a ip route show table 7347 | grep -q '192.168.30.0/24 dev dnet' || fail "a: no system route to lc's LAN"
+ok "site-to-site: la <-> lc through a <-> c"
+
+# IPv6 inside the network: every node has an address in the group's ULA /48, derived from its key
+ula_c=$(nsx c ip -6 -o addr show dev dnet scope global | awk '{print $4}' | cut -d/ -f1)
+case $ula_c in fd*) ;; *) fail "c has no ULA on dnet ($ula_c)" ;; esac
+wait_for 10 nsx a ping -6 -c1 -W1 "$ula_c" || fail "a -> c over IPv6 inside the network"
+ok "IPv6 inside the network (ULA $ula_c)"
+
+# Exit: B's traffic to the internet goes through C (masqueraded there), while B's own DVPN
+# traffic (tracker, peers) keeps using the underlay thanks to the fwmark.
+masq() { nsx c nft list counter ip exitnat exited | awk '/packets/ {print $2}'; }
+before=$(masq)
+nsx b ping -c3 -i0.2 -W1 203.0.113.1 >/dev/null || fail "b -> internet through the exit"
+[ $(( $(masq) - before )) -ge 3 ] || fail "b's internet traffic did not go through c"
+nsx b ping -c2 -W1 10.10.33.1 >/dev/null || fail "b -> a broken by the exit routes"
+ok "exit: b reaches the internet through c"
 
 # A<->B must be a direct nat1 -> nat2 UDP flow (the tracker never forwards traffic).
 nat2nat() { nsx nat1 nft list counter ip watch nat2nat | awk '/packets/ {print $2}'; }
@@ -313,6 +365,9 @@ ok "tracker session survives the NAT address change"
 # S2 (behind nat1) with --static: S2 connects straight to S1, no tracker exists any more.
 cleanup
 PIDS=""
+# a clean stop (SIGTERM) removed the routing rules and table again
+! nsx a ip rule | grep -q 7347 || fail "a left its routing rules behind"
+[ -z "$(nsx c ip route show table 7347)" ] || fail "c left its routing table behind"
 mkdir s1 s2
 "$D" --dir "$W/s1" show-key >/dev/null 2>&1
 sed -i 's/^bind_port = .*/bind_port = "7000"/' s1/config.toml

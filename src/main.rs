@@ -83,6 +83,9 @@ enum GroupCommand {
         /// This node's name in the group (default: start of its key)
         #[arg(short = 'n', long = "node-name")]
         node_name: Option<String>,
+        /// A subnet behind this node, routed to it by every member (repeatable)
+        #[arg(long = "route", value_name = "PREFIX")]
+        routes: Vec<IpNet>,
     },
     /// Print an invite for one new node (admins only)
     Invite {
@@ -102,6 +105,10 @@ enum GroupCommand {
         /// directly, with or without a tracker (set a fixed [peer] bind_port)
         #[arg(long = "static", value_name = "HOST:PORT")]
         statics: Vec<String>,
+        /// A subnet behind the new node (its LAN for site-to-site, 0.0.0.0/0 for an exit),
+        /// routed to it by members that want it (repeatable)
+        #[arg(long = "route", value_name = "PREFIX")]
+        routes: Vec<IpNet>,
     },
     /// Join a group by invite (from the argument, a file or stdin)
     Join {
@@ -210,8 +217,11 @@ fn free_host(net: Ipv4Net, taken: &[Ipv4Addr]) -> Ipv4Addr {
     }
 }
 
-fn host_net(addr: Ipv4Addr) -> Vec<IpNet> {
-    vec![IpNet::V4(Ipv4Net::new(addr, 32).expect("/32 is valid"))]
+/// The certificate prefixes: the node's address first, then the subnets behind it.
+fn host_net(addr: Ipv4Addr, routes: &[IpNet]) -> Vec<IpNet> {
+    let mut v = vec![IpNet::V4(Ipv4Net::new(addr, 32).expect("/32 is valid"))];
+    v.extend(routes.iter().map(IpNet::trunc));
+    v
 }
 
 fn pick_group<'a>(conf: &'a Config, group: &Option<String>) -> &'a GroupConfig {
@@ -265,7 +275,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
         die("the clock is earlier than this build: set it (NTP) before signing group records or certificates");
     }
     match cmd {
-        GroupCommand::Create { name, addr, node_name } => {
+        GroupCommand::Create { name, addr, node_name, routes } => {
             if conf.group(&name).is_some() {
                 die(format!("group {name} already exists"));
             }
@@ -278,7 +288,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             let id = conf.identity.id();
             let secret = GroupSecret::generate();
             let node_name = node_name.unwrap_or_else(|| id.short());
-            let mut body = CertBody::new(id, &node_name, host_net(addr));
+            let mut body = CertBody::new(id, &node_name, host_net(addr, &routes));
             body.roles.0 = dvpn::group::Roles::ADMIN;
             let cert = secret.issue(body);
             let g = GroupConfig {
@@ -298,7 +308,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             println!("back it up with: dvpn group backup -o <file>");
             println!("Invite nodes with: dvpn group invite --name <name>");
         }
-        GroupCommand::Invite { group, name, addr, ttl, statics } => {
+        GroupCommand::Invite { group, name, addr, ttl, statics, routes } => {
             let g = pick_group(conf, &group);
             let Some(secret) = &g.secret else { die(format!("only admins of {} can invite", g.name)) };
             let own = g.ipv4().unwrap_or_else(|| die("this node has no address in the group"));
@@ -313,7 +323,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             if !statics.is_empty() && conf.peer.port_range.0 != conf.peer.port_range.1 {
                 log::warn!("[peer] bind_port is a range: give this node a fixed port for --static to work");
             }
-            let template = CertBody::new(conf.identity.id(), &name, host_net(addr));
+            let template = CertBody::new(conf.identity.id(), &name, host_net(addr, &routes));
             let join = secret.grant_join(template, now_unix() + ttl * 3600);
             let trackers = conf.servers.iter().map(|s| s.tracker_ref()).collect();
             let mut inv = Invite::new(&g.name, g.epoch, g.psk, g.obfs_entries.clone(), trackers, join);
@@ -597,15 +607,33 @@ fn api_addr_default(conf: &Config) -> String {
     SOCKET_DEFAULT_ADDR.to_owned()
 }
 
-fn build_tun(net: &config::NetConfig, addr: Ipv4Addr) -> anyhow::Result<tun_rs::AsyncDevice> {
-    let dev =
-        tun_rs::DeviceBuilder::new().name(&net.tun_name).ipv4(addr, net.prefix, None).mtu(net.mtu).build_async()?;
+/// The TUN device with the IPv4 address from the certificate and the group's IPv6 ULA.
+fn build_tun(net: &config::NetConfig, addr: Ipv4Addr, ula: std::net::Ipv6Addr) -> anyhow::Result<tun_rs::AsyncDevice> {
+    let dev = tun_rs::DeviceBuilder::new()
+        .name(&net.tun_name)
+        .ipv4(addr, net.prefix, None)
+        .ipv6(ula, 48u8)
+        .mtu(net.mtu)
+        .build_async()?;
     Ok(dev)
 }
 
+/// Ctrl+C, or SIGTERM (systemd, kill): both shut down cleanly (routes, tracker goodbye).
 async fn wait_ctrl_c() {
-    let _ = tokio::signal::ctrl_c().await;
-    log::info!(" Pressed Ctrl+C, exiting.");
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .unwrap_or_else(|e| die(format!("signal handler: {e}")));
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => log::info!(" Pressed Ctrl+C, exiting."),
+            _ = term.recv() => log::info!("Terminated, exiting."),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        log::info!(" Pressed Ctrl+C, exiting.");
+    }
 }
 
 async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
@@ -663,9 +691,13 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
 
     let tun = conf.net.as_ref().map(|net| {
         let addr = self_addr.unwrap_or_else(|| die("the group certificate has no IPv4 address for the TUN interface"));
-        match build_tun(net, addr) {
+        if net.mtu < 1280 {
+            die(format!("[net] mtu {} is below 1280, the minimum for IPv6", net.mtu));
+        }
+        let ula = dvpn::ckr::ula_addr(&group.id, &conf.identity.id());
+        match build_tun(net, addr, ula) {
             Ok(dev) => {
-                log::info!("TUN | {} {addr}/{} mtu {} - started", net.tun_name, net.prefix, net.mtu);
+                log::info!("TUN | {} {addr}/{} {ula}/48 mtu {} - started", net.tun_name, net.prefix, net.mtu);
                 dev
             }
             Err(e) => die(format!("TUN | Tun init error: {e}")),
@@ -710,6 +742,7 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
             Err(e) => log::warn!("Config | renewed certificate not saved: {e:#}"),
         }),
         statics: conf.static_peers.clone(),
+        routes: conf.remote_subnets.clone(),
         on_epoch: Box::new(move |epoch, psk| match Config::load(&dir2) {
             Ok(mut conf) => {
                 conf.set_group_epoch(&group_id, epoch, &psk);
@@ -719,6 +752,11 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         }),
     };
     let node = node::Node::new(storage.clone(), transport, links, clients, tun, self_addr, ctx);
+    if let (Some(net), Some(addr)) = (conf.net.as_ref().filter(|n| n.manage_routes), self_addr) {
+        let v4 = ipnet::Ipv4Net::new(addr, net.prefix).map(|n| IpNet::V4(n.trunc()));
+        let connected = v4.into_iter().chain([IpNet::V6(dvpn::ckr::ula_prefix(&group.id))]).collect();
+        node.manage_routes(&net.tun_name, connected);
+    }
     node.start();
     let _api = api::Api::start(node.clone(), api_sock);
 

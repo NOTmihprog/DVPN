@@ -68,3 +68,10 @@ path = "fuzz_targets/tracker_packet.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ckr_spec"
+path = "fuzz_targets/ckr_spec.rs"
+test = false
+doc = false
+bench = false

@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod backup;
+pub mod ckr;
 pub mod clock;
 pub mod config;
 pub mod crypto;
@@ -19,6 +20,7 @@ pub mod proto;
 pub mod replay;
 pub mod state;
 pub mod storage;
+pub mod sysroute;
 pub mod tracker_client;
 pub mod tracker_server;
 pub mod transport;
