@@ -113,6 +113,7 @@ UDP-датаграмма никогда не больше 1452 байт (1500 �
 | `group.rs`, `state.rs` | сертификаты, invite, записи группы (LWW), эпохи psk |
 | `tracker_client.rs`, `tracker_server.rs`, `tunnel.rs` | сервер обнаружения и сессия с ним |
 | `router.rs` | link-state: LSA, LSDB, Дейкстра, защита рассылки |
+| `plan.rs`, `apply.rs` | что должно быть на узле (чистое вычисление: адреса, маршруты, ACL, DNS) и применение разницы к системе |
 | `ckr.rs`, `sysroute.rs` | таблица маршрутов и системные маршруты |
 | `exit.rs`, `gateway.rs` | выбор шлюза, kill switch; NAT и NDP proxy на шлюзе |
 | `acl.rs`, `dns.rs` | ACL (nftables); DNS и mDNS |

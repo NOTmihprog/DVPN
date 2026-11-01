@@ -122,8 +122,9 @@ pub struct Node {
     peer_certs: parking_lot::Mutex<HashMap<NodeId, Cert>>,
     /// Destination -> node, from `peer_certs` and the manual routes (rebuilt when they change).
     ckr: arc_swap::ArcSwap<CkrTable>,
-    /// System routes for the CKR table, with the prefixes already on the TUN interface.
-    sys_routes: parking_lot::Mutex<Option<(crate::sysroute::SysRoutes, Vec<ipnet::IpNet>)>>,
+    /// The plan in place now (`plan.rs`), and the system it is applied to (`apply.rs`).
+    plan: parking_lot::Mutex<crate::plan::Plan>,
+    system: parking_lot::Mutex<crate::apply::System>,
     /// Mesh (PLAN §6): end-to-end sessions carried in `FORWARD`, the link-state database, the
     /// routes computed from it, and what we last announced.
     pub e2e: Links,
@@ -148,10 +149,6 @@ pub struct Node {
     exit6: parking_lot::Mutex<crate::exit::ExitChooser>,
     /// Kill switch on for IPv4 / IPv6: gateways configured, none alive.
     kill: parking_lot::Mutex<(bool, bool)>,
-    /// The ACL chain now installed (to re-render only on changes).
-    acl: parking_lot::Mutex<Option<String>>,
-    /// `[gateway]`: NAT and NDP proxy for members' public IPv6 addresses.
-    gateway: parking_lot::Mutex<Option<crate::gateway::Gateway>>,
     /// Further addresses to try for peers without a session (PLAN §9.1): the candidates they
     /// announced to the tracker, or all addresses of a static peer.
     candidates: parking_lot::Mutex<HashMap<NodeId, Vec<SocketAddr>>>,
@@ -177,13 +174,23 @@ impl Node {
         let exits = (group.exits.clone(), std::fs::metadata(&group.config_path).and_then(|m| m.modified()).ok());
         let clients: Vec<_> = clients.into_iter().map(Arc::new).collect();
         let clients_by_addr = clients.iter().flat_map(|c| c.addrs().iter().map(move |a| (*a, c.clone()))).collect();
+        let tun = tun.map(Arc::new);
+        let mut system = crate::apply::System::new(tun.clone());
+        if let (Some(_), Some((domain, _))) = (&group.resolved_tun, &group.dns) {
+            system.manage_resolved(domain);
+        }
+        // what the TUN starts with: the first plan only adds the rest
+        let plan = crate::plan::Plan {
+            addrs: crate::plan::own_addrs(&group.cert, &group.id, group.tun_prefix),
+            ..Default::default()
+        };
         Arc::new(Node {
             storage,
             transport,
             links,
             clients,
             clients_by_addr,
-            tun: tun.map(Arc::new),
+            tun,
             self_addr: parking_lot::RwLock::new(self_addr),
             api_tx: OnceLock::new(),
             epoch: Instant::now(),
@@ -193,7 +200,8 @@ impl Node {
             group,
             peer_certs: parking_lot::Mutex::new(HashMap::new()),
             ckr: arc_swap::ArcSwap::from_pointee(CkrTable::default()),
-            sys_routes: parking_lot::Mutex::new(None),
+            plan: parking_lot::Mutex::new(plan),
+            system: parking_lot::Mutex::new(system),
             e2e,
             lsdb: parking_lot::Mutex::new(Lsdb::new(group_id)),
             routes: arc_swap::ArcSwap::from_pointee(RouteTable::default()),
@@ -208,8 +216,6 @@ impl Node {
             exit4: parking_lot::Mutex::new(Default::default()),
             exit6: parking_lot::Mutex::new(Default::default()),
             kill: parking_lot::Mutex::new((false, false)),
-            gateway: parking_lot::Mutex::new(None),
-            acl: parking_lot::Mutex::new(None),
             candidates: parking_lot::Mutex::new(HashMap::new()),
             last_peer_sync: parking_lot::Mutex::new(HashMap::new()),
         })
@@ -224,9 +230,10 @@ impl Node {
         self.ckr.load_full()
     }
 
-    /// Rebuilds the CKR table: every member's certificate prefixes and IPv6 ULA (sorted by key,
-    /// so conflicts resolve the same way everywhere), then the manual routes over them.
-    fn rebuild_ckr(&self) {
+    /// Recomputes the node's plan (`plan.rs`: CKR, our addresses, ACL, DNS) from what it knows
+    /// now and applies what changed (`apply.rs`). Called whenever an input changes: certificates,
+    /// records, gateways, the kill switch, `[exit]`.
+    fn replan(&self) {
         // every member's newest certificate: from handshakes and trackers, or from the records
         // (an admin changed its addresses or subnets: `dvpn node set`), revoked ones left out
         let me = self.storage.self_id();
@@ -241,73 +248,43 @@ impl Node {
                 newest.insert(n, c);
             }
         }
-        let mut peers: Vec<&Cert> = newest.values().collect();
-        peers.sort_by_key(|c| c.body.node);
-        let mut routes = Vec::new();
-        for c in peers {
-            let target = crate::ckr::Target::Node(c.body.node);
-            for net in &c.body.prefixes {
-                routes.push(crate::ckr::Route { net: net.trunc(), target, system: true });
-            }
-            let ula = crate::ckr::ula_addr(&self.group.id, &c.body.node);
-            routes.push(crate::ckr::Route { net: ipnet::IpNet::from(IpAddr::V6(ula)), target, system: false });
-        }
-        // the chosen gateways get the internet (private ranges stay local), manual routes on top
-        let gw4 = self.exit4.lock().current;
-        let gw6 = self.exit6.lock().current;
-        let (kill4, kill6) = *self.kill.lock();
-        for (gw, kill, spec) in [(gw4, kill4, "inetv4"), (gw6, kill6, "inetv6")] {
-            if let Some(gw) = gw {
-                routes.extend(crate::ckr::parse_spec(spec, gw).expect("valid spec"));
-            } else if kill {
-                // kill switch: the internet stays in the tunnel, where nothing carries it
-                let rs = crate::ckr::parse_spec(spec, me).expect("valid spec");
-                routes.extend(rs.into_iter().map(|mut r| {
-                    if matches!(r.target, crate::ckr::Target::Node(_)) {
-                        r.target = crate::ckr::Target::Blackhole;
-                    }
-                    r
-                }));
-            }
-        }
-        routes.extend(self.group.routes.iter().copied());
-        self.apply_acl(&newest);
-        self.update_dns(&newest);
-        if let Some(gw) = self.gateway.lock().as_mut() {
-            let prefixes: Vec<ipnet::IpNet> = newest.values().flat_map(|c| c.body.prefixes.iter().copied()).collect();
-            tokio::task::block_in_place(|| gw.apply(&prefixes));
-        }
-        let table = CkrTable::new(routes);
-        if let Some((sys, connected)) = self.sys_routes.lock().as_mut() {
-            let wanted = crate::sysroute::wanted(table.routes(), connected);
-            tokio::task::block_in_place(|| sys.apply(&wanted));
-        }
-        self.ckr.store(Arc::new(table));
-    }
-
-    /// The DNS zone from the members' certificates and our own (PLAN §14a).
-    fn update_dns(&self, members: &HashMap<NodeId, Cert>) {
-        let Some((domain, zone)) = &self.group.dns else { return };
-        let group = crate::dns::label(&self.group.group_name);
         let own = self.cert.read().clone();
-        let mut z = crate::dns::Zone::new();
-        for c in members.values().chain([&own]) {
-            let name = crate::dns::label(&c.body.name);
-            if name.is_empty() {
-                continue;
-            }
-            let mut addrs: Vec<IpAddr> = c.body.ipv4().map(IpAddr::V4).into_iter().collect();
-            addrs.push(IpAddr::V6(crate::ckr::ula_addr(&self.group.id, &c.body.node)));
-            addrs.extend(c.body.prefixes.iter().filter_map(|p| match p {
-                ipnet::IpNet::V6(n) if n.prefix_len() == 128 => Some(IpAddr::V6(n.addr())),
-                _ => None,
-            }));
-            z.insert(format!("{name}.{domain}"), addrs.clone());
-            if !group.is_empty() {
-                z.insert(format!("{name}.{group}.{domain}"), addrs);
-            }
+        let acl = self.group.store.acl(&self.group.id);
+        let dns_forward = self.exits.lock().0.dns.clone();
+        let plan = crate::plan::compute(&crate::plan::Inputs {
+            me,
+            group: self.group.id,
+            group_name: &self.group.group_name,
+            own: &own,
+            members: &newest,
+            tun_prefix: self.group.tun_prefix,
+            exit4: self.exit4.lock().current,
+            exit6: self.exit6.lock().current,
+            kill: *self.kill.lock(),
+            manual: &self.group.routes,
+            acl: acl.as_ref(),
+            dns_domain: self.group.dns.as_ref().map(|(d, _)| d.as_str()),
+            dns_forward: &dns_forward,
+        });
+        // one replan at a time, so the system follows the plans in order
+        let mut current = self.plan.lock();
+        if *current == plan {
+            return;
         }
-        zone.store(Arc::new(z));
+        // in-process state first: packets route by the new table at once
+        self.ckr.store(Arc::new(CkrTable::new(plan.ckr.clone())));
+        *self.self_addr.write() = plan.ipv4();
+        if let Some((_, zone)) = &self.group.dns {
+            zone.store(Arc::new(plan.zone.clone()));
+        }
+        if current.dns_upstream != plan.dns_upstream {
+            if !plan.dns_upstream.is_empty() {
+                log::info!("DNS | other names through the gateway to {:?}", plan.dns_upstream);
+            }
+            self.group.dns_upstream.store(Arc::new(plan.dns_upstream.clone()));
+        }
+        tokio::task::block_in_place(|| self.system.lock().apply(&me, &current, &plan));
+        *current = plan;
     }
 
     /// An mDNS query the system sent into the TUN (`<member>.local`): the response, from the
@@ -326,35 +303,14 @@ impl Node {
         packet::udp_packet(src, group, MDNS_PORT, MDNS_PORT, &msg, 255)
     }
 
-    /// Renders the group's ACL for this node over the members' current addresses and installs it
-    /// when it changed (PLAN §7.4).
-    fn apply_acl(&self, members: &HashMap<NodeId, Cert>) {
-        let Some(tun) = &self.tun else { return };
-        let me = self.storage.self_id();
-        let mut prefixes: HashMap<NodeId, Vec<ipnet::IpNet>> =
-            members.iter().map(|(n, c)| (*n, c.body.prefixes.iter().map(|p| p.trunc()).collect())).collect();
-        // members' group ULA addresses are theirs too
-        for (n, v) in prefixes.iter_mut() {
-            v.push(ipnet::IpNet::from(IpAddr::V6(crate::ckr::ula_addr(&self.group.id, n))));
-        }
-        let chain = self.group.store.acl(&self.group.id).and_then(|a| a.render(&me, &prefixes));
-        let mut cur = self.acl.lock();
-        if *cur != chain {
-            let name = tun.name().unwrap_or_default();
-            tokio::task::block_in_place(|| crate::acl::apply_nft(&name, chain.as_deref()));
-            *cur = chain;
-        }
-    }
-
     /// Act as a gateway (`[gateway]`). Call before `start`.
     pub fn set_gateway(&self, gw: crate::gateway::Gateway) {
-        *self.gateway.lock() = Some(gw);
+        self.system.lock().set_gateway(gw);
     }
 
-    /// Manage system routes for the overlay on the TUN interface `tun` (whose own prefixes
-    /// are `connected`). Call before `start`.
-    pub fn manage_routes(&self, tun: &str, connected: Vec<ipnet::IpNet>) {
-        *self.sys_routes.lock() = Some((crate::sysroute::SysRoutes::new(tun), connected));
+    /// Manage system routes for the overlay on the TUN interface. Call before `start`.
+    pub fn manage_routes(&self) {
+        self.system.lock().manage_routes();
     }
 
     pub fn store(&self) -> &StateStore {
@@ -403,50 +359,12 @@ impl Node {
                 client.set_certs(vec![c.clone()]);
             }
             self.storage.set_peer(me, PeerUpdate::from_cert(&c));
-            let old = std::mem::replace(&mut *self.cert.write(), c.clone());
-            self.retune_tun(&old, &c);
+            // our addresses on the TUN follow it in the replan below
+            *self.cert.write() = c.clone();
             (self.group.on_cert)(&c);
         }
         // members' certificates in the records carry their current addresses and subnets
-        self.rebuild_ckr();
-    }
-
-    /// Our addresses changed with a new certificate (`dvpn node set`): move them on the TUN.
-    fn retune_tun(&self, old: &Cert, new: &Cert) {
-        let Some(tun) = &self.tun else { return };
-        let hosts6 = |c: &Cert| -> Vec<std::net::Ipv6Addr> {
-            c.body
-                .prefixes
-                .iter()
-                .filter_map(|p| match p {
-                    ipnet::IpNet::V6(n) if n.prefix_len() == 128 => Some(n.addr()),
-                    _ => None,
-                })
-                .collect()
-        };
-        let (o4, n4) = (old.body.ipv4(), new.body.ipv4());
-        if o4 != n4 {
-            if let Some(a) = n4 {
-                match tun.add_address_v4(a, self.group.tun_prefix) {
-                    Ok(()) => log::info!("TUN | address {a}/{}", self.group.tun_prefix),
-                    Err(e) => log::warn!("TUN | add {a}: {e}"),
-                }
-            }
-            if let Some(a) = o4 {
-                let _ = tun.remove_address(IpAddr::V4(a));
-            }
-            *self.self_addr.write() = n4;
-        }
-        let (o6, n6) = (hosts6(old), hosts6(new));
-        for a in n6.iter().filter(|a| !o6.contains(a)) {
-            match tun.add_address_v6(*a, 128u8) {
-                Ok(()) => log::info!("TUN | address {a}/128"),
-                Err(e) => log::warn!("TUN | add {a}: {e}"),
-            }
-        }
-        for a in o6.iter().filter(|a| !n6.contains(a)) {
-            let _ = tun.remove_address(IpAddr::V6(*a));
-        }
+        self.replan();
     }
 
     /// Sends records we just learned or made to trackers and neighbours.
@@ -486,7 +404,7 @@ impl Node {
                 }
             };
             if changed {
-                self.rebuild_ckr();
+                self.replan();
             }
         }
         let Some(secret) = &self.group.secret else { return };
@@ -607,7 +525,7 @@ impl Node {
     }
 
     pub fn start(self: &Arc<Self>) {
-        self.rebuild_ckr();
+        self.replan();
         self.links.set_membership(Membership::of(&self.group.store, &self.group.id));
         self.e2e.set_membership(Membership::of(&self.group.store, &self.group.id));
         self.update_psks();
@@ -1158,6 +1076,7 @@ impl Node {
     fn exit_tick(&self) {
         let path = &self.group.config_path;
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let mut config_changed = false;
         let exits = {
             let mut e = self.exits.lock();
             if mtime != e.1 {
@@ -1166,6 +1085,7 @@ impl Node {
                     Ok(new) if new != e.0 => {
                         log::info!("Exit | gateways from config: IPv4 {:?}, IPv6 {:?}", new.v4, new.v6);
                         e.0 = new;
+                        config_changed = true;
                     }
                     Ok(_) => {}
                     Err(err) => log::warn!("Exit | [exit] in {}: {err:#}", path.display()),
@@ -1180,7 +1100,8 @@ impl Node {
         let (p4, p6) = (resolve(&exits.v4), resolve(&exits.v6));
         let now = Instant::now();
         let alive = |g: &NodeId| self.next_hop(g).is_some();
-        let mut changed = false;
+        // `[exit] dns` may have changed: the plan forwards names accordingly
+        let mut changed = config_changed;
         for (chooser, prio, fam) in [(&self.exit4, &p4, "IPv4"), (&self.exit6, &p6, "IPv6")] {
             let mut ch = chooser.lock();
             let old = ch.current;
@@ -1213,20 +1134,7 @@ impl Node {
             }
         }
         if changed {
-            self.rebuild_ckr();
-        }
-        // DNS through the gateway while it carries our IPv4 internet
-        let upstream: Vec<IpAddr> = if self.exit4.lock().current.is_some() { exits.dns.clone() } else { Vec::new() };
-        if **self.group.dns_upstream.load() != upstream {
-            let all = !upstream.is_empty();
-            if all {
-                log::info!("DNS | other names through the gateway to {upstream:?}");
-            }
-            self.group.dns_upstream.store(Arc::new(upstream));
-            if let (Some(tun), Some((domain, _))) = (&self.group.resolved_tun, &self.group.dns) {
-                let (tun, domain) = (tun.clone(), domain.clone());
-                tokio::task::spawn_blocking(move || crate::dns::resolved_route_all(&tun, &domain, all));
-            }
+            self.replan();
         }
     }
 
@@ -1621,18 +1529,7 @@ impl Node {
     }
 
     pub async fn shutdown(&self) {
-        if let Some((sys, _)) = self.sys_routes.lock().as_mut() {
-            tokio::task::block_in_place(|| sys.clear());
-        }
-        if let Some(gw) = self.gateway.lock().as_mut() {
-            tokio::task::block_in_place(|| gw.stop());
-        }
-        if self.acl.lock().take().is_some()
-            && let Some(tun) = &self.tun
-        {
-            let name = tun.name().unwrap_or_default();
-            tokio::task::block_in_place(|| crate::acl::apply_nft(&name, None));
-        }
+        tokio::task::block_in_place(|| self.system.lock().clear());
         for c in &self.clients {
             if let Some(p) = c.close() {
                 self.transport.send_to(&p, c.addr()).await;

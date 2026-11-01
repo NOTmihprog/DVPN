@@ -3,6 +3,7 @@
 
 pub mod acl;
 pub mod api;
+pub mod apply;
 pub mod backup;
 pub mod ckr;
 pub mod clock;
@@ -21,6 +22,7 @@ pub mod node;
 pub mod noise;
 pub mod obfs;
 pub mod packet;
+pub mod plan;
 pub mod proto;
 pub mod replay;
 pub mod router;

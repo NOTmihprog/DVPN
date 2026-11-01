@@ -1131,10 +1131,8 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         }),
     };
     let node = node::Node::new(storage.clone(), transport, (links, e2e), clients, tun, self_addr, ctx);
-    if let (Some(net), Some(addr)) = (conf.net.as_ref().filter(|n| n.manage_routes), self_addr) {
-        let v4 = ipnet::Ipv4Net::new(addr, net.prefix).map(|n| IpNet::V4(n.trunc()));
-        let connected = v4.into_iter().chain([IpNet::V6(dvpn::ckr::ula_prefix(&group.id))]).collect();
-        node.manage_routes(&net.tun_name, connected);
+    if conf.net.as_ref().is_some_and(|n| n.manage_routes) {
+        node.manage_routes();
     }
     if let (Some((domain, zone)), Some(addr), Some(net)) = (&dns, self_addr, &conf.net) {
         tokio::spawn(dvpn::dns::serve(std::net::IpAddr::V4(addr), zone.clone(), domain.clone(), upstream.clone()));
