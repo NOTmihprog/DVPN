@@ -719,6 +719,46 @@ mod tests {
         );
     }
 
+    proptest::proptest! {
+        // every case signs and verifies dozens of records: fewer cases keep the test quick
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+        /// LWW (PLAN §8.1, 6.12): whatever order records arrive in, and however often, every
+        /// store ends with the same state.
+        #[test]
+        fn lww_converges_in_any_order(
+            ops in proptest::collection::vec((0usize..4, 0u64..50, proptest::bool::ANY), 1..30),
+            seed in proptest::prelude::any::<u64>(),
+        ) {
+            let g = GroupSecret::from_bytes([7; 32]);
+            let keys: Vec<NodeId> = (1..=4u8).map(|i| Identity::from_seed(&[i; 32]).id()).collect();
+            let base = now_ms() - 1_000_000;
+            let records: Vec<Record> = ops
+                .iter()
+                .map(|(k, ts, deleted)| {
+                    let key = keys[*k];
+                    let e = Entry { group: g.id(), id: format!("revoke/{key}"), ts: base + ts, deleted: *deleted, body: Body::Revoke { key } };
+                    Record::sign(&g, &e)
+                })
+                .collect();
+            // a second order: a permutation from the seed, with everything twice
+            let mut shuffled: Vec<Record> = records.iter().chain(records.iter()).cloned().collect();
+            let mut x = seed | 1;
+            for i in (1..shuffled.len()).rev() {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                shuffled.swap(i, (x % (i as u64 + 1)) as usize);
+            }
+            let (a, b) = (StateStore::memory(), StateStore::memory());
+            a.insert(records);
+            b.insert(shuffled);
+            let mut sa = a.summary(&g.id());
+            let mut sb = b.summary(&g.id());
+            sa.sort();
+            sb.sort();
+            proptest::prop_assert_eq!(sa, sb);
+            proptest::prop_assert_eq!(a.revoked(&g.id()), b.revoked(&g.id()));
+        }
+    }
+
     #[test]
     fn records_messages_fit_datagrams() {
         let g = GroupSecret::generate();

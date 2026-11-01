@@ -21,6 +21,10 @@ use crate::identity::{Identity, NodeId};
 pub const LSA_TTL: Duration = Duration::from_secs(120);
 /// Nodes announce themselves this often (and when their links change).
 pub const LSA_REFRESH: Duration = Duration::from_secs(30);
+/// LSAs of one origin are accepted at most this often (a member flooding LSAs with an ever
+/// growing seq gets nowhere, PLAN §6.3a); nodes send their own at most every `LSA_MIN_SEND`.
+pub const LSA_MIN_INTERVAL: Duration = Duration::from_secs(2);
+pub const LSA_MIN_SEND: Duration = Duration::from_secs(4);
 /// At most this many neighbours per LSA (the cheapest), so it fits a datagram.
 pub const MAX_LSA_NEIGHBORS: usize = 28;
 const LSA_CTX: &[u8] = b"dvpn/4 lsa\0";
@@ -72,25 +76,49 @@ impl Lsa {
 pub struct Lsdb {
     group: GroupId,
     entries: HashMap<NodeId, (LsaBody, Lsa, Instant)>,
+    pub(crate) min_interval: Duration,
+}
+
+/// What became of an LSA offered to the database.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Insert {
+    New,
+    /// The same or an older one is known: nothing to do.
+    Known,
+    /// Bad signature, another group, or a revoked origin.
+    Invalid,
+    /// Newer, but its origin sent one less than `LSA_MIN_INTERVAL` ago.
+    TooSoon,
 }
 
 impl Lsdb {
     pub fn new(group: GroupId) -> Self {
-        Lsdb { group, entries: HashMap::new() }
+        Lsdb { group, entries: HashMap::new(), min_interval: LSA_MIN_INTERVAL }
     }
 
-    /// Stores a verified LSA if it is newer; `revoked` origins are refused. Returns whether it
-    /// changed the database (then it is flooded on).
-    pub fn insert(&mut self, lsa: Lsa, revoked: &HashSet<NodeId>) -> bool {
-        let Some(b) = lsa.open() else { return false };
+    /// Stores a verified LSA if it is newer and not too soon after the last one of its origin;
+    /// `revoked` origins are refused.
+    pub fn insert_checked(&mut self, lsa: Lsa, revoked: &HashSet<NodeId>) -> Insert {
+        let Some(b) = lsa.open() else { return Insert::Invalid };
         if b.group != self.group || revoked.contains(&b.origin) {
-            return false;
+            return Insert::Invalid;
         }
-        if self.entries.get(&b.origin).is_some_and(|(old, _, _)| old.seq >= b.seq) {
-            return false;
+        if let Some((old, _, until)) = self.entries.get(&b.origin) {
+            if old.seq >= b.seq {
+                return Insert::Known;
+            }
+            let received = *until - LSA_TTL;
+            if received.elapsed() < self.min_interval {
+                return Insert::TooSoon;
+            }
         }
         self.entries.insert(b.origin, (b, lsa, Instant::now() + LSA_TTL));
-        true
+        Insert::New
+    }
+
+    /// Like `insert_checked`; whether it changed the database (then it is flooded on).
+    pub fn insert(&mut self, lsa: Lsa, revoked: &HashSet<NodeId>) -> bool {
+        self.insert_checked(lsa, revoked) == Insert::New
     }
 
     /// Drops expired LSAs and those of `revoked` origins; returns whether anything went.
@@ -177,6 +205,54 @@ impl RoutingMsg {
             return vec![RoutingMsg::Summary(s)];
         }
         s.chunks(30).map(|c| RoutingMsg::Summary(c.to_vec())).collect()
+    }
+}
+
+/// Misbehaving neighbours (gossipsub v1.1 peer scoring, PLAN §6.3a): each one's bad routing and
+/// record messages are counted in a window; past the limit its ROUTING and STATE messages are
+/// ignored for a while. Weights: undecodable 10, invalid (signature, group, revoked) 5, too
+/// frequent 1.
+#[derive(Default)]
+pub struct Scores {
+    peers: HashMap<NodeId, (Instant, u32, Option<Instant>)>,
+}
+
+pub const SCORE_WINDOW: Duration = Duration::from_secs(60);
+pub const SCORE_LIMIT: u32 = 50;
+pub const SCORE_BAN: Duration = Duration::from_secs(300);
+
+impl Scores {
+    /// Whether `peer` is being ignored now.
+    pub fn banned(&mut self, peer: &NodeId) -> bool {
+        match self.peers.get_mut(peer) {
+            Some((_, _, Some(until))) if *until > Instant::now() => true,
+            Some(e @ (_, _, Some(_))) => {
+                *e = (Instant::now(), 0, None);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Adds `points` against `peer`; returns true when this got it banned.
+    pub fn penalize(&mut self, peer: NodeId, points: u32) -> bool {
+        if points == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        let e = self.peers.entry(peer).or_insert((now, 0, None));
+        if e.2.is_some() {
+            return false;
+        }
+        if now.duration_since(e.0) >= SCORE_WINDOW {
+            *e = (now, 0, None);
+        }
+        e.1 += points;
+        if e.1 >= SCORE_LIMIT {
+            e.2 = Some(now + SCORE_BAN);
+            return true;
+        }
+        false
     }
 }
 
@@ -322,6 +398,28 @@ mod tests {
     }
 
     #[test]
+    fn lsa_rate_limit_and_scores() {
+        let n = ids(2);
+        let mut db = Lsdb::new(group());
+        let lsa = |seq| Lsa::sign(&n[0], &LsaBody { origin: n[0].id(), group: group(), seq, neighbors: vec![] });
+        assert_eq!(db.insert_checked(lsa(1), &HashSet::new()), Insert::New);
+        assert_eq!(db.insert_checked(lsa(2), &HashSet::new()), Insert::TooSoon, "newer, but right away");
+        assert_eq!(db.insert_checked(lsa(1), &HashSet::new()), Insert::Known);
+        let forged = Lsa { sig: lsa(3).sig, payload: lsa(4).payload };
+        assert_eq!(db.insert_checked(forged, &HashSet::new()), Insert::Invalid);
+
+        let mut s = Scores::default();
+        let p = n[1].id();
+        assert!(!s.banned(&p));
+        for _ in 0..9 {
+            assert!(!s.penalize(p, 5));
+        }
+        assert!(s.penalize(p, 5), "the 10th invalid message bans");
+        assert!(s.banned(&p));
+        assert!(!s.penalize(p, 5), "no double counting while banned");
+    }
+
+    #[test]
     fn lsa_signature_and_ordering() {
         let n = ids(2);
         let body = LsaBody { origin: n[0].id(), group: group(), seq: 5, neighbors: vec![(n[1].id(), 3)] };
@@ -330,6 +428,7 @@ mod tests {
         let forged = Lsa::sign(&n[1], &body);
         assert_eq!(forged.open(), None, "signed by somebody else");
         let mut db = Lsdb::new(group());
+        db.min_interval = Duration::ZERO;
         assert!(db.insert(lsa.clone(), &HashSet::new()));
         assert!(!db.insert(lsa, &HashSet::new()), "same seq");
         let older = LsaBody { seq: 4, ..body.clone() };

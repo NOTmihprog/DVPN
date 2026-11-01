@@ -19,7 +19,10 @@ use crate::proto::{
     CONTROL_LEN, CONTROL_PING, CONTROL_PONG, DATA_HDR, FORWARD_HDR, KIND_API_MIN, KIND_CONTROL, KIND_FORWARD, KIND_IP,
     KIND_REPORT, KIND_ROUTING, KIND_STATE, MAX_DATAGRAM, MAX_HOPS, REPORT_LEN,
 };
-use crate::router::{LSA_REFRESH, Lsa, LsaBody, Lsdb, MAX_LSA_NEIGHBORS, RouteTable, RoutingMsg, ShortId, short_id};
+use crate::router::{
+    Insert, LSA_MIN_SEND, LSA_REFRESH, Lsa, LsaBody, Lsdb, MAX_LSA_NEIGHBORS, RouteTable, RoutingMsg, Scores, ShortId,
+    short_id,
+};
 use crate::state::{Body, Entry, Membership, StateStore, SyncMsg, record_key};
 use crate::storage::{Event, PeerStorage, PeerUpdate};
 use crate::tracker_client::{Output, TrackerClient};
@@ -121,6 +124,8 @@ pub struct Node {
     routes: arc_swap::ArcSwap<RouteTable>,
     my_lsa: parking_lot::Mutex<(Vec<NodeId>, Option<Instant>, u64)>,
     last_routing_sync: parking_lot::Mutex<HashMap<NodeId, Instant>>,
+    /// Misbehaving neighbours: their ROUTING and STATE messages are ignored for a while.
+    scores: parking_lot::Mutex<Scores>,
     /// Packets sent with a TTL within the hop limit (traceroute probes), by probe id: what an
     /// ICMP Time Exceeded quotes when a relay reports the probe ran out (PLAN §6.4).
     probes: parking_lot::Mutex<HashMap<u16, (Vec<u8>, Instant)>>,
@@ -183,6 +188,7 @@ impl Node {
             routes: arc_swap::ArcSwap::from_pointee(RouteTable::default()),
             my_lsa: parking_lot::Mutex::new((Vec::new(), None, 0)),
             last_routing_sync: parking_lot::Mutex::new(HashMap::new()),
+            scores: parking_lot::Mutex::new(Scores::default()),
             probes: parking_lot::Mutex::new(HashMap::new()),
             reports: parking_lot::Mutex::new((Instant::now(), 0)),
             exits: parking_lot::Mutex::new(exits),
@@ -553,8 +559,24 @@ impl Node {
         }
     }
 
+    /// Counts bad messages from a neighbour; logs when that gets it ignored.
+    fn penalize(&self, peer: NodeId, points: u32, what: &str) {
+        if self.scores.lock().penalize(peer, points) {
+            log::warn!("Mesh | {} sends too many bad {what} messages: ignored for a while", node(peer));
+        }
+    }
+
     async fn handle_state(&self, peer: NodeId, body: &[u8]) {
-        let Some(msg) = SyncMsg::decode(body) else { return };
+        if self.scores.lock().banned(&peer) {
+            return;
+        }
+        let Some(msg) = SyncMsg::decode(body) else {
+            return self.penalize(peer, 10, "record");
+        };
+        if let SyncMsg::Records { records } = &msg {
+            let bad = records.iter().filter(|r| r.open().map_or(true, |e| e.group != self.group.id)).count();
+            self.penalize(peer, 5 * bad as u32, "record");
+        }
         let (replies, changed) = msg.handle(&self.group.store, |g| *g == self.group.id);
         for r in replies {
             self.send_kind(&peer, KIND_STATE, &r.encode()).await;
@@ -985,8 +1007,9 @@ impl Node {
         let neighbors = self.lsa_neighbors();
         let ids: Vec<NodeId> = neighbors.iter().map(|(n, _)| *n).collect();
         let due = {
+            // changed links are announced at once, but not more often than LSA_MIN_SEND
             let (last, at, _) = &*self.my_lsa.lock();
-            *last != ids || at.is_none_or(|t| t.elapsed() >= LSA_REFRESH)
+            at.is_none_or(|t| t.elapsed() >= LSA_REFRESH || (*last != ids && t.elapsed() >= LSA_MIN_SEND))
         };
         if due {
             let seq = {
@@ -1149,7 +1172,12 @@ impl Node {
     }
 
     async fn handle_routing(&self, peer: NodeId, body: &[u8]) {
-        let Some(msg) = RoutingMsg::decode(body) else { return };
+        if self.scores.lock().banned(&peer) {
+            return;
+        }
+        let Some(msg) = RoutingMsg::decode(body) else {
+            return self.penalize(peer, 10, "routing");
+        };
         match msg {
             RoutingMsg::Summary(theirs) => {
                 let (give, want) = self.lsdb.lock().diff(&theirs);
@@ -1169,13 +1197,25 @@ impl Node {
             RoutingMsg::Lsas(lsas) => {
                 let revoked = Membership::of(&self.group.store, &self.group.id).revoked;
                 let me = self.storage.self_id();
+                let mut bad = 0;
                 let new: Vec<Lsa> = {
                     let mut db = self.lsdb.lock();
-                    // our own LSA comes back from neighbours: ignore older copies of it
-                    lsas.into_iter()
-                        .filter(|l| l.open().is_some_and(|b| b.origin != me) && db.insert(l.clone(), &revoked))
-                        .collect()
+                    let mut new = Vec::new();
+                    for l in lsas {
+                        // our own LSA comes back from neighbours: ignore older copies of it
+                        if l.open().is_some_and(|b| b.origin == me) {
+                            continue;
+                        }
+                        match db.insert_checked(l.clone(), &revoked) {
+                            Insert::New => new.push(l),
+                            Insert::Known => {}
+                            Insert::Invalid => bad += 5,
+                            Insert::TooSoon => bad += 1,
+                        }
+                    }
+                    new
                 };
+                self.penalize(peer, bad, "routing");
                 if !new.is_empty() {
                     self.recompute_routes();
                     self.flood(new, Some(peer)).await;
