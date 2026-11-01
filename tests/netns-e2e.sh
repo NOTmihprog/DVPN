@@ -118,24 +118,20 @@ lan() { # lan NODE_NS LAN_NS N
 for ns in la lc; do ip netns add $ns; nsx $ns ip link set lo up; done
 lan a la 10
 lan c lc 30
-# C is also an exit to the "internet" for B: it forwards and masquerades (set up by hand here;
-# managing NAT on gateways is stage 6)
-nsx c nft -f - <<NFT
-table ip exitnat {
+# C and A are gateways to the "internet" ([gateway]: forwarding, NAT, NDP proxy on C); C also
+# has an IPv6 /64 on the wan, from which B gets a public address. These tables only count
+# what the gateways forward.
+nsx wan ip -6 addr add 2001:db8::1/64 dev br0 nodad
+nsx c ip -6 addr add 2001:db8::20/64 dev wan0 nodad
+for g in "c wan0" "a up0"; do
+    set -- $g
+    nsx "$1" nft -f - <<NFT
+table ip exitcount {
     counter exited { }
-    chain post { type nat hook postrouting priority 100; oifname "wan0" ip saddr 10.10.33.0/24 masquerade; }
-    # NAT rules only see a flow's first packet: count the forwarded ones here
-    chain exits { type filter hook forward priority 0; iifname "dnet" oifname "wan0" counter name exited; }
+    chain exits { type filter hook forward priority 0; iifname "dnet" oifname "$2" counter name exited; }
 }
 NFT
-# A is the second gateway for B: forwarding (set by lan) and NAT towards its uplink
-nsx a nft -f - <<NFT
-table ip exitnat {
-    counter exited { }
-    chain post { type nat hook postrouting priority 100; oifname "up0" ip saddr 10.10.33.0/24 masquerade; }
-    chain exits { type filter hook forward priority 0; iifname "dnet" oifname "up0" counter name exited; }
-}
-NFT
+done
 ok "topology up"
 
 # ---- tracker --------------------------------------------------------------------------
@@ -185,10 +181,12 @@ join() { # join NAME ADDR [invite options]
     "$D" --dir "$W/$1" group join "$inv" >/dev/null || fail "$1 could not join"
     grep -q '203.0.113.1' "$1/config.toml" || fail "$1: the invite did not add the tracker"
 }
-join b 10.10.33.2
+join b 10.10.33.2 --route 2001:db8::50/128
 join c 10.10.33.3 --route 192.168.30.0/24
+printf '\n[gateway]\nwan = ["wan0"]\nndp_proxy = "wan0"\n' >> c/config.toml
+printf '\n[gateway]\nwan = ["up0"]\n' >> a/config.toml
 # B sends its internet traffic through C, or A if C is down (gateways by priority)
-"$D" --dir "$W/b" exit --v4 c,a >/dev/null || fail "b: exit"
+"$D" --dir "$W/b" exit --v4 c,a --v6 c >/dev/null || fail "b: exit"
 "$D" --dir "$W/b" group list | grep -q 'e2e.*member.*10.10.33.2' || fail "b: group list"
 
 # The admin's secret survives the admin node: a password-protected backup restores the group on
@@ -252,12 +250,17 @@ ok "IPv6 inside the network (ULA $ula_c)"
 
 # Exit: B's traffic to the internet goes through C (masqueraded there), while B's own DVPN
 # traffic (tracker, peers) keeps using the underlay thanks to the fwmark.
-masq() { nsx c nft list counter ip exitnat exited | awk '/packets/ {print $2}'; }
+masq() { nsx c nft list counter ip exitcount exited | awk '/packets/ {print $2}'; }
 before=$(masq)
 nsx b ping -c3 -i0.2 -W1 203.0.113.1 >/dev/null || fail "b -> internet through the exit"
 [ $(( $(masq) - before )) -ge 3 ] || fail "b's internet traffic did not go through c"
 nsx b ping -c2 -W1 10.10.33.1 >/dev/null || fail "b -> a broken by the exit routes"
 ok "exit: b reaches the internet through c"
+
+# B's public IPv6 address from C's prefix: C answers neighbour discovery for it on the wan
+wait_for 10 nsx b ping -6 -c1 -W1 2001:db8::1 || fail "b -> internet over IPv6 through c"
+nsx wan ping -6 -c3 -i0.2 -W1 2001:db8::50 >/dev/null || fail "internet -> b's public IPv6 address"
+ok "public IPv6 for b via c (NDP proxy)"
 
 # C becomes unreachable for B: B's internet moves to its second gateway, A
 from=$(($(wc -l < "$W/node-b.log") + 1))
@@ -270,7 +273,7 @@ NFT
 # only log lines written after the block count (at start b may have used a for a moment)
 wait_for 60 sh -c "tail -n +$from '$W/node-b.log' | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'Exit | IPv4 via a'" \
     || fail "b did not switch its exit to a"
-masq_a() { nsx a nft list counter ip exitnat exited | awk '/packets/ {print $2}'; }
+masq_a() { nsx a nft list counter ip exitcount exited | awk '/packets/ {print $2}'; }
 before=$(masq_a)
 nsx b ping -c3 -i0.2 -W1 203.0.113.1 >/dev/null || fail "b -> internet through a"
 [ $(( $(masq_a) - before )) -ge 3 ] || fail "b's internet traffic did not go through a"
@@ -391,6 +394,8 @@ PIDS=""
 # a clean stop (SIGTERM) removed the routing rules and table again
 ! nsx a ip rule | grep -q 7347 || fail "a left its routing rules behind"
 [ -z "$(nsx c ip route show table 7347)" ] || fail "c left its routing table behind"
+! nsx c nft list tables | grep -q dvpn_gw || fail "gateway c left its NAT table behind"
+[ -z "$(nsx c ip -6 neigh show proxy)" ] || fail "gateway c left NDP proxies behind"
 mkdir s1 s2
 "$D" --dir "$W/s1" show-key >/dev/null 2>&1
 sed -i 's/^bind_port = .*/bind_port = "7000"/' s1/config.toml
@@ -412,7 +417,6 @@ ok "connected by a static address, without a tracker"
 # invite, they find each other through the tracker and talk over IPv6.
 cleanup
 PIDS=""
-nsx wan ip -6 addr add 2001:db8::1/64 dev br0 nodad
 for n in x6 y6; do ip netns add $n; nsx $n ip link set lo up; done
 wan_port6() { # wan_port6 NS ADDR
     ip link add "w-$1" type veth peer name wan0

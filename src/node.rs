@@ -111,6 +111,8 @@ pub struct Node {
     exits: parking_lot::Mutex<(crate::config::Exits, Option<std::time::SystemTime>)>,
     exit4: parking_lot::Mutex<crate::exit::ExitChooser>,
     exit6: parking_lot::Mutex<crate::exit::ExitChooser>,
+    /// `[gateway]`: NAT and NDP proxy for members' public IPv6 addresses.
+    gateway: parking_lot::Mutex<Option<crate::gateway::Gateway>>,
     /// Further addresses to try for peers without a session (PLAN §9.1): the candidates they
     /// announced to the tracker, or all addresses of a static peer.
     candidates: parking_lot::Mutex<HashMap<NodeId, Vec<SocketAddr>>>,
@@ -163,6 +165,7 @@ impl Node {
             exits: parking_lot::Mutex::new(exits),
             exit4: parking_lot::Mutex::new(Default::default()),
             exit6: parking_lot::Mutex::new(Default::default()),
+            gateway: parking_lot::Mutex::new(None),
             candidates: parking_lot::Mutex::new(HashMap::new()),
             last_peer_sync: parking_lot::Mutex::new(HashMap::new()),
         })
@@ -202,12 +205,22 @@ impl Node {
             }
         }
         routes.extend(self.group.routes.iter().copied());
+        if let Some(gw) = self.gateway.lock().as_mut() {
+            let prefixes: Vec<ipnet::IpNet> =
+                self.peer_certs.lock().values().flat_map(|c| c.body.prefixes.iter().copied()).collect();
+            tokio::task::block_in_place(|| gw.apply(&prefixes));
+        }
         let table = CkrTable::new(routes);
         if let Some((sys, connected)) = self.sys_routes.lock().as_mut() {
             let wanted = crate::sysroute::wanted(table.routes(), connected);
             tokio::task::block_in_place(|| sys.apply(&wanted));
         }
         self.ckr.store(Arc::new(table));
+    }
+
+    /// Act as a gateway (`[gateway]`). Call before `start`.
+    pub fn set_gateway(&self, gw: crate::gateway::Gateway) {
+        *self.gateway.lock() = Some(gw);
     }
 
     /// Manage system routes for the overlay on the TUN interface `tun` (whose own prefixes
@@ -1180,6 +1193,9 @@ impl Node {
     pub async fn shutdown(&self) {
         if let Some((sys, _)) = self.sys_routes.lock().as_mut() {
             tokio::task::block_in_place(|| sys.clear());
+        }
+        if let Some(gw) = self.gateway.lock().as_mut() {
+            tokio::task::block_in_place(|| gw.stop());
         }
         for c in &self.clients {
             if let Some(p) = c.close() {

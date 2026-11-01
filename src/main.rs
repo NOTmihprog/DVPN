@@ -728,6 +728,18 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         match build_tun(net, addr, ula) {
             Ok(dev) => {
                 log::info!("TUN | {} {addr}/{} {ula}/48 mtu {} - started", net.tun_name, net.prefix, net.mtu);
+                // public IPv6 addresses an admin gave this node (served by a gateway's NDP proxy)
+                #[cfg(unix)]
+                for p in &cert.body.prefixes {
+                    if let IpNet::V6(n) = p
+                        && n.prefix_len() == 128
+                    {
+                        match dev.add_address_v6(n.addr(), 128u8) {
+                            Ok(()) => log::info!("TUN | {} {}/128", net.tun_name, n.addr()),
+                            Err(e) => log::warn!("TUN | add {}: {e}", n.addr()),
+                        }
+                    }
+                }
                 dev
             }
             Err(e) => die(format!("TUN | Tun init error: {e}")),
@@ -793,6 +805,13 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         let v4 = ipnet::Ipv4Net::new(addr, net.prefix).map(|n| IpNet::V4(n.trunc()));
         let connected = v4.into_iter().chain([IpNet::V6(dvpn::ckr::ula_prefix(&group.id))]).collect();
         node.manage_routes(&net.tun_name, connected);
+    }
+    if let (Some(gw), Some(net)) = (&conf.gateway, &conf.net) {
+        let ula = dvpn::ckr::ula_prefix(&group.id);
+        let g = tokio::task::block_in_place(|| {
+            dvpn::gateway::Gateway::start(&net.tun_name, &gw.wan, gw.ndp_proxy.clone(), ula, gw.manage_sysctl)
+        });
+        node.set_gateway(g);
     }
     node.start();
     let _api = api::Api::start(node.clone(), api_sock);

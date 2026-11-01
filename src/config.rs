@@ -125,6 +125,8 @@ pub struct Config {
     pub remote_subnets: Vec<crate::ckr::Route>,
     /// `[exit]`: gateways to the internet, by priority.
     pub exits: Exits,
+    /// `[gateway]`: this node is a gateway to the internet for members.
+    pub gateway: Option<GatewayConfig>,
     pub peer: PeerConfig,
     pub net: Option<NetConfig>,
     pub servers: Vec<ServerConfig>,
@@ -274,6 +276,44 @@ fn parse_exits(t: &dyn toml_edit::TableLike) -> anyhow::Result<Exits> {
         }
     }
     Ok(Exits { v4: list("v4")?, v6: list("v6")? })
+}
+
+/// `[gateway]` (PLAN §12): NAT from the tunnel to `wan`, optional NDP proxy for members'
+/// public IPv6 addresses on `ndp_proxy`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayConfig {
+    pub wan: Vec<String>,
+    pub ndp_proxy: Option<String>,
+    pub manage_sysctl: bool,
+}
+
+fn parse_gateway(t: &Table) -> anyhow::Result<GatewayConfig> {
+    let wan: Vec<String> = match t.get("wan") {
+        Some(i) => i
+            .as_array()
+            .ok_or_else(|| anyhow!("wan: expected a list of interfaces"))?
+            .iter()
+            .map(|v| v.as_str().map(str::to_owned).ok_or_else(|| anyhow!("wan: expected strings")))
+            .collect::<anyhow::Result<_>>()?,
+        None => Vec::new(),
+    };
+    if wan.is_empty() {
+        bail!("wan: give the interfaces towards the internet, e.g. wan = [\"eth0\"]");
+    }
+    let ndp_proxy = match t.get("ndp_proxy") {
+        Some(_) => Some(get_str(t, "ndp_proxy")?.to_owned()),
+        None => None,
+    };
+    let manage_sysctl = match t.get("manage_sysctl") {
+        Some(v) => v.as_bool().ok_or_else(|| anyhow!("manage_sysctl: expected true or false"))?,
+        None => true,
+    };
+    for (k, _) in t.iter() {
+        if !["wan", "ndp_proxy", "manage_sysctl"].contains(&k) {
+            bail!("unknown key {k}");
+        }
+    }
+    Ok(GatewayConfig { wan, ndp_proxy, manage_sysctl })
 }
 
 /// Reads only `[exit]` from a config file: a running node follows changes to it.
@@ -536,6 +576,10 @@ impl Config {
                 .map_err(|e| anyhow!("[exit] {e:#} in {file}"))?,
             None => Exits::default(),
         };
+        let gateway = match section(&doc, "gateway") {
+            Some(t) => Some(parse_gateway(t).map_err(|e| anyhow!("[gateway] {e:#} in {file}"))?),
+            None => None,
+        };
         if section(&doc, "group").is_some() {
             log::warn!("[group] psk in {file} is ignored: create or join a group (dvpn group --help)");
         }
@@ -548,6 +592,7 @@ impl Config {
             static_peers,
             remote_subnets,
             exits,
+            gateway,
             peer,
             net,
             servers,
@@ -973,6 +1018,17 @@ mod tests {
         c.save();
         assert_eq!(read_exits(&dir.join(CONFIG_FILE_NAME)).unwrap(), Exits::default());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn gateway() {
+        let c = with_group("[gateway]\nwan = [\"eth0\"]\nndp_proxy = \"eth0\"\n").unwrap();
+        assert_eq!(
+            c.gateway,
+            Some(GatewayConfig { wan: vec!["eth0".into()], ndp_proxy: Some("eth0".into()), manage_sysctl: true })
+        );
+        assert!(with_group("[gateway]\n").is_err(), "wan is required");
+        assert!(with_group("[gateway]\nwan = [\"eth0\"]\nnat = true\n").is_err());
     }
 
     #[test]

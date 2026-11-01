@@ -158,7 +158,7 @@
 - [ ] **6.2** `state/store.rs`: подписанные LWW-записи, HLC, tombstones, `MAX_CLOCK_SKEW`, перепроверка при загрузке
 - [ ] **6.3** `state/sync.rs`: обмен сводками с соседями (kind 3 STATE) и трекером (`StatePut/Get/Summary`, зашифрованно `group_enc`)
 - [ ] **6.4** `plan.rs` (по образцу `yggmgr/src/plan.rs`): состояние → CKR, системные маршруты, адреса TUN, NAT, failover
-- [ ] **6.5** apply-цикл (15 с + по событию), NAT/forwarding для шлюзов (nftables `inet dvpn`), MSS clamp, NDP proxy
+- [~] **6.5** `[gateway]` (`gateway.rs`, Linux): `wan`, `ndp_proxy`, `manage_sysctl`; forwarding v4/v6 (`accept_ra = 2` на WAN), `table inet dvpn_gw`: masquerade из TUN в WAN (IPv4 и IPv6 с ULA группы), MSS clamp `rt mtu`; публичный IPv6 участника — /128 в сертификате (`--route`), узел вешает его на TUN, шлюз — NDP proxy + /128 в main; снятие при выходе; netns: C и A — шлюзы через `[gateway]`, публичный IPv6 B через NDP proxy C. Apply-цикл по плану состояния — с 6.4
 - [x] **6.6** выбор шлюза клиентом (сделано раньше этапа 6, по просьбе 2026-11-01): `[exit] v4/v6` — имена или ключи по приоритету, пусто — без выхода; `dvpn exit --v4 a,b / --none`, работающий узел перечитывает `[exit]` из конфига на лету; первый живой (прямая связь или путь через relay) получает `inetv4` / `inetv6`, при смерти — следующий сразу, вернувшийся приоритетный — после 30 с стабильности (впервые появившийся — сразу); `exit.rs` с тестом; netns: C недоступен → интернет B через A. NAT на шлюзе пока вручную (6.5), kill switch — 6.9
 - [ ] **6.7** `acl.rs` (§7.4): правила по тегам сертификата, LPM+порты, снимок через `ArcSwap` (MVP: default-allow)
 - [ ] **6.8** `dns.rs` MagicDNS (§14a): зона `<name>.<group>.dvpn`, форвард апстрима
