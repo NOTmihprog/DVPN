@@ -6,13 +6,14 @@ use ed25519_dalek::VerifyingKey;
 use parking_lot::Mutex;
 
 use crate::crypto::{ClientHandshake, TrackerSession};
+use crate::group::{Cert, now_unix};
 use crate::identity::Identity;
 use crate::logger::node;
-use crate::proto::{HELLO_ACK, SEARCH_BATCH, TRACKER, TrackerMsg};
+use crate::proto::{HELLO_ACK, TRACKER, TrackerMsg};
 use crate::storage::{PeerStorage, PeerUpdate};
 
+/// Each announce also refreshes the members list (and their current addresses) from the server.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(15);
-const SEARCH_INTERVAL: Duration = Duration::from_secs(15);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
 /// A link that answered within this time is not replaced by a tracker-reported endpoint.
 const LIVE_LINK: Duration = Duration::from_secs(20);
@@ -26,11 +27,9 @@ struct State {
     handshake: Option<ClientHandshake>,
     session: Option<TrackerSession>,
     last_announce: Option<Instant>,
-    last_search: Option<Instant>,
     last_response: Option<Instant>,
     // Wall-clock copies of the above, reported through the API.
     announce_ts: f64,
-    search_ts: f64,
     response_ts: f64,
 }
 
@@ -45,6 +44,8 @@ pub struct TrackerClient {
     pub addr: SocketAddr,
     pub key: VerifyingKey,
     identity: Arc<Identity>,
+    /// Our membership certificates, one per group.
+    certs: Vec<Cert>,
     state: Mutex<State>,
     log_prefix: String,
 }
@@ -62,24 +63,25 @@ impl State {
 }
 
 impl TrackerClient {
-    pub fn new(name: String, addr: SocketAddr, key: VerifyingKey, identity: Arc<Identity>) -> Self {
+    pub fn new(name: String, addr: SocketAddr, key: VerifyingKey, identity: Arc<Identity>, certs: Vec<Cert>) -> Self {
         let log_prefix = format!("Client {name} {addr} |");
         log::info!("{log_prefix} Connection status initiated");
-        TrackerClient { addr, key, identity, state: Mutex::new(State::default()), log_prefix }
+        TrackerClient { addr, key, identity, certs, state: Mutex::new(State::default()), log_prefix }
     }
 
     pub fn is_connected(&self) -> bool {
         self.state.lock().session.is_some()
     }
 
-    /// (last announce, last search, last response) as unix timestamps, 0 = never.
+    /// (last announce, last search, last response) as unix timestamps, 0 = never. Members are
+    /// looked up by every announce now, so the search time is the announce time.
     pub fn timestamps(&self) -> (f64, f64, f64) {
         let s = self.state.lock();
-        (s.announce_ts, s.search_ts, s.response_ts)
+        (s.announce_ts, s.announce_ts, s.response_ts)
     }
 
     /// Called once per second.
-    pub fn tick(&self, storage: &PeerStorage) -> Output {
+    pub fn tick(&self) -> Output {
         let mut out = Output::default();
         let mut s = self.state.lock();
         if s.session.is_none() {
@@ -101,21 +103,10 @@ impl TrackerClient {
         if s.last_announce.is_none_or(|t| t.elapsed() >= ANNOUNCE_INTERVAL) {
             log::debug!("{} Send announce", self.log_prefix);
             let sig = self.identity.sign(s.session.as_ref().expect("checked above").announce_msg());
-            s.send(&mut out, &TrackerMsg::Announce { peer_id: self.identity.id(), sig });
+            let msg = TrackerMsg::Announce { node: self.identity.id(), certs: self.certs.clone(), sig };
+            s.send(&mut out, &msg);
             s.last_announce = Some(Instant::now());
             s.announce_ts = unix_now();
-        }
-
-        if s.last_search.is_none_or(|t| t.elapsed() >= SEARCH_INTERVAL) {
-            // Connected peers are searched too: the tracker then reports their current address,
-            // which fixes a stale endpoint after the other side changed port or NAT mapping.
-            let peers = storage.others();
-            for chunk in peers.chunks(SEARCH_BATCH) {
-                log::debug!("{} Send search {} peers", self.log_prefix, chunk.len());
-                s.send(&mut out, &TrackerMsg::Search { peers: chunk.to_vec() });
-            }
-            s.last_search = Some(Instant::now());
-            s.search_ts = unix_now();
         }
         out
     }
@@ -135,7 +126,6 @@ impl TrackerClient {
                 s.last_response = Some(Instant::now());
                 s.response_ts = unix_now();
                 s.last_announce = None;
-                s.last_search = None;
                 if !was_connected {
                     log::info!("{} Connection status connected", self.log_prefix);
                     out.status = Some(true);
@@ -148,34 +138,11 @@ impl TrackerClient {
                     return out;
                 };
                 match TrackerMsg::decode(&plain) {
-                    Some(TrackerMsg::Found { peer_id, addr }) => {
+                    Some(TrackerMsg::Found { cert, addr }) => {
                         s.last_response = Some(Instant::now());
                         s.response_ts = unix_now();
                         drop(s);
-                        if !storage.exists(&peer_id) {
-                            log::info!(
-                                "{} Received packet | Peer {} not found in peer_storage",
-                                self.log_prefix,
-                                node(peer_id)
-                            );
-                        } else if storage.endpoint(&peer_id) == Some(addr) {
-                            log::debug!("{} Peer {} receive endpoint {addr}", self.log_prefix, node(peer_id));
-                        } else if storage.link_alive(&peer_id, LIVE_LINK) {
-                            // The direct link works; behind some NATs the peer's real port differs
-                            // from what the tracker sees, so don't break a working link.
-                            log::debug!(
-                                "{} Peer {} endpoint {addr} ignored, link alive",
-                                self.log_prefix,
-                                node(peer_id)
-                            );
-                        } else {
-                            if storage.is_self(&peer_id) {
-                                log::info!("{} New self endpoint {addr}", self.log_prefix);
-                            } else {
-                                log::info!("{} Peer {} new endpoint {addr}", self.log_prefix, node(peer_id));
-                            }
-                            storage.set_peer(peer_id, PeerUpdate { endpoint: Some(Some(addr)), ..Default::default() });
-                        }
+                        self.found(&cert, addr, storage);
                     }
                     Some(TrackerMsg::Close) => {
                         log::info!("{} Connection closed from server", self.log_prefix);
@@ -189,6 +156,48 @@ impl TrackerClient {
             _ => {}
         }
         out
+    }
+
+    /// A member of one of our groups is at `addr`. The certificate is checked here too: the
+    /// tracker is not trusted with membership.
+    fn found(&self, cert: &Cert, addr: SocketAddr, storage: &PeerStorage) {
+        let peer = cert.body.node;
+        if !self.certs.iter().any(|c| c.body.group == cert.body.group) {
+            return;
+        }
+        if let Err(e) = cert.verify(&cert.body.group, Some(now_unix())) {
+            log::info!("{} Peer {} from the server: {e}", self.log_prefix, node(peer));
+            return;
+        }
+        if storage.is_self(&peer) {
+            if storage.endpoint(&peer) != Some(addr) {
+                log::info!("{} New self endpoint {addr}", self.log_prefix);
+                storage.set_peer(peer, PeerUpdate { endpoint: Some(Some(addr)), ..Default::default() });
+            }
+            return;
+        }
+        let mut update = PeerUpdate::from_cert(cert);
+        if let Some((r, _)) = storage.get(&peer)
+            && Some(r.name) == update.name
+            && Some(r.addr) == update.addr
+        {
+            // nothing new: no update event for API clients every announce
+            update.name = None;
+            update.addr = None;
+        }
+        if storage.endpoint(&peer) == Some(addr) {
+            log::debug!("{} Peer {} receive endpoint {addr}", self.log_prefix, node(peer));
+        } else if storage.link_alive(&peer, LIVE_LINK) {
+            // The direct link works; behind some NATs the peer's real port differs from what the
+            // tracker sees, so don't break a working link.
+            log::debug!("{} Peer {} endpoint {addr} ignored, link alive", self.log_prefix, node(peer));
+        } else {
+            log::info!("{} Peer {} new endpoint {addr}", self.log_prefix, node(peer));
+            update.endpoint = Some(Some(addr));
+        }
+        if update.name.is_some() || update.endpoint.is_some() {
+            storage.set_peer(peer, update);
+        }
     }
 
     /// Best-effort goodbye on shutdown.

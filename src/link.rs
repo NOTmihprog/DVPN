@@ -12,11 +12,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use blake2::{Blake2s256, Digest};
 use parking_lot::{Mutex, RwLock};
 use rand::RngExt;
 
 use crate::elligator;
+use crate::group::{Cert, GroupId, now_unix};
 use crate::identity::{Identity, NodeId};
 use crate::noise::{self, HandshakePayload, Initiator, Responder, TAG_LEN, Tai64n};
 use crate::obfs::{MAX_PAD, Obfs, Profile};
@@ -36,23 +36,15 @@ pub const REJECT_AFTER: Duration = Duration::from_secs(180);
 const REJECT_AFTER_MESSAGES: u64 = 1 << 60;
 /// An unanswered handshake is forgotten after this long.
 const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
-/// Lookups of unknown initiator keys rebuild the key map at most this often.
-const MEMBER_REFRESH: Duration = Duration::from_secs(1);
-
-/// Group parameters set by hand until real groups arrive (stage 3).
+/// What sessions need to know about the group (PLAN §5).
 #[derive(Clone)]
 pub struct Group {
+    pub id: GroupId,
     pub psk: [u8; 32],
-    pub id: [u8; 32],
     pub obfs: Profile,
-}
-
-impl Group {
-    /// The group id is derived from the psk for now; stage 3 derives both from the group secret.
-    pub fn from_psk(psk: [u8; 32]) -> Self {
-        let id = Blake2s256::new().chain_update(b"dvpn/4 group id").chain_update(psk).finalize().into();
-        Group { psk, id, obfs: Profile::default() }
-    }
+    /// Our membership certificate, sent in every handshake. The peer's one is checked against
+    /// the group id: membership is proven by the certificate, not by a list of known keys.
+    pub cert: Cert,
 }
 
 pub struct Session {
@@ -186,8 +178,6 @@ struct Inner {
     by_idx: HashMap<u32, Arc<Session>>,
     pending: HashMap<u32, Pending>,
     peers: HashMap<NodeId, PeerSessions>,
-    by_x25519: HashMap<[u8; 32], NodeId>,
-    members_refreshed: Option<Instant>,
 }
 
 impl Inner {
@@ -227,8 +217,9 @@ impl Inner {
 
 /// What a received packet turned out to be.
 pub enum Received {
-    /// A handshake completed or answered; `reply` (if any) goes back to the sender.
-    Handshake { peer: NodeId, reply: Option<Vec<u8>> },
+    /// A handshake completed or answered; `reply` (if any) goes back to the sender. `cert` is
+    /// the peer's verified membership certificate (its name and addresses).
+    Handshake { peer: NodeId, cert: Box<Cert>, reply: Option<Vec<u8>> },
     /// Decrypted DATA: `plain` is the range of the packet holding `[kind][body]`.
     Data { session: Arc<Session>, plain: Range<usize> },
 }
@@ -258,7 +249,24 @@ impl Links {
     }
 
     fn payload(&self) -> Vec<u8> {
-        HandshakePayload::new(0, self.group.id).encode()
+        let mut p = HandshakePayload::new(0, *self.group.id.as_bytes());
+        p.cert = self.group.cert.encode();
+        p.encode()
+    }
+
+    /// The peer's certificate from a decrypted handshake payload, if it is a valid member of
+    /// our group (and not us).
+    fn member_cert(&self, payload: &[u8]) -> Option<Cert> {
+        let p = HandshakePayload::decode(payload).ok()?;
+        if p.group_id != *self.group.id.as_bytes() {
+            return None;
+        }
+        let cert = Cert::decode(&p.cert)?;
+        if let Err(e) = cert.verify(&self.group.id, Some(now_unix())) {
+            log::debug!("Link | handshake from {} with {e}", crate::logger::node(cert.body.node));
+            return None;
+        }
+        (cert.body.node != self.identity.id()).then_some(cert)
     }
 
     /// Packets that start a handshake with `peer`, in sending order: the profile's signature and
@@ -290,28 +298,17 @@ impl Links {
         Some(packets)
     }
 
-    fn lookup_member(&self, x25519: &[u8; 32], members: impl FnOnce() -> Vec<NodeId>) -> Option<NodeId> {
-        if let Some(id) = self.inner.read().by_x25519.get(x25519) {
-            return Some(*id);
-        }
-        let mut inner = self.inner.write();
-        if inner.members_refreshed.is_some_and(|t| t.elapsed() < MEMBER_REFRESH) {
-            return None;
-        }
-        inner.members_refreshed = Some(Instant::now());
-        inner.by_x25519 = members().into_iter().map(|id| (id.x25519_public().to_bytes(), id)).collect();
-        inner.by_x25519.get(x25519).copied()
-    }
-
-    fn handle_init(&self, packet: &[u8], members: impl FnOnce() -> Vec<NodeId>) -> Option<Received> {
+    fn handle_init(&self, packet: &[u8]) -> Option<Received> {
         let sender_idx = u32::from_le_bytes(packet.get(3..HS_INIT_HDR)?.try_into().unwrap());
         let msg = with_decoded_ephemeral(&packet[HS_INIT_HDR..])?;
         let (resp, rs, payload) = Responder::read(self.identity.x25519_secret(), &msg).ok()?;
-        let peer = self.lookup_member(&rs, members)?;
-        let p = HandshakePayload::decode(&payload).ok()?;
-        if p.group_id != self.group.id || peer == self.identity.id() {
+        let cert = self.member_cert(&payload)?;
+        let peer = cert.body.node;
+        // the certificate must be for the key that did the handshake
+        if peer.x25519_public().to_bytes() != rs {
             return None;
         }
+        let p = HandshakePayload::decode(&payload).ok()?;
         let mut inner = self.inner.write();
         let st = inner.peers.entry(peer).or_default();
         if st.last_init_ts.is_some_and(|t| p.timestamp <= t) {
@@ -329,7 +326,7 @@ impl Links {
         out[HS_RESP_HDR..HS_RESP_HDR + 32].copy_from_slice(&repr);
         inner.install(Arc::new(Session::new(peer, idx, sender_idx, transport, self.obfs.clone(), false)));
         drop(inner);
-        Some(Received::Handshake { peer, reply: Some(self.finish_handshake(HS_RESP, out)) })
+        Some(Received::Handshake { peer, cert: Box::new(cert), reply: Some(self.finish_handshake(HS_RESP, out)) })
     }
 
     fn handle_resp(&self, packet: &[u8]) -> Option<Received> {
@@ -343,14 +340,12 @@ impl Links {
             (p.peer, p.initiator.clone())
         };
         let (transport, payload) = ini.finish(&with_decoded_ephemeral(&packet[HS_RESP_HDR..])?).ok()?;
-        let p = HandshakePayload::decode(&payload).ok()?;
-        if p.group_id != self.group.id {
-            return None;
-        }
+        // IK: the responder's key is the one we initiated to; its certificate must match it
+        let cert = self.member_cert(&payload).filter(|c| c.body.node == peer)?;
         let mut inner = self.inner.write();
         inner.pending.remove(&receiver_idx)?;
         inner.install(Arc::new(Session::new(peer, receiver_idx, sender_idx, transport, self.obfs.clone(), true)));
-        Some(Received::Handshake { peer, reply: None })
+        Some(Received::Handshake { peer, cert: Box::new(cert), reply: None })
     }
 
     fn handle_data(&self, packet: &mut [u8]) -> Option<Received> {
@@ -368,14 +363,12 @@ impl Links {
     }
 
     /// Handles a wire packet from a peer: unmasks it, then processes the HS_INIT, HS_RESP or DATA
-    /// inside. `members` lists the nodes allowed to connect (called only when an unknown
-    /// initiator key shows up). Packets that do not authenticate give `None`. `Data::plain`
-    /// indexes into `packet`.
-    pub fn receive(&self, packet: &mut [u8], members: impl FnOnce() -> Vec<NodeId>) -> Option<Received> {
+    /// inside. Packets that do not authenticate give `None`. `Data::plain` indexes into `packet`.
+    pub fn receive(&self, packet: &mut [u8]) -> Option<Received> {
         let len = self.obfs.open(packet)?;
         let packet = &mut packet[..len];
         match packet[0] {
-            HS_INIT => self.handle_init(packet, members),
+            HS_INIT => self.handle_init(packet),
             HS_RESP => self.handle_resp(packet),
             DATA => self.handle_data(packet),
             _ => None,
@@ -424,6 +417,7 @@ impl Links {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::group::{CertBody, GroupSecret};
     use crate::proto::KIND_IP;
 
     struct Side {
@@ -431,25 +425,34 @@ mod tests {
         links: Links,
     }
 
-    fn side(psk: [u8; 32]) -> Side {
-        let identity = Arc::new(Identity::generate());
-        Side { id: identity.id(), links: Links::new(identity, Group::from_psk(psk)) }
+    fn member(secret: &GroupSecret, identity: &Identity) -> Group {
+        let cert = secret.issue(CertBody::new(identity.id(), "n", vec![]));
+        Group { id: secret.id(), psk: secret.psk(0), obfs: Profile::default(), cert }
+    }
+
+    fn side_with(identity: Identity, group: Group) -> Side {
+        Side { id: identity.id(), links: Links::new(Arc::new(identity), group) }
+    }
+
+    fn side(secret: &GroupSecret) -> Side {
+        let identity = Identity::generate();
+        let g = member(secret, &identity);
+        side_with(identity, g)
     }
 
     fn pair() -> (Side, Side) {
-        let psk = crate::crypto::random_bytes();
-        (side(psk), side(psk))
+        let secret = GroupSecret::generate();
+        (side(&secret), side(&secret))
     }
 
     /// A -> B handshake; returns whether both ends completed it.
     fn handshake(a: &Side, b: &Side) -> bool {
         let Some(mut init) = a.links.initiate(b.id, Duration::ZERO).and_then(|mut p| p.pop()) else { return false };
-        let Some(Received::Handshake { peer, reply: Some(mut resp) }) = b.links.receive(&mut init, || vec![a.id])
-        else {
+        let Some(Received::Handshake { peer, cert, reply: Some(mut resp) }) = b.links.receive(&mut init) else {
             return false;
         };
-        assert_eq!(peer, a.id);
-        matches!(a.links.receive(&mut resp, Vec::new), Some(Received::Handshake { peer, reply: None }) if peer == b.id)
+        assert_eq!((peer, cert.body.node), (a.id, a.id));
+        matches!(a.links.receive(&mut resp), Some(Received::Handshake { peer, cert, reply: None }) if peer == b.id && cert.body.node == b.id)
     }
 
     fn data(from: &Side, to: &NodeId, body: &[u8]) -> Option<Vec<u8>> {
@@ -463,7 +466,7 @@ mod tests {
     }
 
     fn deliver(to: &Side, mut packet: Vec<u8>) -> Option<(NodeId, Vec<u8>)> {
-        match to.links.receive(&mut packet, Vec::new)? {
+        match to.links.receive(&mut packet)? {
             Received::Data { session, plain } => Some((session.peer, packet[plain].to_vec())),
             _ => None,
         }
@@ -482,33 +485,59 @@ mod tests {
     }
 
     #[test]
-    fn different_psk_no_session() {
-        let (a, b) = (side([1; 32]), side([2; 32]));
-        assert!(!handshake(&a, &b), "group ids differ: no reply");
+    fn different_group_no_session() {
+        let (a, b) = (side(&GroupSecret::generate()), side(&GroupSecret::generate()));
+        assert!(!handshake(&a, &b), "other psk and group id: no reply");
         assert!(a.links.current(&b.id).is_none() && b.links.current(&a.id).is_none());
     }
 
     #[test]
     fn same_group_id_wrong_psk_no_session() {
-        let (a, mut b) = pair();
-        b.links.group.psk = [9; 32]; // as if a node knew the group id but not the psk
+        let secret = GroupSecret::generate();
+        let a = side(&secret);
+        let ib = Identity::generate();
+        let mut g = member(&secret, &ib);
+        g.psk = [9; 32]; // as if a node had a valid certificate but not the psk
+        let b = side_with(ib, g);
         assert!(!handshake(&a, &b));
         assert!(a.links.current(&b.id).is_none());
     }
 
+    /// The psk alone is not enough: the initiator must present a valid certificate for its own key.
     #[test]
-    fn unknown_initiator_rejected() {
-        let (a, b) = pair();
-        let mut init = a.links.initiate(b.id, Duration::ZERO).unwrap().pop().unwrap();
-        assert!(b.links.receive(&mut init, Vec::new).is_none(), "a is not a member of b's network");
+    fn certificate_required() {
+        let secret = GroupSecret::generate();
+        let b = side(&secret);
+        type MakeCert<'a> = Box<dyn Fn(&Identity) -> Cert + 'a>;
+        let bad_certs: [MakeCert; 3] = [
+            // signed by another group
+            Box::new(|i| GroupSecret::generate().issue(CertBody::new(i.id(), "x", vec![]))),
+            // expired
+            Box::new(|i| {
+                let mut body = CertBody::new(i.id(), "x", vec![]);
+                body.not_after = 1;
+                secret.issue(body)
+            }),
+            // valid, but for somebody else's key
+            Box::new(|_| secret.issue(CertBody::new(Identity::generate().id(), "x", vec![]))),
+        ];
+        for (i, make) in bad_certs.iter().enumerate() {
+            let ia = Identity::generate();
+            let mut g = member(&secret, &ia);
+            g.cert = make(&ia);
+            let a = side_with(ia, g);
+            assert!(!handshake(&a, &b), "bad cert {i} accepted");
+            // and as a responder
+            assert!(!handshake(&b, &a), "bad cert {i} accepted from the responder");
+        }
     }
 
     #[test]
     fn replayed_init_gets_no_reply() {
         let (a, b) = pair();
         let init = a.links.initiate(b.id, Duration::ZERO).unwrap().pop().unwrap();
-        assert!(b.links.receive(&mut init.clone(), || vec![a.id]).is_some());
-        assert!(b.links.receive(&mut init.clone(), || vec![a.id]).is_none(), "same TAI64N timestamp");
+        assert!(b.links.receive(&mut init.clone()).is_some());
+        assert!(b.links.receive(&mut init.clone()).is_none(), "same TAI64N timestamp");
     }
 
     #[test]
@@ -536,13 +565,11 @@ mod tests {
     fn forged_resp_does_not_cancel_pending_handshake() {
         let (a, b) = pair();
         let mut init = a.links.initiate(b.id, Duration::ZERO).unwrap().pop().unwrap();
-        let Some(Received::Handshake { reply: Some(resp), .. }) = b.links.receive(&mut init, || vec![a.id]) else {
-            panic!()
-        };
+        let Some(Received::Handshake { reply: Some(resp), .. }) = b.links.receive(&mut init) else { panic!() };
         let mut forged = resp.clone();
         forged[60] ^= 1; // inside the encrypted payload (the tail may be padding)
-        assert!(a.links.receive(&mut forged, Vec::new).is_none());
-        assert!(a.links.receive(&mut resp.clone(), Vec::new).is_some(), "genuine reply still accepted");
+        assert!(a.links.receive(&mut forged).is_none());
+        assert!(a.links.receive(&mut resp.clone()).is_some(), "genuine reply still accepted");
     }
 
     #[test]
@@ -565,14 +592,10 @@ mod tests {
         let (a, b) = pair();
         let mut ia = a.links.initiate(b.id, Duration::ZERO).unwrap().pop().unwrap();
         let mut ib = b.links.initiate(a.id, Duration::ZERO).unwrap().pop().unwrap();
-        let Some(Received::Handshake { reply: Some(mut ra), .. }) = b.links.receive(&mut ia, || vec![a.id]) else {
-            panic!()
-        };
-        let Some(Received::Handshake { reply: Some(mut rb), .. }) = a.links.receive(&mut ib, || vec![b.id]) else {
-            panic!()
-        };
-        assert!(a.links.receive(&mut ra, Vec::new).is_some());
-        assert!(b.links.receive(&mut rb, Vec::new).is_some());
+        let Some(Received::Handshake { reply: Some(mut ra), .. }) = b.links.receive(&mut ia) else { panic!() };
+        let Some(Received::Handshake { reply: Some(mut rb), .. }) = a.links.receive(&mut ib) else { panic!() };
+        assert!(a.links.receive(&mut ra).is_some());
+        assert!(b.links.receive(&mut rb).is_some());
         for _ in 0..3 {
             assert!(deliver(&b, data(&a, &b.id, b"ab").unwrap()).is_some());
             assert!(deliver(&a, data(&b, &a.id, b"ba").unwrap()).is_some());
@@ -581,19 +604,21 @@ mod tests {
 
     #[test]
     fn junk_and_signatures_precede_init_and_are_ignored() {
-        let psk = crate::crypto::random_bytes();
-        let mut group = Group::from_psk(psk);
-        group.obfs.signatures = vec!["<b 0x16030301> <r 40>".parse().unwrap()];
-        let (ia, ib) = (Arc::new(Identity::generate()), Arc::new(Identity::generate()));
-        let (a, b) = (Links::new(ia.clone(), group.clone()), Links::new(ib.clone(), group));
+        let secret = GroupSecret::generate();
+        let (ia, ib) = (Identity::generate(), Identity::generate());
+        let (mut ga, mut gb) = (member(&secret, &ia), member(&secret, &ib));
+        ga.obfs.signatures = vec!["<b 0x16030301> <r 40>".parse().unwrap()];
+        gb.obfs = ga.obfs.clone();
+        let (ia, ib) = (Arc::new(ia), Arc::new(ib));
+        let (a, b) = (Links::new(ia.clone(), ga), Links::new(ib.clone(), gb));
         let packets = a.initiate(ib.id(), Duration::ZERO).unwrap();
         assert!((1 + 4 + 1..=1 + 8 + 1).contains(&packets.len()), "signature, 4-8 junk, init");
         assert_eq!(packets[0][..4], [0x16, 0x03, 0x03, 0x01]);
         let (init, prelude) = packets.split_last().unwrap();
         for p in prelude {
-            assert!(b.receive(&mut p.clone(), || vec![ia.id()]).is_none());
+            assert!(b.receive(&mut p.clone()).is_none());
         }
-        assert!(b.receive(&mut init.clone(), || vec![ia.id()]).is_some());
+        assert!(b.receive(&mut init.clone()).is_some());
     }
 
     #[test]
@@ -612,7 +637,6 @@ mod tests {
 #[cfg(test)]
 mod bench {
     use super::*;
-    use crate::crypto::random_bytes;
 
     /// Session seal + open of a 1400-byte packet, same workload as the v3 `bench_peer_cipher`
     /// (84.6k pkt/s, 0.95 Gbit/s on the dev machine).
@@ -620,21 +644,25 @@ mod bench {
     #[test]
     #[ignore]
     fn bench_session() {
-        let psk = random_bytes();
-        let (ia, ib) = (Arc::new(Identity::generate()), Arc::new(Identity::generate()));
-        let (a, b) = (Links::new(ia.clone(), Group::from_psk(psk)), Links::new(ib.clone(), Group::from_psk(psk)));
-        let mut init = a.initiate(ib.id(), Duration::ZERO).unwrap().pop().unwrap();
-        let Some(Received::Handshake { reply: Some(mut resp), .. }) = b.receive(&mut init, || vec![ia.id()]) else {
-            panic!()
+        let secret = crate::group::GroupSecret::generate();
+        let group = |i: &Identity| Group {
+            id: secret.id(),
+            psk: secret.psk(0),
+            obfs: Profile::default(),
+            cert: secret.issue(crate::group::CertBody::new(i.id(), "n", vec![])),
         };
-        a.receive(&mut resp, Vec::new).unwrap();
+        let (ia, ib) = (Arc::new(Identity::generate()), Arc::new(Identity::generate()));
+        let (a, b) = (Links::new(ia.clone(), group(&ia)), Links::new(ib.clone(), group(&ib)));
+        let mut init = a.initiate(ib.id(), Duration::ZERO).unwrap().pop().unwrap();
+        let Some(Received::Handshake { reply: Some(mut resp), .. }) = b.receive(&mut init) else { panic!() };
+        a.receive(&mut resp).unwrap();
         let tx = a.current(&ib.id()).unwrap();
         let mut buf = vec![0u8; 2048];
         let n = 100_000;
         let t = Instant::now();
         for _ in 0..n {
             let len = tx.seal(&mut buf, 1400).unwrap();
-            match b.receive(&mut buf[..len], Vec::new) {
+            match b.receive(&mut buf[..len]) {
                 Some(Received::Data { .. }) => {}
                 _ => panic!("decrypt failed"),
             }

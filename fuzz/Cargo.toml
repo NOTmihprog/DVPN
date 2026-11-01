@@ -47,3 +47,10 @@ path = "fuzz_targets/obfs_template.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "group_cert"
+path = "fuzz_targets/group_cert.rs"
+test = false
+doc = false
+bench = false

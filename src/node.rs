@@ -134,7 +134,7 @@ impl Node {
         loop {
             tick.tick().await;
             for c in &self.clients {
-                let out = c.tick(&self.storage);
+                let out = c.tick();
                 self.send_tracker(c, out).await;
             }
         }
@@ -239,9 +239,15 @@ impl Node {
 
     async fn handle_peer_packet(&self, packet: &mut [u8], from: SocketAddr) {
         let storage = &self.storage;
-        match self.links.receive(packet, || storage.others()) {
+        match self.links.receive(packet) {
             None => {}
-            Some(Received::Handshake { peer, reply }) => {
+            Some(Received::Handshake { peer, cert, reply }) => {
+                // name and address as the certificate states them (also for peers that did not
+                // come through the tracker, e.g. static ones)
+                let update = PeerUpdate::from_cert(&cert);
+                if storage.get(&peer).is_none_or(|(r, _)| Some(r.name) != update.name || Some(r.addr) != update.addr) {
+                    storage.set_peer(peer, update);
+                }
                 self.roam(peer, from);
                 storage.update_link(&peer, |l| l.last_seen = Some(Instant::now()));
                 match reply {

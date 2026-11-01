@@ -31,6 +31,7 @@ use std::net::SocketAddr;
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 
+use crate::group::Cert;
 use crate::identity::NodeId;
 
 pub const HELLO: u8 = 0x01;
@@ -62,26 +63,25 @@ pub const CONTROL_LEN: usize = 1 + 1 + 8;
 
 pub const MAX_DATAGRAM: usize = 65507;
 
-/// Max peer ids in a single `Search` so the datagram stays well under the MTU.
-pub const SEARCH_BATCH: usize = 32;
+/// Most groups one announce may list.
+pub const MAX_ANNOUNCE_CERTS: usize = 16;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TrackerMsg {
-    /// Client -> server: "I am `peer_id`, at the address you see this packet from". `sig` is made
-    /// with `peer_id`'s key over this session's handshake transcript
-    /// (`TrackerSession::announce_msg`), so only the key owner can announce it.
+    /// Client -> server: "I am `node`, at the address you see this packet from, a member of the
+    /// groups of these certificates". `sig` is made with `node`'s key over this session's
+    /// handshake transcript (`TrackerSession::announce_msg`), so only the key owner can announce
+    /// it; the server checks each certificate against its group id (PLAN §11).
     Announce {
-        peer_id: NodeId,
+        node: NodeId,
+        certs: Vec<Cert>,
         sig: Signature,
     },
-    /// Client -> server: "I want to connect to these peers".
-    Search {
-        peers: Vec<NodeId>,
-    },
-    /// Server -> client: `peer_id` is reachable at `addr`. Sent for our own id in reply to
-    /// an announce, and for a searched peer once both sides searched for each other.
+    /// Server -> client: the member with this certificate is reachable at `addr`. Sent for every
+    /// online member of the client's groups in reply to an announce (the client's own address
+    /// included), and to all members when a node comes online or moves.
     Found {
-        peer_id: NodeId,
+        cert: Box<Cert>,
         addr: SocketAddr,
     },
     Close,

@@ -1,29 +1,23 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
 use arc_swap::ArcSwap;
-use parking_lot::{Mutex, RwLock};
-use serde::{Deserialize, Serialize};
+use parking_lot::RwLock;
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 
+use crate::group::Cert;
 use crate::identity::NodeId;
 use crate::logger::node;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct PeerRecord {
-    /// The node key; written as `key` (`peer_id` from earlier v4 builds is still read).
-    #[serde(rename = "key", alias = "peer_id")]
+    /// The node key.
     pub peer_id: NodeId,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub addr: Option<Ipv4Addr>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_args: Option<Map<String, Value>>,
 }
 
@@ -59,6 +53,13 @@ pub struct PeerUpdate {
     pub addr: Option<Option<Ipv4Addr>>,
     pub endpoint: Option<Option<SocketAddr>>,
     pub sub_args: Option<Option<Map<String, Value>>>,
+}
+
+impl PeerUpdate {
+    /// Name and address as the peer's (verified) membership certificate states them.
+    pub fn from_cert(cert: &Cert) -> Self {
+        PeerUpdate { name: Some(Some(cert.body.name.clone())), addr: Some(cert.body.ipv4()), ..Default::default() }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,53 +185,27 @@ impl PacketView {
 }
 
 pub struct PeerStorage {
-    path: Option<PathBuf>,
     inner: RwLock<Inner>,
     view: ArcSwap<PacketView>,
-    write_lock: Mutex<()>,
     events: broadcast::Sender<Event>,
 }
 
 impl PeerStorage {
-    /// Loads peers from `path` (JSON array); `None` keeps everything in memory.
-    pub fn load(self_id: NodeId, path: Option<PathBuf>) -> anyhow::Result<Self> {
-        let mut records: Vec<PeerRecord> = Vec::new();
-        if let Some(p) = &path {
-            match std::fs::read(p) {
-                Ok(data) => {
-                    records = serde_json::from_slice(&data).with_context(|| {
-                        format!(
-                            "parse {} (v3 files with 32-char peer ids are not supported, peers are node keys now)",
-                            p.display()
-                        )
-                    })?
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log::warn!("PeerStorage | read file({}) error: {e}", p.display()),
-            }
-        }
-        let mut inner = Inner {
+    /// Peers live in memory only: they are learned from the tracker and from handshakes, each
+    /// with its membership certificate (PLAN stage 3), so nothing needs to be kept on disk.
+    pub fn new(self_id: NodeId) -> Self {
+        let inner = Inner {
             self_id,
             order: vec![self_id],
             peers: HashMap::from([(self_id, Peer::new(PeerRecord::new(self_id)))]),
             by_endpoint: HashMap::new(),
             by_addr: HashMap::new(),
         };
-        for rec in records {
-            let id = rec.peer_id;
-            if !inner.peers.contains_key(&id) {
-                inner.order.push(id);
-            }
-            inner.peers.insert(id, Peer::new(rec));
-        }
-        inner.reindex_addr();
-        Ok(PeerStorage {
-            path,
+        PeerStorage {
             view: ArcSwap::from_pointee(PacketView::build(&inner)),
             inner: RwLock::new(inner),
-            write_lock: Mutex::new(()),
             events: broadcast::channel(1024).0,
-        })
+        }
     }
 
     /// Call with the write lock held, after any change the packet path can see.
@@ -246,20 +221,6 @@ impl PeerStorage {
         let _ = self.events.send(event);
     }
 
-    fn save(&self) {
-        let Some(path) = &self.path else { return };
-        let _guard = self.write_lock.lock();
-        let records: Vec<PeerRecord> = {
-            let inner = self.inner.read();
-            inner.order.iter().map(|id| inner.peers[id].rec.clone()).collect()
-        };
-        let data = serde_json::to_vec_pretty(&records).expect("records serialize");
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, path)) {
-            log::warn!("PeerStorage | write file({}) error: {e}", path.display());
-        }
-    }
-
     pub fn self_id(&self) -> NodeId {
         self.inner.read().self_id
     }
@@ -269,7 +230,6 @@ impl PeerStorage {
     }
 
     pub fn set_peer(&self, id: NodeId, u: PeerUpdate) {
-        let persist = u.name.is_some() || u.addr.is_some() || u.sub_args.is_some();
         let event = {
             let mut inner = self.inner.write();
             let action = if inner.peers.contains_key(&id) {
@@ -300,12 +260,7 @@ impl PeerStorage {
             let p = &inner.peers[&id];
             Event::Peer { action, record: p.rec.clone(), endpoint: p.endpoint }
         };
-        // A newly added peer is persisted even if only its endpoint was given.
-        let added = matches!(event, Event::Peer { action: Action::Add, .. });
         self.emit(event);
-        if persist || added {
-            self.save();
-        }
     }
 
     pub fn del_peer(&self, id: &NodeId) -> bool {
@@ -319,7 +274,6 @@ impl PeerStorage {
             p.rec
         };
         self.emit(Event::Peer { action: Action::Del, record: rec, endpoint: None });
-        self.save();
         true
     }
 
@@ -450,7 +404,7 @@ mod tests {
     #[test]
     fn set_and_route() {
         let me = NodeId::random();
-        let s = PeerStorage::load(me, None).unwrap();
+        let s = PeerStorage::new(me);
         let other = NodeId::random();
         let ip = Ipv4Addr::new(10, 0, 0, 2);
         let ep: SocketAddr = "1.2.3.4:5000".parse().unwrap();
@@ -471,7 +425,7 @@ mod tests {
     #[test]
     fn packet_view_follows_changes() {
         let me = NodeId::random();
-        let s = PeerStorage::load(me, None).unwrap();
+        let s = PeerStorage::new(me);
         let other = NodeId::random();
         let (ip, ip2) = (Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 3));
         let ep: SocketAddr = "1.2.3.4:5000".parse().unwrap();
@@ -493,7 +447,7 @@ mod tests {
     #[test]
     fn resolve_full_key_and_unique_prefix() {
         let me = NodeId::random();
-        let s = PeerStorage::load(me, None).unwrap();
+        let s = PeerStorage::new(me);
         let unknown = NodeId::random();
         assert_eq!(s.resolve(&unknown.to_string()), Ok(unknown), "full keys need not be known (set adds them)");
         assert_eq!(s.resolve(&format!(" {me}\n")), Ok(me));
@@ -522,21 +476,8 @@ mod tests {
     }
 
     #[test]
-    fn record_json_uses_key() {
-        let id = NodeId::random();
-        let r = PeerRecord { name: Some("a".into()), addr: Some(Ipv4Addr::new(10, 0, 0, 1)), ..PeerRecord::new(id) };
-        let json = serde_json::to_value(&r).unwrap();
-        assert_eq!(json["key"], id.to_string());
-        assert!(json.get("peer_id").is_none());
-        let back: PeerRecord = serde_json::from_value(json).unwrap();
-        assert_eq!(back.peer_id, id);
-        let old: PeerRecord = serde_json::from_str(&format!(r#"{{"peer_id":"{id}"}}"#)).unwrap();
-        assert_eq!(old.peer_id, id, "earlier v4 builds wrote peer_id");
-    }
-
-    #[test]
     fn endpoint_moves_between_peers() {
-        let s = PeerStorage::load(NodeId::random(), None).unwrap();
+        let s = PeerStorage::new(NodeId::random());
         let (a, b) = (NodeId::random(), NodeId::random());
         let ep: SocketAddr = "1.2.3.4:5000".parse().unwrap();
         s.set_peer(a, PeerUpdate { endpoint: Some(Some(ep)), ..Default::default() });
@@ -551,7 +492,7 @@ mod bench {
     use super::*;
 
     fn populated(n: u8) -> (Arc<PeerStorage>, Vec<Ipv4Addr>, Vec<NodeId>) {
-        let s = Arc::new(PeerStorage::load(NodeId::random(), None).unwrap());
+        let s = Arc::new(PeerStorage::new(NodeId::random()));
         let (mut ips, mut ids) = (Vec::new(), Vec::new());
         for i in 0..n {
             let ip = Ipv4Addr::new(10, 0, 0, i + 2);

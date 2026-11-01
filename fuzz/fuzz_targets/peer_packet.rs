@@ -5,21 +5,24 @@
 
 use std::sync::{Arc, OnceLock};
 
-use dvpn::identity::{Identity, NodeId};
+use dvpn::group::{CertBody, GroupSecret};
+use dvpn::identity::Identity;
 use dvpn::link::{Group, Links};
 use libfuzzer_sys::fuzz_target;
 
 /// Built once: nothing is ever accepted, so no state carries over between inputs.
-fn links() -> &'static (Links, NodeId) {
-    static L: OnceLock<(Links, NodeId)> = OnceLock::new();
+fn links() -> &'static Links {
+    static L: OnceLock<Links> = OnceLock::new();
     L.get_or_init(|| {
         let me = Arc::new(Identity::from_seed(&[1; 32]));
-        (Links::new(me, Group::from_psk([3; 32])), Identity::from_seed(&[2; 32]).id())
+        let secret = GroupSecret::from_bytes([3; 32]);
+        let cert = secret.issue(CertBody::new(me.id(), "fuzz", vec![]));
+        let group = Group { id: secret.id(), psk: secret.psk(0), obfs: Default::default(), cert };
+        Links::new(me, group)
     })
 }
 
 fuzz_target!(|data: &[u8]| {
-    let (links, peer) = links();
     let mut packet = data.to_vec();
-    assert!(links.receive(&mut packet, || vec![*peer]).is_none(), "fuzzer forged a packet");
+    assert!(links().receive(&mut packet).is_none(), "fuzzer forged a packet");
 });

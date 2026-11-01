@@ -147,6 +147,14 @@ impl CertBody {
         }
     }
 
+    /// The node's IPv4 address in the group: the first IPv4 prefix (a /32 host).
+    pub fn ipv4(&self) -> Option<std::net::Ipv4Addr> {
+        self.prefixes.iter().find_map(|p| match p {
+            IpNet::V4(n) => Some(n.addr()),
+            IpNet::V6(_) => None,
+        })
+    }
+
     fn signed_message(&self, ctx: &[u8]) -> Vec<u8> {
         let mut m = ctx.to_vec();
         m.extend(postcard::to_stdvec(self).expect("cert body serializes"));
@@ -270,6 +278,102 @@ impl Cert {
     }
 }
 
+/// A tracker as given in invites and config: the host as typed (domain or IP), port and key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackerRef {
+    pub host: String,
+    pub port: u16,
+    pub key: [u8; 32],
+}
+
+const INVITE_VERSION: u8 = 1;
+
+/// Everything a node needs to join a group (PLAN §5.3), as one base64url string: the group psk
+/// of the current epoch, the obfuscation profile, trackers, and a one-time join key with its grant.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Invite {
+    pub version: u8,
+    /// Suggested local name of the group.
+    pub name: String,
+    pub epoch: u32,
+    pub psk: [u8; 32],
+    /// `[groups.obfs]` entries as `(key, value)` text, applied as is by the joining node.
+    pub obfs: Vec<(String, String)>,
+    pub trackers: Vec<TrackerRef>,
+    pub join: Join,
+}
+
+impl fmt::Debug for Invite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Invite")
+            .field("name", &self.name)
+            .field("group", &self.group())
+            .field("epoch", &self.epoch)
+            .field("trackers", &self.trackers)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InviteError {
+    Encoding,
+    Version(u8),
+    /// The grant does not verify: corrupted, or not made by this group.
+    Grant(CertError),
+    Expired,
+}
+
+impl fmt::Display for InviteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InviteError::Encoding => f.write_str("not an invite (bad encoding)"),
+            InviteError::Version(v) => write!(f, "invite version {v} is not supported"),
+            InviteError::Grant(e) => write!(f, "invalid invite: {e}"),
+            InviteError::Expired => f.write_str("invite expired"),
+        }
+    }
+}
+
+impl std::error::Error for InviteError {}
+
+impl Invite {
+    pub fn new(
+        name: &str,
+        epoch: u32,
+        psk: [u8; 32],
+        obfs: Vec<(String, String)>,
+        trackers: Vec<TrackerRef>,
+        join: Join,
+    ) -> Self {
+        Invite { version: INVITE_VERSION, name: name.to_owned(), epoch, psk, obfs, trackers, join }
+    }
+
+    pub fn group(&self) -> GroupId {
+        self.join.template.group
+    }
+
+    pub fn encode(&self) -> String {
+        crate::crypto::encode_b64(&postcard::to_stdvec(self).expect("invite serializes"))
+    }
+
+    /// Decodes and checks an invite: the grant must be the group's and, if `now` is given,
+    /// still usable.
+    pub fn decode(s: &str, now: Option<u64>) -> Result<Self, InviteError> {
+        let bytes = crate::crypto::decode_b64(s.trim()).map_err(|_| InviteError::Encoding)?;
+        let inv: Invite = postcard::from_bytes(&bytes).map_err(|_| InviteError::Encoding)?;
+        if inv.version != INVITE_VERSION {
+            return Err(InviteError::Version(inv.version));
+        }
+        // the join key must be the granted one, and the grant the group's
+        let probe = inv.join.enroll(inv.join.grant.key);
+        probe.verify(&inv.group(), None).map_err(InviteError::Grant)?;
+        if now.is_some_and(|t| t > inv.join.grant.until) {
+            return Err(InviteError::Expired);
+        }
+        Ok(inv)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +470,30 @@ mod tests {
         let mut c = cert;
         c.body.roles.0 |= Roles::ADMIN;
         assert_eq!(c.verify(&g.id(), None), Err(CertError::DelegatedAdmin));
+    }
+
+    #[test]
+    fn invite_round_trip_and_checks() {
+        let g = GroupSecret::generate();
+        let join = g.grant_join(CertBody::new(NodeId::random(), "b", vec![net("10.10.0.7/32")]), now_unix() + 60);
+        let tracker = TrackerRef { host: "tracker.example".into(), port: 6485, key: [3; 32] };
+        let inv = Invite::new("home", 0, g.psk(0), vec![("jc".into(), "1-2".into())], vec![tracker.clone()], join);
+        let text = inv.encode();
+        let back = Invite::decode(&text, Some(now_unix())).unwrap();
+        assert_eq!((back.group(), back.psk, back.trackers, back.obfs.len()), (g.id(), g.psk(0), vec![tracker], 1));
+        let node = Identity::generate().id();
+        assert_eq!(back.join.enroll(node).verify(&g.id(), Some(now_unix())), Ok(()));
+
+        assert_eq!(Invite::decode(&text, Some(now_unix() + 61)).err(), Some(InviteError::Expired));
+        assert_eq!(Invite::decode("not an invite", None).err(), Some(InviteError::Encoding));
+        // another join key than the granted one
+        let mut bad = inv.clone();
+        bad.join.key = random_bytes();
+        assert!(matches!(Invite::decode(&bad.encode(), None), Err(InviteError::Grant(_))));
+        // a grant claimed for another group
+        let mut bad = inv;
+        bad.join.template.group = GroupSecret::generate().id();
+        assert!(matches!(Invite::decode(&bad.encode(), None), Err(InviteError::Grant(_))));
     }
 
     proptest! {

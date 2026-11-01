@@ -4,18 +4,18 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use ipnet::{IpNet, Ipv4Net};
 use log::LevelFilter;
-use serde_json::Value as Json;
 
 use dvpn::{api, config, logger, node, tracker_server, transport};
 
-use dvpn::config::{Config, PEERS_FILE_NAME, SOCKET_DEFAULT_ADDR};
-use dvpn::crypto::{decode_b64, encode_b64, random_bytes};
+use dvpn::config::{Config, GroupConfig, SOCKET_DEFAULT_ADDR, parse_obfs};
+use dvpn::crypto::{encode_b64, random_bytes};
+use dvpn::group::{CertBody, GroupSecret, Invite, JOIN_TTL_SECS, now_unix};
 use dvpn::identity::Identity;
-use dvpn::identity::NodeId;
-use dvpn::storage::{PeerRecord, PeerStorage, PeerUpdate};
+use dvpn::storage::{PeerStorage, PeerUpdate};
 use dvpn::tracker_client::TrackerClient;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -25,7 +25,7 @@ const EMAIL: &str = "mih@mihprog.com";
 #[derive(Parser)]
 #[command(name = "dvpn", disable_version_flag = true, about = "Decentralized P2P VPN")]
 struct Cli {
-    /// Directory with config.toml and peers.json (default: executable directory)
+    /// Directory with config.toml (default: executable directory)
     #[arg(long, global = true, env = "DVPN_DIR")]
     dir: Option<PathBuf>,
 
@@ -45,19 +45,9 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Args)]
-struct OutputArgs {
-    /// Do not encode json to base64
-    #[arg(short = 'j', long = "json")]
-    json: bool,
-    /// Output file path
-    #[arg(short = 'o', long = "output")]
-    out: Option<PathBuf>,
-}
-
 #[derive(Subcommand)]
 enum Command {
-    /// Generate a random 32-byte key (base64url): a node private key or a group psk
+    /// Generate a random 32-byte key (base64url), e.g. a node private key
     GenKey,
     /// Print the node public key (node id) from config.toml / DVPN_PRIVATE_KEY
     ShowKey {
@@ -66,53 +56,9 @@ enum Command {
         #[arg(short = 'k', long, allow_hyphen_values = true)]
         key: Option<String>,
     },
-    /// Set or add peer or peer parameters
-    Set {
-        /// Node key (public, base64url; see show-key). A unique prefix of a known key is enough
-        #[arg(short = 'p', long = "peer", value_name = "KEY", allow_hyphen_values = true)]
-        peer_id: String,
-        /// Peer name, "None" to clear
-        #[arg(short = 'n', long)]
-        name: Option<String>,
-        /// IPv4 address in the LAN network, "None" to clear
-        #[arg(short = 'a', long)]
-        addr: Option<String>,
-        /// Clear parameters that are not given
-        #[arg(short = 'c', long)]
-        clear: bool,
-    },
-    /// Delete a peer
-    Del {
-        /// Node key or a unique prefix
-        #[arg(short = 'p', long = "peer", value_name = "KEY", allow_hyphen_values = true)]
-        peer_id: String,
-    },
-    /// Show peers table
-    List,
-    /// Export peers to base64 or json
-    Export(OutputArgs),
-    /// Import peers from base64 or json
-    Import {
-        /// Input file path (default: read from stdin)
-        #[arg(short = 'i', long = "input")]
-        inp: Option<PathBuf>,
-        /// Delete current peers first
-        #[arg(short = 'c', long = "clear")]
-        clear: bool,
-    },
-    /// Export one peer to base64 or json
-    ExportPeer {
-        /// Node key or a unique prefix, default: self
-        #[arg(short = 'p', long = "peer", value_name = "KEY", allow_hyphen_values = true)]
-        peer_id: Option<String>,
-        #[command(flatten)]
-        out: OutputArgs,
-    },
-    /// Import one peer from base64 or json
-    ImportPeer {
-        #[arg(short = 'i', long = "input")]
-        inp: Option<PathBuf>,
-    },
+    /// Groups: create one (this node becomes its admin), invite nodes, join by invite
+    #[command(subcommand)]
+    Group(GroupCommand),
     /// Start peer discovery server
     Server {
         /// Server bind ipv4 addr
@@ -124,6 +70,52 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum GroupCommand {
+    /// Create a group; this node becomes its admin and first member
+    Create {
+        /// Local name of the group
+        name: String,
+        /// This node's address in the group (default: random in 10.10.33.0 with the [net] mask)
+        #[arg(short = 'a', long)]
+        addr: Option<Ipv4Addr>,
+        /// This node's name in the group (default: start of its key)
+        #[arg(short = 'n', long = "node-name")]
+        node_name: Option<String>,
+    },
+    /// Print an invite for one new node (admins only)
+    Invite {
+        /// Group name or id (default: the only group)
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+        /// Name of the new node
+        #[arg(short = 'n', long, default_value = "member")]
+        name: String,
+        /// Address of the new node (default: random in the group network)
+        #[arg(short = 'a', long)]
+        addr: Option<Ipv4Addr>,
+        /// Hours the invite can be used
+        #[arg(long, default_value_t = JOIN_TTL_SECS / 3600)]
+        ttl: u64,
+    },
+    /// Join a group by invite (from the argument, a file or stdin)
+    Join {
+        // base64url may start with '-'
+        #[arg(allow_hyphen_values = true)]
+        invite: Option<String>,
+        /// Read the invite from a file
+        #[arg(short = 'i', long = "input")]
+        inp: Option<PathBuf>,
+    },
+    /// List the groups of this node
+    List,
+    /// Leave a group (removes it from config.toml)
+    Leave {
+        /// Group name or id
+        group: String,
+    },
+}
+
 fn die(msg: impl std::fmt::Display) -> ! {
     log::error!("{msg}");
     exit(1)
@@ -131,11 +123,6 @@ fn die(msg: impl std::fmt::Display) -> ! {
 
 fn default_dir() -> PathBuf {
     std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// A full node key, or a unique prefix of one already in the storage.
-fn resolve_peer_id(s: &str, storage: &PeerStorage) -> NodeId {
-    storage.resolve(s).unwrap_or_else(|e| die(format!("Node key {s}: {e}")))
 }
 
 fn github_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -155,81 +142,156 @@ fn github_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     out.join("\n")
 }
 
-fn list_peers(storage: &PeerStorage) {
-    let self_id = storage.self_id();
-    let rows: Vec<Vec<String>> = storage
-        .list()
-        .into_iter()
-        .map(|(r, _)| {
-            let name = r.name.clone().unwrap_or_else(|| "None".into());
-            vec![
-                if r.peer_id == self_id { format!("[{name}]") } else { name },
-                r.peer_id.to_string(),
-                r.addr.map_or_else(|| "None".into(), |a| a.to_string()),
-            ]
-        })
-        .collect();
-    println!("\n{}\n", github_table(&["Name", "Key", "Addr"], &rows));
+fn net_prefix(conf: &Config) -> u8 {
+    conf.net.as_ref().map_or(24, |n| n.prefix)
 }
 
-fn export_value(r: &PeerRecord) -> Json {
-    serde_json::json!({ "name": r.name, "key": r.peer_id, "addr": r.addr })
-}
-
-fn write_output(args: &OutputArgs, data: &Json) {
-    let mut text = data.to_string();
-    if !args.json {
-        text = encode_b64(text.as_bytes());
-    }
-    match &args.out {
-        None => println!("{text}"),
-        Some(p) => std::fs::write(p, text).unwrap_or_else(|e| die(format!("Write file error: {e}"))),
-    }
-}
-
-fn read_input(inp: &Option<PathBuf>) -> Json {
-    let text = match inp {
-        Some(p) => std::fs::read_to_string(p).unwrap_or_else(|e| die(format!("Open file error: {e}"))),
-        None => {
-            print!("Paste peers string: ");
-            let _ = std::io::stdout().flush();
-            let mut s = String::new();
-            let _ = std::io::stdin().lock().read_line(&mut s);
-            s
+/// A random host of `net` that is none of `taken`.
+fn free_host(net: Ipv4Net, taken: &[Ipv4Addr]) -> Ipv4Addr {
+    loop {
+        let a = config::random_host(net.network(), net.prefix_len());
+        if !taken.contains(&a) {
+            return a;
         }
-    };
-    let text = text.trim();
-    let decoded = decode_b64(text).ok().and_then(|b| String::from_utf8(b).ok());
-    serde_json::from_str(decoded.as_deref().unwrap_or(text)).unwrap_or_else(|_| die("Load error"))
-}
-
-fn parse_import(v: Json) -> anyhow::Result<PeerRecord> {
-    Ok(serde_json::from_value(v)?)
-}
-
-fn store_import(storage: &PeerStorage, r: PeerRecord) {
-    storage.set_peer(
-        r.peer_id,
-        PeerUpdate { name: Some(r.name), addr: Some(r.addr), endpoint: None, sub_args: r.sub_args.map(Some) },
-    );
-}
-
-/// `None` = not given, `Some(None)` = "None" literal (clear), `Some(Some(v))` = set.
-fn cli_field(v: Option<String>) -> Option<Option<String>> {
-    v.map(|s| if s == "None" || s.is_empty() { None } else { Some(s) })
-}
-
-fn cmd_set(storage: &PeerStorage, peer_id: String, name: Option<String>, addr: Option<String>, clear: bool) {
-    let id = resolve_peer_id(&peer_id, storage);
-    let addr = cli_field(addr)
-        .map(|a| a.map(|s| s.parse::<Ipv4Addr>().unwrap_or_else(|e| die(format!("addr invalid, error: {e}")))));
-    let name = cli_field(name);
-    fn pick<T>(f: Option<Option<T>>, clear: bool) -> Option<Option<T>> {
-        if clear { Some(f.flatten()) } else { f }
     }
-    storage
-        .set_peer(id, PeerUpdate { name: pick(name, clear), addr: pick(addr, clear), endpoint: None, sub_args: None });
-    list_peers(storage);
+}
+
+fn host_net(addr: Ipv4Addr) -> Vec<IpNet> {
+    vec![IpNet::V4(Ipv4Net::new(addr, 32).expect("/32 is valid"))]
+}
+
+fn cmd_group(conf: &mut Config, cmd: GroupCommand) {
+    match cmd {
+        GroupCommand::Create { name, addr, node_name } => {
+            if conf.group(&name).is_some() {
+                die(format!("group {name} already exists"));
+            }
+            if !conf.groups.is_empty() {
+                die("this node is already in a group; several groups per node come later (PLAN stage 3.5)");
+            }
+            let prefix = net_prefix(conf);
+            let net = Ipv4Net::new(Ipv4Addr::new(10, 10, 33, 0), prefix).unwrap_or_else(|e| die(e)).trunc();
+            let addr = addr.unwrap_or_else(|| free_host(net, &[]));
+            let id = conf.identity.id();
+            let secret = GroupSecret::generate();
+            let node_name = node_name.unwrap_or_else(|| id.short());
+            let mut body = CertBody::new(id, &node_name, host_net(addr));
+            body.roles.0 = dvpn::group::Roles::ADMIN;
+            let cert = secret.issue(body);
+            let g = GroupConfig {
+                name: name.clone(),
+                id: secret.id(),
+                psk: secret.psk(0),
+                secret: Some(secret),
+                epoch: 0,
+                cert: Some(cert),
+                obfs: Default::default(),
+                obfs_entries: Vec::new(),
+            };
+            println!("Group {name}: {}\nThis node: {node_name}, {addr}/{prefix}, admin", g.id);
+            conf.add_group(g);
+            conf.save();
+            println!("The group secret is in config.toml ([[groups]] secret): back it up, it cannot be recovered.");
+            println!("Invite nodes with: dvpn group invite --name <name>");
+        }
+        GroupCommand::Invite { group, name, addr, ttl } => {
+            let g = match &group {
+                Some(gr) => conf.group(gr).unwrap_or_else(|| die(format!("no group {gr}"))),
+                None if conf.groups.len() == 1 => &conf.groups[0],
+                None => die("give the group with --group"),
+            };
+            let Some(secret) = &g.secret else { die(format!("only admins of {} can invite", g.name)) };
+            let own = g.ipv4().unwrap_or_else(|| die("this node has no address in the group"));
+            let net = Ipv4Net::new(own, net_prefix(conf)).unwrap_or_else(|e| die(e)).trunc();
+            let addr = addr.unwrap_or_else(|| free_host(net, &[own]));
+            if conf.servers.is_empty() {
+                log::warn!("No [servers] configured: the invite has no tracker, the new node will not find anybody");
+            }
+            let template = CertBody::new(conf.identity.id(), &name, host_net(addr));
+            let join = secret.grant_join(template, now_unix() + ttl * 3600);
+            let trackers = conf.servers.iter().map(|s| s.tracker_ref()).collect();
+            let inv = Invite::new(&g.name, g.epoch, g.psk, g.obfs_entries.clone(), trackers, join);
+            eprintln!("Invite for {name} ({addr}) to {}, valid {ttl} h, for one node:", g.name);
+            println!("{}", inv.encode());
+        }
+        GroupCommand::Join { invite, inp } => {
+            let text = match (invite, inp) {
+                (Some(t), _) => t,
+                (None, Some(p)) => {
+                    std::fs::read_to_string(&p).unwrap_or_else(|e| die(format!("read {}: {e}", p.display())))
+                }
+                (None, None) => {
+                    print!("Paste invite: ");
+                    let _ = std::io::stdout().flush();
+                    let mut s = String::new();
+                    let _ = std::io::stdin().lock().read_line(&mut s);
+                    s
+                }
+            };
+            let inv = Invite::decode(&text, Some(now_unix())).unwrap_or_else(|e| die(e));
+            if conf.groups.iter().any(|g| g.id == inv.group()) {
+                die(format!("already in group {}", inv.group()));
+            }
+            if !conf.groups.is_empty() {
+                die("this node is already in a group; several groups per node come later (PLAN stage 3.5)");
+            }
+            let obfs = parse_obfs(&inv.obfs).unwrap_or_else(|e| die(format!("invite obfuscation profile: {e:#}")));
+            let cert = inv.join.enroll(conf.identity.id());
+            let body = cert.body.clone();
+            let mut name = inv.name.clone();
+            while conf.group(&name).is_some() {
+                name.push('_');
+            }
+            let added: Vec<String> =
+                inv.trackers.iter().filter(|t| conf.add_server(t)).map(|t| format!("{}:{}", t.host, t.port)).collect();
+            conf.add_group(GroupConfig {
+                name: name.clone(),
+                id: inv.group(),
+                secret: None,
+                epoch: inv.epoch,
+                psk: inv.psk,
+                cert: Some(cert),
+                obfs,
+                obfs_entries: inv.obfs.clone(),
+            });
+            conf.save();
+            let addr = body.ipv4().map_or_else(|| "no address".into(), |a| a.to_string());
+            println!("Joined group {name} ({}) as {}, {addr}", inv.group(), body.name);
+            if !added.is_empty() {
+                println!("Added servers: {}", added.join(", "));
+            }
+        }
+        GroupCommand::List => {
+            let rows: Vec<Vec<String>> = conf
+                .groups
+                .iter()
+                .map(|g| {
+                    let cert = g.cert.as_ref();
+                    vec![
+                        g.name.clone(),
+                        g.id.to_string(),
+                        if g.secret.is_some() { "admin".into() } else { "member".into() },
+                        cert.map_or_else(String::new, |c| c.body.name.clone()),
+                        g.ipv4().map_or_else(String::new, |a| a.to_string()),
+                        cert.map_or_else(String::new, |c| {
+                            let days = c.body.not_after.saturating_sub(now_unix()) / 86400;
+                            if c.grant.is_some() { format!("{days} d (invite)") } else { format!("{days} d") }
+                        }),
+                    ]
+                })
+                .collect();
+            println!("\n{}\n", github_table(&["Group", "Id", "Role", "Name", "Addr", "Cert valid"], &rows));
+        }
+        GroupCommand::Leave { group } => {
+            let id = conf.group(&group).unwrap_or_else(|| die(format!("no group {group}"))).id;
+            if conf.groups.iter().any(|g| g.id == id && g.secret.is_some()) {
+                log::warn!("Leaving a group this node administers: its secret is removed from config.toml");
+            }
+            conf.remove_group(&id);
+            conf.save();
+            println!("Left group {group}");
+        }
+    }
 }
 
 fn api_addr_default(conf: &Config) -> String {
@@ -247,9 +309,9 @@ fn api_addr_default(conf: &Config) -> String {
     SOCKET_DEFAULT_ADDR.to_owned()
 }
 
-fn build_tun(net: &config::NetConfig) -> anyhow::Result<tun_rs::AsyncDevice> {
+fn build_tun(net: &config::NetConfig, addr: Ipv4Addr) -> anyhow::Result<tun_rs::AsyncDevice> {
     let dev =
-        tun_rs::DeviceBuilder::new().name(&net.tun_name).ipv4(net.addr, net.prefix, None).mtu(net.mtu).build_async()?;
+        tun_rs::DeviceBuilder::new().name(&net.tun_name).ipv4(addr, net.prefix, None).mtu(net.mtu).build_async()?;
     Ok(dev)
 }
 
@@ -258,7 +320,20 @@ async fn wait_ctrl_c() {
     log::info!(" Pressed Ctrl+C, exiting.");
 }
 
-async fn run_node(conf: Config, storage: Arc<PeerStorage>, api_addr: Option<String>) {
+async fn run_node(conf: Config, api_addr: Option<String>) {
+    let group = match conf.groups.as_slice() {
+        [] => die("not in any group: create one (dvpn group create) or join one (dvpn group join)"),
+        [g] => g.clone(),
+        _ => die("several groups per node come later (PLAN stage 3.5): leave all but one"),
+    };
+    let Some(cert) = group.cert.clone() else { die(format!("no certificate for group {}", group.name)) };
+    if let Err(e) = cert.verify(&group.id, Some(now_unix())) {
+        die(format!("own certificate in group {}: {e}; ask an admin for a new invite", group.name));
+    }
+    let self_addr = cert.body.ipv4();
+    let storage = Arc::new(PeerStorage::new(conf.identity.id()));
+    storage.set_peer(conf.identity.id(), PeerUpdate::from_cert(&cert));
+
     let api_addr = api_addr.unwrap_or_else(|| api_addr_default(&conf));
     let api_sock = api::ApiSocket::bind(&api_addr)
         .await
@@ -279,22 +354,29 @@ async fn run_node(conf: Config, storage: Arc<PeerStorage>, api_addr: Option<Stri
         log::info!("Peer | Listen address: {a}");
     }
 
-    let tun = conf.net.as_ref().map(|net| match build_tun(net) {
-        Ok(dev) => {
-            log::info!("TUN | {} {}/{} mtu {} - started", net.tun_name, net.addr, net.prefix, net.mtu);
-            dev
+    let tun = conf.net.as_ref().map(|net| {
+        let addr = self_addr.unwrap_or_else(|| die("the group certificate has no IPv4 address for the TUN interface"));
+        match build_tun(net, addr) {
+            Ok(dev) => {
+                log::info!("TUN | {} {addr}/{} mtu {} - started", net.tun_name, net.prefix, net.mtu);
+                dev
+            }
+            Err(e) => die(format!("TUN | Tun init error: {e}")),
         }
-        Err(e) => die(format!("TUN | Tun init error: {e}")),
     });
 
-    let Some(group) = conf.group.clone() else {
-        die("[group] psk is required to run a node: generate one with `dvpn gen-key`, the same on every node")
-    };
+    log::info!("Group {} ({}) as {}", group.name, group.id.short(), cert.body.name);
     let identity = Arc::new(conf.identity.clone());
-    let links = dvpn::link::Links::new(identity.clone(), group);
-    let clients =
-        conf.servers.iter().map(|s| TrackerClient::new(s.name.clone(), s.addr, s.key, identity.clone())).collect();
-    let node = node::Node::new(storage, transport, links, clients, tun, conf.net.as_ref().map(|n| n.addr));
+    let links = dvpn::link::Links::new(
+        identity.clone(),
+        dvpn::link::Group { id: group.id, psk: group.psk, obfs: group.obfs.clone(), cert: cert.clone() },
+    );
+    let clients = conf
+        .servers
+        .iter()
+        .map(|s| TrackerClient::new(s.name.clone(), s.addr, s.key, identity.clone(), vec![cert.clone()]))
+        .collect();
+    let node = node::Node::new(storage.clone(), transport, links, clients, tun, self_addr);
     node.start();
     let _api = api::Api::start(node.clone(), api_sock);
 
@@ -353,22 +435,6 @@ fn main() {
         conf.net = None;
     }
 
-    let storage = PeerStorage::load(conf.identity.id(), Some(dir.join(PEERS_FILE_NAME)))
-        .unwrap_or_else(|e| die(format!("Error, {e:#}")));
-    let self_id = storage.self_id();
-
-    // peers.json is the source of truth for the own LAN address once it is set.
-    if let Some(net_addr) = conf.net.as_ref().map(|n| n.addr) {
-        match storage.get(&self_id).and_then(|(r, _)| r.addr) {
-            None => storage.set_peer(self_id, PeerUpdate { addr: Some(Some(net_addr)), ..Default::default() }),
-            Some(a) if a != net_addr => {
-                conf.set_net_addr(a);
-                conf.save();
-            }
-            Some(_) => {}
-        }
-    }
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -378,57 +444,11 @@ fn main() {
         None => {
             log::info!("Starting dvpn {VERSION}");
             log::info!("Node key: {}", conf.identity.id());
-            rt.block_on(run_node(conf, Arc::new(storage), cli.api_addr));
+            rt.block_on(run_node(conf, cli.api_addr));
         }
         Some(Command::GenKey | Command::ShowKey { key: Some(_) }) => unreachable!(),
         Some(Command::ShowKey { key: None }) => println!("{}", conf.identity.id()),
-        Some(Command::Set { peer_id, name, addr, clear }) => cmd_set(&storage, peer_id, name, addr, clear),
-        Some(Command::Del { peer_id }) => {
-            let id = resolve_peer_id(&peer_id, &storage);
-            if storage.is_self(&id) {
-                die("error delete self peer");
-            }
-            storage.del_peer(&id);
-            list_peers(&storage);
-        }
-        Some(Command::List) => list_peers(&storage),
-        Some(Command::Export(out)) => {
-            let peers: Vec<Json> = storage.list().iter().map(|(r, _)| export_value(r)).collect();
-            write_output(&out, &Json::Array(peers));
-        }
-        Some(Command::Import { inp, clear }) => {
-            let Json::Array(items) = read_input(&inp) else { die("data is not a list") };
-            if clear {
-                for id in storage.ids() {
-                    if !storage.is_self(&id) {
-                        storage.del_peer(&id);
-                    }
-                }
-            }
-            for item in items {
-                match parse_import(item) {
-                    Ok(r) => store_import(&storage, r),
-                    Err(e) => log::warn!("Skip peer: {e:#}"),
-                }
-            }
-            list_peers(&storage);
-        }
-        Some(Command::ExportPeer { peer_id, out }) => {
-            let id = peer_id.map_or(self_id, |p| resolve_peer_id(&p, &storage));
-            let (r, _) = storage.get(&id).unwrap_or_else(|| die(format!("Peer_id {id} not found")));
-            write_output(&out, &export_value(&r));
-        }
-        Some(Command::ImportPeer { inp }) => {
-            let v = read_input(&inp);
-            if !v.is_object() {
-                die("data is not an object");
-            }
-            match parse_import(v) {
-                Ok(r) => store_import(&storage, r),
-                Err(e) => die(format!("Peer load error: {e:#}")),
-            }
-            list_peers(&storage);
-        }
+        Some(Command::Group(cmd)) => cmd_group(&mut conf, cmd),
         Some(Command::Server { addr, port }) => rt.block_on(run_server(&mut conf, addr, port)),
     }
 }

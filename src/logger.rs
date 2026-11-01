@@ -114,7 +114,7 @@ mod tests {
     // The only test that attaches a storage: LOGGER is process-global.
     #[test]
     fn node_display_and_no_deadlock_under_storage_lock() {
-        let s = Arc::new(PeerStorage::load(NodeId::random(), None).unwrap());
+        let s = Arc::new(PeerStorage::new(NodeId::random()));
         let (a, b) = (NodeId::random(), NodeId::random());
         let ip = Ipv4Addr::new(10, 0, 0, 5);
         s.set_peer(a, PeerUpdate { name: Some(Some("alice".into())), addr: Some(Some(ip)), ..Default::default() });

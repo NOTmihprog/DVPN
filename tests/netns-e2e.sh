@@ -9,7 +9,8 @@
 #               node A 192.168.1.2  node B 192.168.2.2
 #
 # A and B are each behind their own NAT, so A<->B only works through hole punching.
-# Overlay: A 10.10.33.1, B 10.10.33.2, C 10.10.33.3, all links encrypted.
+# Overlay: A 10.10.33.1 (group admin), B 10.10.33.2, C 10.10.33.3 (joined by invite), all links
+# encrypted.
 #
 #   tests/netns-e2e.sh                  # debug build, ~10 s
 #   DVPN=target/release/dvpn tests/netns-e2e.sh
@@ -115,33 +116,28 @@ TKEY=$(sed -n 's/^public_key = "\(.*\)"/\1/p' trk/config.toml)
 ok "tracker up"
 
 # ---- nodes ----------------------------------------------------------------------------
-# setup NAME OVERLAY_ADDR: config with the tracker and the group psk, own address, export own record.
+# A creates the group (its admin) and invites B and C: no keys or peer lists are exchanged by
+# hand, the invite carries the group psk, the tracker and a one-time join key.
 # Every command gets --dir, otherwise dvpn would write config.toml next to the binary.
-PSK=$("$D" --dir "$W/trk" gen-key)
-setup() {
-    mkdir "$1"
-    "$D" --dir "$W/$1" list >/dev/null
-    cat >> "$1/config.toml" <<TOML
+mkdir a b c
+key=$("$D" --dir "$W/a" show-key)
+[ ${#key} -eq 43 ] || fail "show-key printed '$key', want a 43-char key"
+cat >> a/config.toml <<TOML
 
 [servers.main]
 addr = "203.0.113.1"
 port = 6485
 key = "$TKEY"
-
-[group]
-psk = "$PSK"
 TOML
-    key=$("$D" --dir "$W/$1" show-key)
-    [ ${#key} -eq 43 ] || fail "$1: show-key printed '$key', want a 43-char key"
-    "$D" --dir "$W/$1" set -p "$key" -n "$1" -a "$2" >/dev/null
-    "$D" --dir "$W/$1" export-peer -o "$W/$1.peer"
+"$D" --dir "$W/a" group create e2e -a 10.10.33.1 -n a >/dev/null || fail "group create"
+join() { # join NAME ADDR
+    inv=$("$D" --dir "$W/a" group invite -n "$1" -a "$2" 2>/dev/null) || fail "invite for $1"
+    "$D" --dir "$W/$1" group join "$inv" >/dev/null || fail "$1 could not join"
+    grep -q '203.0.113.1' "$1/config.toml" || fail "$1: the invite did not add the tracker"
 }
-setup a 10.10.33.1
-setup b 10.10.33.2
-setup c 10.10.33.3
-for n in a b c; do
-    for p in a b c; do [ $n = $p ] || "$D" --dir "$W/$n" import-peer -i "$W/$p.peer" >/dev/null; done
-done
+join b 10.10.33.2
+join c 10.10.33.3
+"$D" --dir "$W/b" group list | grep -q 'e2e.*member.*10.10.33.2' || fail "b: group list"
 # All namespaces share one /run, so the default unix API socket would collide: use UDP
 # on each namespace's own loopback instead.
 for n in a b c; do bg "node-$n" $n "$D" --dir "$W/$n" -a 127.0.0.1:9902; done

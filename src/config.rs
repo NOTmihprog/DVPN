@@ -9,12 +9,11 @@ use rand::RngExt;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::crypto::{decode_b64, decode_key32, encode_b64};
+use crate::group::{Cert, GroupId, GroupSecret, TrackerRef};
 use crate::identity::Identity;
-use crate::link::Group;
 use crate::obfs::{MAX_PAD, MAX_WIRE, Profile, Template};
 
 pub const CONFIG_FILE_NAME: &str = "config.toml";
-pub const PEERS_FILE_NAME: &str = "peers.json";
 /// Overrides `[identity] private_key`; never written to the config file.
 pub const PRIVATE_KEY_ENV: &str = "DVPN_PRIVATE_KEY";
 
@@ -37,8 +36,8 @@ bind_addr = "0.0.0.0"
 # local port or port range, example: "8647", "8647-9942"
 bind_port = "8647-9942"
 
-# Discovery servers, any number of [servers.<name>] sections.
-# key = server Ed25519 public key (base64), printed by `dvpn server` on start.
+# Discovery servers, any number of [servers.<name>] sections; `dvpn group join` adds the
+# ones from the invite. key = server Ed25519 public key, printed by `dvpn server` on start.
 # [servers.example]
 # addr = "203.0.113.10"
 # port = 6485
@@ -48,24 +47,12 @@ bind_port = "8647-9942"
 # tun interface name (Wintun adapter name on windows)
 tun_name = "dnet"
 mtu = 1350
-addr = "{addr}"
-# netmask as "255.255.255.0" or prefix length "24"
+# netmask of the group network as "255.255.255.0" or prefix length "24";
+# the own address comes from the group certificate
 mask = "255.255.255.0"
 
-# Shared by every node of the network; without it sessions cannot be established.
-# Generate once with `dvpn gen-key` and copy to all nodes. (Real groups with invites: stage 3.)
-# [group]
-# psk = "..."
-#
-# Obfuscation profile, identical on all nodes (defaults shown; AmneziaWG-style names).
-# [group.obfs]
-# jc = "4-8"        # junk packets before each handshake
-# jmin = 40         # junk packet sizes
-# jmax = 200
-# s1 = "0-96"       # random padding of handshake initiations
-# s2 = "0-96"       # ... of handshake responses
-# s4 = "0-48"       # ... of data packets
-# i1 = "<b 0x16030301> <r 32> <t>"   # optional signature packets i1..i5, sent before the junk
+# Groups ([[groups]] sections) are written by `dvpn group create` (new group, this node is its
+# admin) and `dvpn group join <invite>`; see `dvpn group --help`.
 
 [app]
 # Log Levels DEBUG, INFO, WARNING, ERROR, CRITICAL
@@ -80,22 +67,53 @@ pub struct PeerConfig {
 pub struct NetConfig {
     pub tun_name: String,
     pub mtu: u16,
-    pub addr: Ipv4Addr,
+    /// Prefix length of the group network; the address itself comes from the certificate.
     pub prefix: u8,
 }
 
 pub struct ServerConfig {
     pub name: String,
+    /// As written (domain or IP), for invites.
+    pub host: String,
+    pub port: u16,
     pub addr: SocketAddr,
     pub key: VerifyingKey,
+}
+
+impl ServerConfig {
+    pub fn tracker_ref(&self) -> TrackerRef {
+        TrackerRef { host: self.host.clone(), port: self.port, key: self.key.to_bytes() }
+    }
+}
+
+/// A `[[groups]]` entry (PLAN §12).
+#[derive(Clone, Debug)]
+pub struct GroupConfig {
+    pub name: String,
+    pub id: GroupId,
+    /// Admins only.
+    pub secret: Option<GroupSecret>,
+    pub epoch: u32,
+    pub psk: [u8; 32],
+    /// This node's membership certificate.
+    pub cert: Option<Cert>,
+    pub obfs: Profile,
+    /// `[groups.obfs]` as written, passed on in invites.
+    pub obfs_entries: Vec<(String, String)>,
+}
+
+impl GroupConfig {
+    /// The own IPv4 address in the group: the first IPv4 host of the certificate.
+    pub fn ipv4(&self) -> Option<Ipv4Addr> {
+        self.cert.as_ref()?.body.ipv4()
+    }
 }
 
 pub struct Config {
     path: PathBuf,
     doc: DocumentMut,
     pub identity: Identity,
-    /// `[group] psk`, set by hand until real groups (stage 3).
-    pub group: Option<Group>,
+    pub groups: Vec<GroupConfig>,
     pub peer: PeerConfig,
     pub net: Option<NetConfig>,
     pub servers: Vec<ServerConfig>,
@@ -120,7 +138,8 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     std::fs::write(path, text)
 }
 
-fn random_host(net: Ipv4Addr, prefix: u8) -> Ipv4Addr {
+/// A random host address in `net/prefix` (not the network or broadcast address).
+pub fn random_host(net: Ipv4Addr, prefix: u8) -> Ipv4Addr {
     let hosts = (1u32 << (32 - prefix)) - 2;
     let n = rand::rng().random_range(1..=hosts);
     Ipv4Addr::from(u32::from(net) + n)
@@ -153,35 +172,49 @@ where
     Ok(a..=b)
 }
 
-/// `[group.obfs]`: the group's obfuscation profile (PLAN §4.4). Unknown keys are errors, so a
-/// typo cannot silently fall back to defaults.
-fn parse_obfs(t: &Table) -> anyhow::Result<Profile> {
+/// `[groups.obfs]` entries as text, in file order: integers and booleans are written as text too.
+fn obfs_entries(t: &Table) -> anyhow::Result<Vec<(String, String)>> {
+    t.iter()
+        .map(|(k, item)| {
+            let v = match item.as_value() {
+                Some(toml_edit::Value::String(s)) => s.value().clone(),
+                Some(toml_edit::Value::Integer(i)) => i.value().to_string(),
+                Some(toml_edit::Value::Boolean(b)) => b.value().to_string(),
+                _ => bail!("{k}: expected a string, integer or boolean"),
+            };
+            Ok((k.to_owned(), v))
+        })
+        .collect()
+}
+
+/// The group's obfuscation profile (PLAN §4.4) from `[groups.obfs]` entries. Unknown keys are
+/// errors, so a typo cannot silently fall back to defaults.
+pub fn parse_obfs(entries: &[(String, String)]) -> anyhow::Result<Profile> {
     let mut p = Profile::default();
     let (mut jmin, mut jmax) = (*p.junk_size.start(), *p.junk_size.end());
     let mut signatures: [Option<Template>; 5] = Default::default();
-    for (key, item) in t.iter() {
-        let text = || get_str_or_int(t, key).with_context(|| key.to_owned());
+    for (key, text) in entries {
+        let key = key.as_str();
         let pad = || -> anyhow::Result<RangeInclusive<u16>> {
-            let r = parse_range::<u16>(&text()?).with_context(|| key.to_owned())?;
+            let r = parse_range::<u16>(text).with_context(|| key.to_owned())?;
             if *r.end() as usize > MAX_PAD {
                 bail!("{key}: padding above {MAX_PAD}");
             }
             Ok(r)
         };
         match key {
-            "jc" => p.junk_count = parse_range::<u8>(&text()?).context("jc")?,
-            "jmin" => jmin = text()?.parse().context("jmin")?,
-            "jmax" => jmax = text()?.parse().context("jmax")?,
+            "jc" => p.junk_count = parse_range::<u8>(text).context("jc")?,
+            "jmin" => jmin = text.trim().parse().context("jmin")?,
+            "jmax" => jmax = text.trim().parse().context("jmax")?,
             "s1" => p.init_pad = pad()?,
             "s2" => p.resp_pad = pad()?,
             "s4" => p.data_pad = pad()?,
             "i1" | "i2" | "i3" | "i4" | "i5" => {
-                let s = item.as_str().ok_or_else(|| anyhow!("{key} is not a string"))?;
                 let i = key.as_bytes()[1] - b'1';
-                signatures[i as usize] = Some(s.parse().map_err(|e| anyhow!("{key}: {e}"))?);
+                signatures[i as usize] = Some(text.parse().map_err(|e| anyhow!("{key}: {e}"))?);
             }
             "header_protection" => {
-                if item.as_bool() != Some(true) {
+                if text != "true" {
                     bail!("header_protection cannot be turned off: basic masking is always on");
                 }
             }
@@ -194,6 +227,49 @@ fn parse_obfs(t: &Table) -> anyhow::Result<Profile> {
     p.junk_size = jmin..=jmax;
     p.signatures = signatures.into_iter().flatten().collect();
     Ok(p)
+}
+
+fn parse_group(t: &Table) -> anyhow::Result<GroupConfig> {
+    let name = get_str(t, "name")?.to_owned();
+    let epoch = match t.get("epoch") {
+        Some(i) => u32::try_from(i.as_integer().ok_or_else(|| anyhow!("epoch is not an integer"))?).context("epoch")?,
+        None => 0,
+    };
+    let secret = match t.get("secret") {
+        Some(_) => Some(GroupSecret::from_bytes(decode_key32(get_str(t, "secret")?).context("secret")?)),
+        None => None,
+    };
+    let id: Option<GroupId> = match t.get("id") {
+        Some(_) => Some(get_str(t, "id")?.parse().map_err(|e| anyhow!("id: {e}"))?),
+        None => None,
+    };
+    let (id, psk) = match &secret {
+        Some(sec) => {
+            if id.is_some_and(|id| id != sec.id()) {
+                bail!("id does not match the secret");
+            }
+            (sec.id(), sec.psk(epoch))
+        }
+        None => (
+            id.ok_or_else(|| anyhow!("id not found"))?,
+            decode_key32(get_str(t, "psk").context("members need psk (admins: secret)")?).context("psk")?,
+        ),
+    };
+    let cert = match t.get("cert") {
+        Some(_) => {
+            let bytes = decode_b64(get_str(t, "cert")?).context("cert")?;
+            let cert = Cert::decode(&bytes).ok_or_else(|| anyhow!("cert: not a certificate"))?;
+            cert.verify(&id, None).map_err(|e| anyhow!("cert: {e}"))?;
+            Some(cert)
+        }
+        None => None,
+    };
+    let obfs_entries = match t.get("obfs") {
+        Some(item) => obfs_entries(item.as_table().ok_or_else(|| anyhow!("obfs is not a table"))?)?,
+        None => Vec::new(),
+    };
+    let obfs = parse_obfs(&obfs_entries).map_err(|e| anyhow!("[groups.obfs] {e:#}"))?;
+    Ok(GroupConfig { name, id, secret, epoch, psk, cert, obfs, obfs_entries })
 }
 
 pub fn parse_port_range(s: &str) -> anyhow::Result<(u16, u16)> {
@@ -232,9 +308,9 @@ fn parse_peer(t: &Table) -> anyhow::Result<PeerConfig> {
 fn parse_net(t: &Table) -> anyhow::Result<NetConfig> {
     let tun_name = get_str(t, "tun_name")?.to_owned();
     let mtu = get_str_or_int(t, "mtu")?.parse().context("mtu")?;
-    let addr = get_str(t, "addr")?.parse().context("addr")?;
+    // a v3 / early v4 `addr` key is ignored: the address comes from the group certificate
     let prefix = parse_mask(&get_str_or_int(t, "mask")?).context("mask")?;
-    Ok(NetConfig { tun_name, mtu, addr, prefix })
+    Ok(NetConfig { tun_name, mtu, prefix })
 }
 
 fn parse_server(name: &str, t: &Table) -> anyhow::Result<ServerConfig> {
@@ -247,7 +323,7 @@ fn parse_server(name: &str, t: &Table) -> anyhow::Result<ServerConfig> {
         .ok_or_else(|| anyhow!("{host} has no ipv4 address"))?;
     let key_bytes = decode_key32(get_str(t, "key")?).context("key")?;
     let key = VerifyingKey::from_bytes(&key_bytes).map_err(|e| anyhow!("key: {e}"))?;
-    Ok(ServerConfig { name: name.to_owned(), addr, key })
+    Ok(ServerConfig { name: name.to_owned(), host: host.to_owned(), port, addr, key })
 }
 
 fn parse_log_level(s: &str) -> anyhow::Result<LevelFilter> {
@@ -272,9 +348,7 @@ impl Config {
     fn load_with_env_key(dir: &Path, env_key: Option<String>) -> anyhow::Result<Self> {
         let path = dir.join(CONFIG_FILE_NAME);
         if !path.exists() {
-            let addr = random_host(Ipv4Addr::new(10, 10, 33, 0), 24);
-            let text = DEFAULT_CONFIG.replace("{addr}", &addr.to_string());
-            write_private(&path, &text).with_context(|| format!("create {}", path.display()))?;
+            write_private(&path, DEFAULT_CONFIG).with_context(|| format!("create {}", path.display()))?;
         }
         let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let mut doc: DocumentMut = text.parse().with_context(|| format!("parse {}", path.display()))?;
@@ -333,26 +407,96 @@ impl Config {
             None => None,
         };
 
-        let group = match section(&doc, "group").and_then(|t| t.get("psk")) {
-            Some(item) => {
-                let s = item.as_str().ok_or_else(|| anyhow!("[group] psk is not a string in {file}"))?;
-                let mut g = Group::from_psk(decode_key32(s).map_err(|e| anyhow!("[group] psk: {e} in {file}"))?);
-                if let Some(t) = section(&doc, "group").and_then(|g| g.get("obfs")).and_then(Item::as_table) {
-                    g.obfs = parse_obfs(t).map_err(|e| anyhow!("[group.obfs] {e:#} in {file}"))?;
+        let mut groups: Vec<GroupConfig> = Vec::new();
+        if let Some(item) = doc.get("groups") {
+            let arr =
+                item.as_array_of_tables().ok_or_else(|| anyhow!("groups must be [[groups]] sections in {file}"))?;
+            for (i, t) in arr.iter().enumerate() {
+                let g = parse_group(t).map_err(|e| anyhow!("[[groups]] #{} {e:#} in {file}", i + 1))?;
+                if groups.iter().any(|o| o.name == g.name || o.id == g.id) {
+                    bail!("[[groups]] {} is listed twice in {file}", g.name);
                 }
-                Some(g)
+                groups.push(g);
             }
-            None => None,
-        };
+        }
+        if section(&doc, "group").is_some() {
+            log::warn!("[group] psk in {file} is ignored: create or join a group (dvpn group --help)");
+        }
 
-        Ok(Config { path, doc, identity, group, peer, net, servers, log_level, local_server_key })
+        Ok(Config { path, doc, identity, groups, peer, net, servers, log_level, local_server_key })
     }
 
-    pub fn set_net_addr(&mut self, addr: Ipv4Addr) {
-        if let Some(net) = &mut self.net {
-            net.addr = addr;
-            self.doc["net"]["addr"] = value(addr.to_string());
+    pub fn group(&self, name_or_id: &str) -> Option<&GroupConfig> {
+        self.groups.iter().find(|g| g.name == name_or_id || g.id.to_string() == name_or_id)
+    }
+
+    /// Adds a `[[groups]]` entry (in memory and in the document; `save` writes it).
+    pub fn add_group(&mut self, g: GroupConfig) {
+        let mut t = Table::new();
+        t["name"] = value(g.name.as_str());
+        t["id"] = value(g.id.to_string());
+        match &g.secret {
+            Some(sec) => t["secret"] = value(encode_b64(sec.as_bytes())),
+            None => t["psk"] = value(encode_b64(&g.psk)),
         }
+        t["epoch"] = value(i64::from(g.epoch));
+        if let Some(c) = &g.cert {
+            t["cert"] = value(encode_b64(&c.encode()));
+        }
+        if !g.obfs_entries.is_empty() {
+            let mut o = Table::new();
+            for (k, v) in &g.obfs_entries {
+                o[k.as_str()] = value(v.as_str());
+            }
+            t["obfs"] = Item::Table(o);
+        }
+        if self.doc.get("groups").is_none() {
+            self.doc["groups"] = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+        }
+        if let Some(arr) = self.doc["groups"].as_array_of_tables_mut() {
+            arr.push(t);
+        }
+        self.groups.push(g);
+    }
+
+    pub fn remove_group(&mut self, id: &GroupId) -> bool {
+        let Some(i) = self.groups.iter().position(|g| &g.id == id) else { return false };
+        self.groups.remove(i);
+        if let Some(arr) = self.doc.get_mut("groups").and_then(Item::as_array_of_tables_mut) {
+            arr.remove(i);
+            if arr.is_empty() {
+                self.doc.remove("groups");
+            }
+        }
+        true
+    }
+
+    /// Adds `[servers.<name>]` for a tracker unless one with the same key is configured.
+    /// Returns whether it was added (resolving happens at the next load).
+    pub fn add_server(&mut self, t: &TrackerRef) -> bool {
+        let key = encode_b64(&t.key);
+        let servers = self.doc.get("servers").and_then(Item::as_table);
+        let exists = servers.is_some_and(|s| {
+            s.iter().any(|(_, i)| i.get("key").and_then(Item::as_str).and_then(|k| decode_key32(k).ok()) == Some(t.key))
+        });
+        if exists {
+            return false;
+        }
+        if self.doc.get("servers").is_none() {
+            let mut s = Table::new();
+            s.set_implicit(true);
+            self.doc["servers"] = Item::Table(s);
+        }
+        let mut name = t.host.replace(['.', ':', '[', ']'], "-");
+        while self.doc["servers"].get(&name).is_some() {
+            name.push('_');
+        }
+        let mut st = Table::new();
+        st["addr"] = value(t.host.as_str());
+        st["port"] = value(i64::from(t.port));
+        st["key"] = value(key);
+        self.doc["servers"][name.as_str()] = Item::Table(st);
+        true
     }
 
     pub fn set_local_server(&mut self, private_key: &[u8; 32], public_key: &[u8; 32]) {
@@ -370,7 +514,7 @@ impl Config {
     }
 
     pub fn save(&self) {
-        if let Err(e) = std::fs::write(&self.path, self.doc.to_string()) {
+        if let Err(e) = write_private(&self.path, &self.doc.to_string()) {
             log::warn!("Config | write file({}) error: {e}", self.path.display());
         }
     }
@@ -394,17 +538,63 @@ mod tests {
         assert!(parse_port_range("9-1").is_err());
     }
 
+    fn admin_group(dir: &Path) -> GroupConfig {
+        let id = Config::load_with_env_key(dir, None).unwrap().identity.id();
+        let secret = GroupSecret::generate();
+        let cert = secret.issue(crate::group::CertBody::new(id, "a", vec!["10.10.33.5/32".parse().unwrap()]));
+        GroupConfig {
+            name: "home".into(),
+            id: secret.id(),
+            psk: secret.psk(0),
+            secret: Some(secret),
+            epoch: 0,
+            cert: Some(cert),
+            obfs: Profile::default(),
+            obfs_entries: vec![("jc".into(), "1-2".into())],
+        }
+    }
+
     #[test]
-    fn default_config_roundtrip() {
+    fn groups_round_trip() {
         let dir = temp_dir();
+        let g = admin_group(&dir);
         let mut conf = Config::load(&dir).unwrap();
-        assert!(conf.net.is_some());
-        let addr = Ipv4Addr::new(10, 10, 33, 77);
-        conf.set_net_addr(addr);
+        assert!(conf.net.is_some() && conf.groups.is_empty());
+        conf.add_group(g.clone());
+        let member = GroupConfig {
+            name: "work".into(),
+            secret: None,
+            id: GroupSecret::generate().id(),
+            cert: None,
+            ..g.clone()
+        };
+        conf.add_group(member.clone());
+        let t = TrackerRef { host: "t.example".into(), port: 7000, key: [5; 32] };
+        assert!(conf.add_server(&t));
+        assert!(!conf.add_server(&t), "same key already configured");
         conf.save();
         let text = std::fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap();
         assert!(text.contains("# local bind ip"), "comments must survive save");
-        assert_eq!(Config::load(&dir).unwrap().net.unwrap().addr, addr);
+        assert!(text.contains("[servers.t-example]"), "{text}");
+
+        // the server is resolved on load: drop it again before reloading (no DNS in tests)
+        let mut doc: DocumentMut = text.parse().unwrap();
+        doc.remove("servers");
+        std::fs::write(dir.join(CONFIG_FILE_NAME), doc.to_string()).unwrap();
+        let mut back = Config::load(&dir).unwrap();
+        assert_eq!(back.groups.len(), 2);
+        let (a, m) = (&back.groups[0], &back.groups[1]);
+        assert_eq!((a.id, a.psk, a.ipv4()), (g.id, g.psk, Some(Ipv4Addr::new(10, 10, 33, 5))));
+        assert!(a.secret.is_some() && m.secret.is_none());
+        assert_eq!((m.id, m.psk), (member.id, member.psk));
+        assert_eq!(a.obfs.junk_count, 1..=2);
+        assert_eq!(back.group("work").unwrap().id, member.id);
+        assert_eq!(back.group(&g.id.to_string()).unwrap().name, "home");
+
+        assert!(back.remove_group(&g.id));
+        back.remove_group(&member.id);
+        back.save();
+        assert!(Config::load(&dir).unwrap().groups.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -484,8 +674,9 @@ mod tests {
         let dir = temp_dir();
         Config::load_with_env_key(&dir, None).unwrap();
         let path = dir.join(CONFIG_FILE_NAME);
-        let psk = encode_b64(&crate::crypto::random_bytes::<32>());
-        let text = std::fs::read_to_string(&path).unwrap() + &format!("\n[group]\npsk = \"{psk}\"\n{extra}");
+        let secret = encode_b64(&crate::crypto::random_bytes::<32>());
+        let text = std::fs::read_to_string(&path).unwrap()
+            + &format!("\n[[groups]]\nname = \"g\"\nsecret = \"{secret}\"\n{extra}");
         std::fs::write(&path, text).unwrap();
         let r = Config::load_with_env_key(&dir, None);
         std::fs::remove_dir_all(dir).unwrap();
@@ -494,15 +685,15 @@ mod tests {
 
     #[test]
     fn group_obfs_profile() {
-        assert_eq!(with_group("").unwrap().group.unwrap().obfs, Profile::default());
+        assert_eq!(with_group("").unwrap().groups[0].obfs, Profile::default());
         let c = with_group(
-            "[group.obfs]\njc = \"1-2\"\njmin = 10\njmax = \"20\"\ns1 = \"5-6\"\ns2 = 7\ns4 = \"0-0\"\n\
+            "[groups.obfs]\njc = \"1-2\"\njmin = 10\njmax = \"20\"\ns1 = \"5-6\"\ns2 = 7\ns4 = \"0-0\"\n\
              i2 = \"<r 3>\"\ni1 = \"<b 0xab>\"\nheader_protection = true\n",
         )
         .unwrap();
-        let o = c.group.unwrap().obfs;
-        assert_eq!((o.junk_count, o.junk_size), (1..=2, 10..=20));
-        assert_eq!((o.init_pad, o.resp_pad, o.data_pad), (5..=6, 7..=7, 0..=0));
+        let o = &c.groups[0].obfs;
+        assert_eq!((o.junk_count.clone(), o.junk_size.clone()), (1..=2, 10..=20));
+        assert_eq!((o.init_pad.clone(), o.resp_pad.clone(), o.data_pad.clone()), (5..=6, 7..=7, 0..=0));
         assert_eq!(o.signatures, vec!["<b 0xab>".parse().unwrap(), "<r 3>".parse().unwrap()], "kept in i1..i5 order");
 
         for (bad, why) in [
@@ -514,9 +705,20 @@ mod tests {
             ("header_protection = false", "cannot be turned off"),
             ("h1 = \"1-5\"", "unknown key h1"),
         ] {
-            let err = format!("{:#}", with_group(&format!("[group.obfs]\n{bad}\n")).err().unwrap());
-            assert!(err.contains(why) && err.contains("[group.obfs]"), "{bad}: {err}");
+            let err = format!("{:#}", with_group(&format!("[groups.obfs]\n{bad}\n")).err().unwrap());
+            assert!(err.contains(why) && err.contains("[groups.obfs]"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn group_errors() {
+        let err = format!("{:#}", with_group("id = \"AAAA\"").err().unwrap());
+        assert!(err.contains("id"), "{err}");
+        let other = GroupSecret::generate().id();
+        let err = format!("{:#}", with_group(&format!("id = \"{other}\"")).err().unwrap());
+        assert!(err.contains("does not match"), "{err}");
+        let err = format!("{:#}", with_group("cert = \"AAAA\"").err().unwrap());
+        assert!(err.contains("cert"), "{err}");
     }
 
     #[test]
