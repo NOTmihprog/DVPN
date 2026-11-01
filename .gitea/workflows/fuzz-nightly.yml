@@ -1,0 +1,46 @@
+# Long fuzzing: every target for 10 minutes, in parallel, growing a corpus that is kept in the
+# Actions cache (pushes start their short runs from it). Schedules run from the default branch;
+# on other branches start it by hand (Actions -> fuzz-nightly -> Run workflow).
+name: fuzz-nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: https://github.com/dtolnay/rust-toolchain@nightly
+      - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: install cargo-fuzz
+        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
+      - name: build targets
+        run: cargo +nightly fuzz build
+      - uses: https://github.com/actions/cache/restore@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: run every target for 10 minutes, in parallel
+        run: tests/fuzz-all.sh 600
+      - name: minimize the corpus
+        if: always()
+        run: |
+          cd fuzz
+          for t in $(cargo +nightly fuzz list); do
+            [ -d "corpus/$t" ] && cargo +nightly fuzz cmin "$t" >/dev/null 2>&1 || true
+            echo "$t: $(ls "corpus/$t" 2>/dev/null | wc -l) inputs"
+          done
+      - uses: https://github.com/actions/cache/save@v4
+        if: always()
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}

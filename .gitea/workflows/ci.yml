@@ -33,14 +33,18 @@ jobs:
         with:
           workspaces: fuzz
       - name: install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # ~/.cargo/bin is cached by rust-cache
+        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
       - name: build targets
         run: cargo +nightly fuzz build
-      - name: short run of every target
-        run: |
-          for t in $(cargo +nightly fuzz list); do
-            cargo +nightly fuzz run "$t" -- -max_total_time=60
-          done
+      # start from the corpus the nightly run grew (read only: pushes do not save it)
+      - uses: https://github.com/actions/cache/restore@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: run every target, in parallel
+        run: tests/fuzz-all.sh 60
 
   netns:
     runs-on: ubuntu-latest
