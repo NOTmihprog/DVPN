@@ -40,9 +40,7 @@ const RECORD_CTX: &[u8] = b"dvpn/4 record\0";
 const RECORDS_BUDGET: usize = 1100;
 const SUMMARY_CHUNK: usize = 40;
 
-pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
-}
+pub use crate::clock::now_ms;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Body {
@@ -234,7 +232,8 @@ impl Inner {
     /// LWW insert of a verified record; returns the entry if it changed the state.
     fn insert(&mut self, record: Record, now: u64) -> Result<Option<Entry>, RecordError> {
         let e = record.open()?;
-        if e.ts > now + MAX_CLOCK_SKEW_MS {
+        // with a clock that is certainly wrong (1970 before NTP) everything looks "future"
+        if crate::clock::trusted() && e.ts > now + MAX_CLOCK_SKEW_MS {
             return Err(RecordError::FromTheFuture);
         }
         let records = self.groups.entry(e.group).or_default();

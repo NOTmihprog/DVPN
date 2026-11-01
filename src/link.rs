@@ -17,7 +17,7 @@ use parking_lot::{Mutex, RwLock};
 use rand::RngExt;
 
 use crate::elligator;
-use crate::group::{Cert, GroupId, now_unix};
+use crate::group::{Cert, GroupId};
 use crate::identity::{Identity, NodeId};
 use crate::noise::{self, HandshakePayload, Initiator, Responder, TAG_LEN, Tai64n};
 use crate::obfs::{MAX_PAD, Obfs, Profile};
@@ -333,7 +333,7 @@ impl Links {
             return None;
         }
         let cert = Cert::decode(&p.cert)?;
-        if let Err(e) = cert.verify(&self.group.id, Some(now_unix())) {
+        if let Err(e) = cert.verify(&self.group.id, crate::clock::trusted_unix()) {
             log::debug!("Link | handshake from {} with {e}", crate::logger::node(cert.body.node));
             return None;
         }

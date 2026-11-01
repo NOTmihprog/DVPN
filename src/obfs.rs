@@ -143,7 +143,7 @@ impl Template {
                 Piece::Letters(n) => out.extend((0..*n).map(|_| LETTERS[rng.random_range(0..LETTERS.len())])),
                 Piece::Digits(n) => out.extend((0..*n).map(|_| b'0' + rng.random_range(0..10u8))),
                 Piece::Time => {
-                    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                    let t = crate::clock::now();
                     out.extend_from_slice(&(t.as_secs() as u32).to_be_bytes());
                 }
             }

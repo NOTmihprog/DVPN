@@ -217,6 +217,16 @@ fn epoch_of(changed: &[dvpn::state::Entry]) -> u32 {
 
 fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
     let state = || StateStore::open(dir.join(STATE_FILE_NAME));
+    let signs = matches!(
+        cmd,
+        GroupCommand::Create { .. }
+            | GroupCommand::Invite { .. }
+            | GroupCommand::Revoke { .. }
+            | GroupCommand::Rotate { .. }
+    );
+    if signs && !dvpn::clock::trusted() {
+        die("the clock is earlier than this build: set it (NTP) before signing group records or certificates");
+    }
     match cmd {
         GroupCommand::Create { name, addr, node_name } => {
             if conf.group(&name).is_some() {
@@ -480,7 +490,10 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         conf.save();
         cert = c;
     }
-    if let Err(e) = cert.verify(&group.id, Some(now_unix())) {
+    if !dvpn::clock::trusted() {
+        log::warn!("The clock is earlier than this build: certificate expiry is not checked until it is set (NTP)");
+    }
+    if let Err(e) = cert.verify(&group.id, dvpn::clock::trusted_unix()) {
         die(format!("own certificate in group {}: {e}; ask an admin for a new invite", group.name));
     }
     let self_addr = cert.body.ipv4();

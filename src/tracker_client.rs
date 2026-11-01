@@ -9,7 +9,7 @@ use ed25519_dalek::VerifyingKey;
 use parking_lot::Mutex;
 use rand::RngExt;
 
-use crate::group::{Cert, now_unix};
+use crate::group::Cert;
 use crate::identity::{Identity, NodeId};
 use crate::link::Session;
 use crate::logger::node;
@@ -319,7 +319,7 @@ impl TrackerClient {
         if !self.in_group(&cert.body.group) {
             return false;
         }
-        if let Err(e) = cert.verify(&cert.body.group, Some(now_unix())) {
+        if let Err(e) = cert.verify(&cert.body.group, crate::clock::trusted_unix()) {
             log::info!("{} Peer {} from the server: {e}", self.log_prefix, node(peer));
             return false;
         }

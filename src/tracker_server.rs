@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 
-use crate::group::{Cert, GroupId, now_unix};
+use crate::group::{Cert, GroupId};
 use crate::identity::{Identity, NodeId};
 use crate::link::Session;
 use crate::logger::node as show;
@@ -211,11 +211,11 @@ impl Server {
             .take(MAX_CANDIDATES)
             .collect();
         candidates.dedup();
-        let now = now_unix();
+        let now = crate::clock::trusted_unix();
         let mut valid: HashMap<GroupId, Cert> = HashMap::new();
         for c in certs.into_iter().take(MAX_ANNOUNCE_CERTS) {
             let group = c.body.group;
-            match c.verify(&group, Some(now)) {
+            match c.verify(&group, now) {
                 Ok(()) if c.body.node != node => {
                     log::info!("Server | {:#}: certificate of another node ignored", show(node))
                 }

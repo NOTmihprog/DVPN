@@ -157,7 +157,7 @@ impl Node {
         }
         if let Some(c) = store.cert(&self.group.id, &me)
             && c.body.not_after > self.cert.read().body.not_after
-            && c.verify(&self.group.id, Some(now_unix())).is_ok()
+            && c.verify(&self.group.id, crate::clock::trusted_unix()).is_ok()
         {
             log::info!(
                 "Group | new certificate from an admin, valid {} more days",
@@ -202,6 +202,9 @@ impl Node {
             self.peer_certs.lock().insert(id, cert.clone());
         }
         let Some(secret) = &self.group.secret else { return };
+        if !crate::clock::trusted() {
+            return; // records signed with a wrong clock would win or lose LWW races wrongly
+        }
         let store = &self.group.store;
         let g = self.group.id;
         if !Membership::of(store, &g).admits(cert) {

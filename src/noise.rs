@@ -334,7 +334,7 @@ impl Tai64n {
     const WHITEN_MASK: u32 = !0xff_ffff;
 
     pub fn now() -> Self {
-        let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let d = crate::clock::now();
         Self::from_unix(d.as_secs(), d.subsec_nanos())
     }
 

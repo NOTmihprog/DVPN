@@ -126,8 +126,12 @@ pub fn server_read(server: &Identity, packet: &[u8]) -> Option<Accepted> {
     Some(Accepted { node, timestamp, responder, sender_idx })
 }
 
-/// Whether a handshake timestamp is within `MAX_SKEW` of now.
+/// Whether a handshake timestamp is within `MAX_SKEW` of now. A tracker whose own clock is
+/// certainly wrong cannot judge, and accepts it (replays are still caught per client key).
 pub fn fresh(t: Tai64n) -> bool {
+    if !crate::clock::trusted() {
+        return true;
+    }
     let now = Tai64n::now();
     let secs = |t: &Tai64n| u64::from_be_bytes(t.0[..8].try_into().unwrap());
     secs(&now).abs_diff(secs(&t)) <= MAX_SKEW.as_secs()

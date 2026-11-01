@@ -2,6 +2,7 @@
 //! they are a library so that fuzz targets and benchmarks can reach the parsers.
 
 pub mod api;
+pub mod clock;
 pub mod config;
 pub mod crypto;
 pub mod elligator;

@@ -34,9 +34,7 @@ pub const JOIN_TTL_SECS: u64 = 24 * 3600;
 const CERT_CTX: &[u8] = b"dvpn/4 cert\0";
 const GRANT_CTX: &[u8] = b"dvpn/4 join grant\0";
 
-pub fn now_unix() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
+pub use crate::clock::now_unix;
 
 fn hkdf32(ikm: &[u8], info: &[&[u8]]) -> [u8; 32] {
     let mut out = [0u8; 32];

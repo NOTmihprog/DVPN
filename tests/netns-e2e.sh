@@ -157,11 +157,23 @@ join c 10.10.33.3
 "$D" --dir "$W/b" group list | grep -q 'e2e.*member.*10.10.33.2' || fail "b: group list"
 # All namespaces share one /run, so the default unix API socket would collide: use UDP
 # on each namespace's own loopback instead.
-for n in a b c; do bg "node-$n" $n "$D" --dir "$W/$n" -a 127.0.0.1:9902; done
+# C starts with its clock in 1970, like a router without RTC before NTP (a test-only offset
+# read from a file): the tracker does not answer its stale handshakes, nobody reaches it.
+echo -1700000000 > "$W/c.skew"
+for n in a b; do bg "node-$n" $n "$D" --dir "$W/$n" -a 127.0.0.1:9902; done
+bg node-c c env DVPN_TEST_CLOCK_SKEW_FILE="$W/c.skew" "$D" --dir "$W/c" -a 127.0.0.1:9902
 for n in a b c; do
     wait_for 10 nsx $n ip -4 addr show dnet || fail "node $n: no tun interface"
 done
 ok "nodes up"
+grep -q 'clock is earlier than this build' "$W/node-c.log" || fail "c did not notice its clock is wrong"
+sleep 4
+! grep -q 'Connection status connected' "$W/node-c.log" || fail "the tracker answered a handshake from 1970"
+! nsx a ping -c1 -W1 10.10.33.3 >/dev/null 2>&1 || fail "c reachable while its clock is in 1970"
+# "NTP" sets the clock: C connects by itself (handshake retries back off to at most 16 s)
+echo 0 > "$W/c.skew"
+wait_for 30 grep -q 'Connection status connected' "$W/node-c.log" || fail "c did not connect after its clock was set"
+ok "c with a 1970 clock joins the network once the clock is set"
 
 # ---- checks ---------------------------------------------------------------------------
 # reach FROM TO_NAME TO_ADDR: overlay ping, first contact goes through tracker + punching
