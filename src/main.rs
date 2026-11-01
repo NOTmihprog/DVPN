@@ -72,6 +72,8 @@ enum Command {
     Neighbors,
     /// Routes of the running node: mesh (through relays) and CKR (addresses and subnets)
     Routes,
+    /// Traffic counters of the running node: per member, relayed, dropped packets by reason
+    Metrics,
     /// Round trips to a member over our session with it (direct or through relays)
     Ping {
         /// Member name, node key or key prefix
@@ -212,8 +214,9 @@ enum GroupCommand {
         /// directly, with or without a tracker (set a fixed [peer] bind_port)
         #[arg(long = "static", value_name = "HOST:PORT")]
         statics: Vec<String>,
-        /// A subnet behind the new node (its LAN for site-to-site, 0.0.0.0/0 for an exit),
-        /// routed to it by members that want it (repeatable)
+        /// A subnet behind the new node (its LAN for site-to-site) or a public IPv6 /128 for it,
+        /// routed to it by every member (repeatable). Not for exits: members choose gateways
+        /// themselves (`dvpn exit`)
         #[arg(long = "route", value_name = "PREFIX")]
         routes: Vec<IpNet>,
         /// The new node relays traffic between members that cannot reach each other directly
@@ -423,6 +426,17 @@ fn diag(
         fields.push(("key", k.into()));
     }
     rt.block_on(api::query(&addr, fields)).unwrap_or_else(|e| die(format!("{e:#}")))
+}
+
+/// 1536 -> "1.5 KiB"
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let (mut v, mut u) = (n as f64, 0);
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[u]) }
 }
 
 fn mp<'a>(v: &'a rmpv::Value, k: &str) -> &'a rmpv::Value {
@@ -1254,10 +1268,15 @@ fn main() {
                         mps(n, "rtt_ms"),
                         mps(n, "alive"),
                         format!("{} s", mps(n, "session_secs")),
+                        human_bytes(mp(n, "tx_bytes").as_u64().unwrap_or_default()),
+                        human_bytes(mp(n, "rx_bytes").as_u64().unwrap_or_default()),
                     ]
                 })
                 .collect();
-            println!("\n{}\n", github_table(&["Name", "Key", "Endpoint", "RTT ms", "Alive", "Session"], &rows));
+            println!(
+                "\n{}\n",
+                github_table(&["Name", "Key", "Endpoint", "RTT ms", "Alive", "Session", "Sent", "Received"], &rows)
+            );
         }
         Some(Command::Routes) => {
             let v = diag(&rt, &conf, cli.api_addr, "routes", None);
@@ -1277,6 +1296,48 @@ fn main() {
                 .map(|r| vec![mps(r, "net"), mps(r, "to"), mps(r, "system")])
                 .collect();
             println!("\nCKR (destination: node)\n{}\n", github_table(&["Prefix", "To", "System route"], &ckr));
+        }
+        Some(Command::Metrics) => {
+            let v = diag(&rt, &conf, cli.api_addr, "metrics", None);
+            let pair = |p: &rmpv::Value| {
+                format!(
+                    "{} / {}",
+                    mp(p, "packets").as_u64().unwrap_or_default(),
+                    human_bytes(mp(p, "bytes").as_u64().unwrap_or_default())
+                )
+            };
+            let rows: Vec<Vec<String>> = mp(&v, "peers")
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|p| {
+                    vec![
+                        mps(p, "name"),
+                        mps(p, "key").chars().take(10).collect(),
+                        pair(mp(p, "ip_tx")),
+                        pair(mp(p, "ip_rx")),
+                        pair(mp(p, "wire_tx")),
+                        pair(mp(p, "wire_rx")),
+                    ]
+                })
+                .collect();
+            println!(
+                "\nUptime {} s, handshakes {}, relayed for others {}",
+                mps(&v, "uptime_secs"),
+                mps(&v, "handshakes"),
+                pair(mp(&v, "relayed"))
+            );
+            println!(
+                "\nTraffic (packets / bytes; IP: with the member on any path, wire: the direct session)\n{}",
+                github_table(&["Name", "Key", "IP sent", "IP received", "Wire sent", "Wire received"], &rows)
+            );
+            let drops: Vec<Vec<String>> = mp(&v, "drops")
+                .as_map()
+                .into_iter()
+                .flatten()
+                .map(|(k, n)| vec![k.as_str().unwrap_or_default().to_owned(), n.to_string()])
+                .collect();
+            println!("\nDropped packets\n{}\n", github_table(&["Reason", "Packets"], &drops));
         }
         Some(Command::Ping { node, count }) => {
             let (mut got, mut sum) = (0, 0.0);

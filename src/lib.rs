@@ -16,6 +16,7 @@ pub mod group;
 pub mod identity;
 pub mod link;
 pub mod logger;
+pub mod metrics;
 pub mod node;
 pub mod noise;
 pub mod obfs;

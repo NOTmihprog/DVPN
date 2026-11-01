@@ -133,6 +133,8 @@ pub struct Node {
     last_routing_sync: parking_lot::Mutex<HashMap<NodeId, Instant>>,
     /// Misbehaving neighbours: their ROUTING and STATE messages are ignored for a while.
     scores: parking_lot::Mutex<Scores>,
+    /// Traffic and drop counters (`dvpn metrics`).
+    pub metrics: crate::metrics::Metrics,
     /// Packets sent with a TTL within the hop limit (traceroute probes), by probe id: what an
     /// ICMP Time Exceeded quotes when a relay reports the probe ran out (PLAN §6.4).
     probes: parking_lot::Mutex<HashMap<u16, (Vec<u8>, Instant)>>,
@@ -198,6 +200,7 @@ impl Node {
             my_lsa: parking_lot::Mutex::new((Vec::new(), None, 0)),
             last_routing_sync: parking_lot::Mutex::new(HashMap::new()),
             scores: parking_lot::Mutex::new(Scores::default()),
+            metrics: crate::metrics::Metrics::default(),
             probes: parking_lot::Mutex::new(HashMap::new()),
             reports: parking_lot::Mutex::new((Instant::now(), 0)),
             pings: parking_lot::Mutex::new(HashMap::new()),
@@ -375,6 +378,7 @@ impl Node {
             self.peer_certs.lock().iter().filter(|(_, c)| !m.admits(c)).map(|(id, _)| *id).collect();
         for id in gone {
             log::info!("Group | {} revoked, dropped", node(id));
+            self.metrics.remove(&id);
             self.peer_certs.lock().remove(&id);
             self.links.drop_peer(&id);
             self.e2e.drop_peer(&id);
@@ -684,12 +688,18 @@ impl Node {
         buf[DATA_HDR + 1..DATA_HDR + 1 + body.len()].copy_from_slice(body);
         let Some(len) = session.seal(&mut buf, 1 + body.len()) else { return false };
         self.transport.send_to(&buf[..len], route.endpoint).await;
+        self.metrics.peer(peer).wire_tx.add(len);
         true
     }
 
-    /// For API clients: `payload` on API route `route` (32..=255).
+    /// For API clients: `payload` on API route `route` (32..=255), directly or end to end
+    /// through relays.
     pub async fn send_routed(&self, peer: &NodeId, route: u8, payload: &[u8]) -> bool {
-        self.send_kind(peer, route, payload).await
+        if self.links.current(peer).is_some() {
+            self.send_kind(peer, route, payload).await
+        } else {
+            self.send_e2e(*peer, route, payload, MAX_HOPS, 0).await
+        }
     }
 
     async fn send_tracker(&self, client: &TrackerClient, out: Output) {
@@ -938,9 +948,11 @@ impl Node {
 
     async fn handle_peer_packet(&self, packet: &mut [u8], from: SocketAddr) {
         let storage = &self.storage;
+        let len = packet.len();
         match self.links.receive(packet) {
-            None => {}
+            None => self.metrics.dropped(crate::metrics::Drop::Unreadable),
             Some(Received::Handshake { peer, cert, reply }) => {
+                self.metrics.handshake();
                 // name and address as the certificate states them (also for peers that did not
                 // come through the tracker, e.g. static ones)
                 let update = PeerUpdate::from_cert(&cert);
@@ -961,6 +973,7 @@ impl Node {
             }
             Some(Received::Data { session, plain }) => {
                 let peer = session.peer;
+                self.metrics.peer(&peer).wire_rx.add(len);
                 self.roam(peer, from);
                 let Some((&kind, body)) = packet[plain].split_first() else { return };
                 match kind {
@@ -988,11 +1001,13 @@ impl Node {
         let Some(tun) = &self.tun else { return };
         let own = packet::parse(body).is_some_and(|i| self.ckr.load().lookup(i.src) == Some(peer));
         if !own {
+            self.metrics.dropped(crate::metrics::Drop::ForeignSource);
             log::debug!("Link | packet from {} with foreign source dropped", node(peer));
             return;
         }
-        if let Err(e) = tun.send(body).await {
-            log::warn!("TUN | write error: {e}");
+        match tun.send(body).await {
+            Ok(_) => self.metrics.peer(&peer).ip_rx.add(body.len()),
+            Err(e) => log::warn!("TUN | write error: {e}"),
         }
     }
 
@@ -1401,11 +1416,13 @@ impl Node {
             return self.handle_e2e(from, inner, hops).await;
         }
         if !self.is_relay() {
+            self.metrics.dropped(crate::metrics::Drop::NotRelay);
             log::debug!("Mesh | FORWARD from {} dropped: not a relay", node(from));
             return;
         }
         let hops = hops.saturating_add(1);
         if hops >= limit {
+            self.metrics.dropped(crate::metrics::Drop::HopLimit);
             log::debug!("Mesh | FORWARD from {} dropped: hop limit", node(from));
             let probe = u16::from_le_bytes([body[2], body[3]]);
             if probe != 0 {
@@ -1417,6 +1434,7 @@ impl Node {
         let probe = u16::from_le_bytes([body[2], body[3]]);
         let Some(next) = routes.resolve(&dst).and_then(|d| self.next_hop(&d)) else {
             // no way on: a traceroute probe learns it (!H), other packets are just dropped
+            self.metrics.dropped(crate::metrics::Drop::NoWayOn);
             if probe != 0 {
                 self.send_report(src, probe, 1).await;
             }
@@ -1426,7 +1444,9 @@ impl Node {
             return; // routes not converged yet: do not bounce
         }
         let hdr = [limit, hops, body[2], body[3]];
-        self.send_forward(next, hdr, dst, src, inner).await;
+        if self.send_forward(next, hdr, dst, src, inner).await {
+            self.metrics.relayed.add(inner.len());
+        }
     }
 
     /// An end-to-end packet that reached us after `hops` relays.
@@ -1435,6 +1455,7 @@ impl Node {
         match self.e2e.receive(&mut packet) {
             None => {}
             Some(Received::Handshake { peer, cert, reply }) => {
+                self.metrics.handshake();
                 let update = PeerUpdate::from_cert(&cert);
                 if self
                     .storage
@@ -1540,10 +1561,12 @@ impl Node {
                 Some(crate::ckr::Target::Node(p)) => p,
                 Some(crate::ckr::Target::Blackhole) => {
                     // kill switch: tell the application at once instead of a silent timeout
+                    self.metrics.dropped(crate::metrics::Drop::KillSwitch);
                     self.icmp_back(packet::IcmpError::Prohibited, &buf[OFF..OFF + n]).await;
                     continue;
                 }
                 _ => {
+                    self.metrics.dropped(crate::metrics::Drop::NoRoute);
                     log::trace!("TUN | no route to {dst}");
                     continue;
                 }
@@ -1556,6 +1579,7 @@ impl Node {
                 let ip = buf[OFF..OFF + n].to_vec();
                 let relay = (!direct).then(|| self.routes.load().next_hop(&peer)).flatten();
                 let from = relay.and_then(|r| self.overlay_addr(&r, dst.is_ipv6()));
+                self.metrics.dropped(crate::metrics::Drop::TooBig);
                 self.icmp_from(packet::IcmpError::TooBig(mtu as u16), &ip, from).await;
                 continue;
             }
@@ -1565,23 +1589,32 @@ impl Node {
                 let ip = &buf[OFF..OFF + n];
                 // TTL into the hop limit (PLAN §6.4): small TTLs are traceroute probes
                 let (limit, probe) = if ttl <= MAX_HOPS { (ttl.max(1), self.new_probe(ip)) } else { (MAX_HOPS, 0) };
-                if !self.send_e2e(peer, KIND_IP, ip, limit, probe).await && self.routes.load().next_hop(&peer).is_none()
-                {
+                if self.send_e2e(peer, KIND_IP, ip, limit, probe).await {
+                    self.metrics.peer(&peer).ip_tx.add(n);
+                } else if self.routes.load().next_hop(&peer).is_none() {
                     let nothing_to_try = self.storage.route_by_id(&peer).is_none()
                         && self.candidates.lock().get(&peer).is_none_or(|c| c.is_empty());
                     if nothing_to_try {
                         // no address, no relay: unreachable for now, say so at once
+                        self.metrics.dropped(crate::metrics::Drop::Unreachable);
                         let ip = buf[OFF..OFF + n].to_vec();
                         self.icmp_back(packet::IcmpError::HostUnreachable, &ip).await;
                     } else {
+                        self.metrics.dropped(crate::metrics::Drop::NoSession);
                         self.handshake(peer, PUNCH_INTERVAL).await;
                     }
+                } else {
+                    // a route through relays, the end-to-end session is being set up
+                    self.metrics.dropped(crate::metrics::Drop::NoSession);
                 }
                 continue;
             };
             buf[DATA_HDR] = KIND_IP;
             if let Some(len) = session.seal(&mut buf, n + 1) {
                 self.transport.send_to(&buf[..len], route.endpoint).await;
+                let c = self.metrics.peer(&peer);
+                c.ip_tx.add(n);
+                c.wire_tx.add(len);
             }
         }
         log::info!("TUN | Thread receiver - stopped");

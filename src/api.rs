@@ -574,6 +574,8 @@ impl Api {
                     .into_iter()
                     .map(|l| {
                         let (id, ep, rtt, alive, age) = (l.peer, l.endpoint, l.rtt_ms, l.alive, l.age);
+                        let c = self.node.metrics.peer(&id);
+                        let ((tx_packets, tx_bytes), (rx_packets, rx_bytes)) = (c.wire_tx.get(), c.wire_rx.get());
                         map(vec![
                             ("key", id.to_string().into()),
                             ("name", opt_str(storage.name(&id))),
@@ -581,6 +583,10 @@ impl Api {
                             ("rtt_ms", rtt.map_or(Value::Nil, Value::from)),
                             ("alive", alive.into()),
                             ("session_secs", age.as_secs().into()),
+                            ("tx_packets", tx_packets.into()),
+                            ("tx_bytes", tx_bytes.into()),
+                            ("rx_packets", rx_packets.into()),
+                            ("rx_bytes", rx_bytes.into()),
                         ])
                     })
                     .collect(),
@@ -605,6 +611,31 @@ impl Api {
                     map(vec![("net", r.net.to_string().into()), ("to", target.into()), ("system", r.system.into())])
                 });
                 map(vec![("mesh", Value::Array(mesh.collect())), ("ckr", Value::Array(ckr.collect()))])
+            }
+            "metrics" => {
+                let m = &self.node.metrics;
+                let pair = |p: &crate::metrics::Pair| {
+                    let (packets, bytes) = p.get();
+                    map(vec![("packets", packets.into()), ("bytes", bytes.into())])
+                };
+                let peers = m.peers().into_iter().map(|(id, c)| {
+                    map(vec![
+                        ("key", id.to_string().into()),
+                        ("name", opt_str(storage.name(&id))),
+                        ("ip_tx", pair(&c.ip_tx)),
+                        ("ip_rx", pair(&c.ip_rx)),
+                        ("wire_tx", pair(&c.wire_tx)),
+                        ("wire_rx", pair(&c.wire_rx)),
+                    ])
+                });
+                let drops = m.drops().into_iter().map(|(d, n)| (Value::from(d.name()), Value::from(n))).collect();
+                map(vec![
+                    ("uptime_secs", m.uptime_secs().into()),
+                    ("handshakes", m.handshakes.load(std::sync::atomic::Ordering::Relaxed).into()),
+                    ("relayed", pair(&m.relayed)),
+                    ("drops", Value::Map(drops)),
+                    ("peers", Value::Array(peers.collect())),
+                ])
             }
             "path" => match peer.and_then(|id| self.node.path(&id)) {
                 Some(hops) => Value::Array(
