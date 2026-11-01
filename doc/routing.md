@@ -104,6 +104,7 @@ dvpn node set office --add-route 192.168.31.0/24             # ещё одна, 
 ip rule  priority 7346  lookup main suppress_prefixlength 0    (маршруты LAN главнее)
 ip rule  priority 7347  not fwmark 0x7347 lookup 7347           (остальное — по таблице DVPN)
 таблица 7347: <подсеть> dev dnet,  throw <исключение>
+ip rule  priority 7348  from <источник> lookup 7348             (только с [exit] v4_sources, см. exit.md)
 ```
 
 * Маршруты локальной сети в основной таблице главнее туннеля: подсеть, к которой вы подключены напрямую, в туннель
@@ -114,6 +115,7 @@ ip rule  priority 7347  not fwmark 0x7347 lookup 7347           (остальн�
   старте после сбоя.
 * `[net] manage_routes = false` — не трогать системные маршруты (поставьте свои).
 
-Посмотреть: `ip rule`, `ip route show table 7347`, `ip -6 route show table 7347`.
+Все маршруты DVPN помечены `proto 73`. Посмотреть: `ip rule`, `ip route show table 7347`, `ip -6 route show table
+7347`, `ip route show table all proto 73`.
 
 На Windows и macOS системные маршруты пока нужно ставить вручную (поддержка Windows — вместе со сборкой релизов).

@@ -55,7 +55,7 @@ impl System {
     pub fn apply(&mut self, me: &NodeId, old: &Plan, new: &Plan) {
         self.addresses(&old.addrs, &new.addrs);
         if let Some(r) = self.routes.as_mut() {
-            r.apply(&crate::sysroute::wanted(&new.ckr, &new.connected));
+            r.apply(&crate::sysroute::Wanted::of(new));
         }
         if let Some(gw) = self.gateway.as_mut() {
             // also when members did not change: the gateway's own prefix may have come since
@@ -68,10 +68,13 @@ impl System {
                 self.acl = chain;
             }
         }
+        // all names through us only when the whole node goes through the gateway: with
+        // `[exit] v4_sources` the node itself resolves directly, as it reaches the internet
+        let all = |p: &Plan| !p.dns_upstream.is_empty() && !p.exit_split();
         if let Some(domain) = &self.resolved
-            && old.dns_upstream.is_empty() != new.dns_upstream.is_empty()
+            && all(old) != all(new)
         {
-            crate::dns::resolved_route_all(&self.tun_name, domain, !new.dns_upstream.is_empty());
+            crate::dns::resolved_route_all(&self.tun_name, domain, all(new));
         }
     }
 

@@ -34,6 +34,10 @@ pub struct Inputs<'a> {
     pub exit4: Option<NodeId>,
     pub exit6: Option<NodeId>,
     pub kill: (bool, bool),
+    /// `[exit] table` and `v4_sources`/`v6_sources`: the internet routes go to their own table
+    /// (with `from <source>` rules), not to the whole node.
+    pub exit_table: Option<u32>,
+    pub exit_sources: &'a [IpNet],
     /// `[ckr.remote_subnets]`: over everything else.
     pub manual: &'a [Route],
     /// The group's access rules, if any.
@@ -53,6 +57,12 @@ pub struct Plan {
     pub connected: Vec<IpNet>,
     /// The CKR table (destination -> node), in order: members by key, gateways, manual routes.
     pub ckr: Vec<Route>,
+    /// With `[exit] table` or sources: the internet routes (gateway or kill switch) for that
+    /// table, kept out of the system routes of `ckr` (they are in `ckr` for DVPN itself), and
+    /// the sources ruled into it.
+    pub exit: Vec<Route>,
+    pub exit_table: Option<u32>,
+    pub exit_sources: Vec<IpNet>,
     /// The group's access rules and every member's addresses and subnets (whom they apply to).
     pub acl: Option<Acl>,
     pub members: BTreeMap<NodeId, Vec<IpNet>>,
@@ -64,6 +74,11 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// The internet routes are not for the whole node (`[exit] table` or sources).
+    pub fn exit_split(&self) -> bool {
+        self.exit_table.is_some() || !self.exit_sources.is_empty()
+    }
+
     /// Our IPv4 address in the group.
     pub fn ipv4(&self) -> Option<std::net::Ipv4Addr> {
         self.addrs.iter().find_map(|a| match a {
@@ -108,12 +123,13 @@ pub fn compute(i: &Inputs) -> Plan {
         ckr.push(Route { net: IpNet::from(IpAddr::V6(ula)), target, system: false });
     }
     // the chosen gateways get the internet (private ranges stay local)
+    let mut inet = Vec::new();
     for (gw, kill, spec) in [(i.exit4, i.kill.0, "inetv4"), (i.exit6, i.kill.1, "inetv6")] {
         if let Some(gw) = gw {
-            ckr.extend(parse_spec(spec, gw).expect("valid spec"));
+            inet.extend(parse_spec(spec, gw).expect("valid spec"));
         } else if kill {
             // kill switch: the internet stays in the tunnel, where nothing carries it
-            ckr.extend(parse_spec(spec, i.me).expect("valid spec").into_iter().map(|mut r| {
+            inet.extend(parse_spec(spec, i.me).expect("valid spec").into_iter().map(|mut r| {
                 if matches!(r.target, Target::Node(_)) {
                     r.target = Target::Blackhole;
                 }
@@ -121,6 +137,15 @@ pub fn compute(i: &Inputs) -> Plan {
             }));
         }
     }
+    let split = i.exit_table.is_some() || !i.exit_sources.is_empty();
+    let exit = if split {
+        // DVPN routes by them all the same; the system only for the sources, in their table
+        ckr.extend(inet.iter().map(|r| Route { system: false, ..*r }));
+        inet
+    } else {
+        ckr.extend(inet);
+        Vec::new()
+    };
     ckr.extend(i.manual.iter().copied());
 
     // whom the access rules talk about: members' subnets and their group ULA
@@ -138,7 +163,19 @@ pub fn compute(i: &Inputs) -> Plan {
     // other names through the gateway while it carries our IPv4 internet
     let dns_upstream = if i.exit4.is_some() && i.dns_domain.is_some() { i.dns_forward.to_vec() } else { Vec::new() };
 
-    Plan { addrs, connected, ckr, acl: i.acl.cloned(), members: acl_members, member_prefixes, zone, dns_upstream }
+    Plan {
+        addrs,
+        connected,
+        ckr,
+        exit,
+        exit_table: i.exit_table,
+        exit_sources: i.exit_sources.to_vec(),
+        acl: i.acl.cloned(),
+        members: acl_members,
+        member_prefixes,
+        zone,
+        dns_upstream,
+    }
 }
 
 /// Names of members and our own (PLAN §14a): `<name>.<domain>` and `<name>.<group>.<domain>`.
@@ -207,6 +244,8 @@ mod tests {
             exit4: None,
             exit6: None,
             kill: (false, false),
+            exit_table: None,
+            exit_sources: &[],
             manual: &[],
             acl: None,
             dns_domain: Some("dvpn"),
@@ -262,6 +301,37 @@ mod tests {
         let manual = [Route { net: net("0.0.0.0/0"), target: Target::Node(office), system: true }];
         i.manual = &manual;
         assert_eq!(target(&compute(&i), "0.0.0.0/0"), Some(Target::Node(office)));
+    }
+
+    #[test]
+    fn exit_for_sources_only() {
+        let w = world();
+        let office = by_name(&w, "office");
+        let mut i = inputs(&w);
+        i.exit4 = Some(office);
+        assert!(compute(&i).exit.is_empty(), "whole node: the internet routes are in ckr");
+        let sources = [net("10.10.11.0/24")];
+        i.exit_sources = &sources;
+        let p = compute(&i);
+        assert!(p.exit_split());
+        // DVPN still sends the internet to the gateway and accepts it back from it ...
+        assert_eq!(target(&p, "0.0.0.0/0"), Some(Target::Node(office)));
+        // ... but the node's system routes do not carry it, the exit table does
+        assert!(p.ckr.iter().filter(|r| r.net == net("0.0.0.0/0")).all(|r| !r.system));
+        assert!(p.exit.iter().any(|r| r.net == net("0.0.0.0/0") && r.system && r.target == Target::Node(office)));
+        assert!(p.exit.iter().any(|r| r.net == net("192.168.0.0/16") && r.target == Target::Exclude));
+        assert_eq!(p.exit_sources, sources);
+        // the kill switch is for the sources too
+        i.exit4 = None;
+        i.kill = (true, false);
+        let p = compute(&i);
+        assert!(p.exit.iter().any(|r| r.net == net("0.0.0.0/0") && r.target == Target::Blackhole));
+        assert!(p.ckr.iter().filter(|r| r.net == net("0.0.0.0/0")).all(|r| !r.system));
+        // a table alone (the system's rules steer into it) splits as well
+        i.exit_sources = &[];
+        i.exit_table = Some(445);
+        let p = compute(&i);
+        assert!(p.exit_split() && !p.exit.is_empty() && p.exit_sources.is_empty());
     }
 
     #[test]

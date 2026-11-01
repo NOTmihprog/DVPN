@@ -250,7 +250,10 @@ impl Node {
         }
         let own = self.cert.read().clone();
         let acl = self.group.store.acl(&self.group.id);
-        let dns_forward = self.exits.lock().0.dns.clone();
+        let (dns_forward, exit_table, exit_sources) = {
+            let e = &self.exits.lock().0;
+            (e.dns.clone(), e.table, e.sources())
+        };
         let plan = crate::plan::compute(&crate::plan::Inputs {
             me,
             group: self.group.id,
@@ -261,6 +264,8 @@ impl Node {
             exit4: self.exit4.lock().current,
             exit6: self.exit6.lock().current,
             kill: *self.kill.lock(),
+            exit_table,
+            exit_sources: &exit_sources,
             manual: &self.group.routes,
             acl: acl.as_ref(),
             dns_domain: self.group.dns.as_ref().map(|(d, _)| d.as_str()),

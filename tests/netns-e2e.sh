@@ -335,6 +335,37 @@ print(\".\".join(map(str, r[-4:])))' 2>/dev/null)\" = 198.51.100.7 ]" || fail "b
     ok "DNS through the gateway (upstream sees the gateway, not b)"
 fi
 
+# Exit for some sources only ([exit] v4_sources): only what comes from B's address in the network
+# goes through the gateway (a rule "from 10.10.33.2 lookup 7348"), B itself reaches the internet
+# directly. Then [exit] table: the internet routes go to table 445 with no rule of DVPN's, B's
+# own fwmark rule steers into it, and B's own route in that table survives DVPN.
+via_c() { # via_c PING-ARGS...: does a ping from b go through c?
+    before=$(masq)
+    nsx b ping -c2 -i0.2 -W1 "$@" 203.0.113.1 >/dev/null || fail "b -> internet (ping $*)"
+    [ $(( $(masq) - before )) -ge 2 ]
+}
+"$D" --dir "$W/b" exit --sources 10.10.33.2 >/dev/null || fail "b: exit --sources"
+wait_for 10 sh -c "ip netns exec b ip rule | grep -q 'from 10.10.33.2 lookup 7348'" || fail "b: no rule for the sources"
+nsx b ip route show table 7348 | grep -q 'default dev dnet' || fail "b: no internet route in the exit table"
+! nsx b ip route show table 7347 | grep -q '^default' || fail "b: the internet still in the node's table"
+via_c -I 10.10.33.2 || fail "the source did not go through the gateway"
+! via_c || fail "b's own traffic went through the gateway"
+nsx b ip route add 198.51.100.0/24 via 192.168.2.1 table 445
+nsx b ip rule add priority 100 fwmark 0x99 lookup 445
+"$D" --dir "$W/b" exit --sources none --table 445 >/dev/null || fail "b: exit --table"
+wait_for 10 sh -c "ip netns exec b ip route show table 445 | grep -q 'default dev dnet'" || fail "b: no internet route in table 445"
+! nsx b ip rule | grep -q 'lookup 7348\|from 10.10.33.2' || fail "b: source rules left behind"
+via_c -m 153 -I 10.10.33.2 || fail "marked traffic did not go through the gateway"
+! via_c || fail "unmarked traffic went through the gateway"
+"$D" --dir "$W/b" exit --table none >/dev/null
+wait_for 10 sh -c "ip netns exec b ip route show table 7347 | grep -q '^default dev dnet'" || fail "b: whole-node exit not back"
+! nsx b ip route show table 445 | grep -q 'dev dnet' || fail "b: our routes left in table 445"
+nsx b ip route show table 445 | grep -q '198.51.100.0/24' || fail "b: its own route in table 445 was removed"
+nsx b ip rule del priority 100 fwmark 0x99 lookup 445
+nsx b ip route flush table 445
+via_c || fail "b's internet not through the gateway again"
+ok "exit for some sources only, and into a table of the system's"
+
 # A<->B must be a direct nat1 -> nat2 UDP flow (the tracker never forwards traffic).
 nat2nat() { nsx nat1 nft list counter ip watch nat2nat | awk '/packets/ {print $2}'; }
 before=$(nat2nat)

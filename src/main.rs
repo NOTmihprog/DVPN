@@ -108,6 +108,14 @@ enum Command {
         /// DNS servers to use through the gateway (comma separated IPs; "none" to clear)
         #[arg(long, value_delimiter = ',')]
         dns: Option<Vec<String>>,
+        /// Only these sources go through the gateway (comma separated networks, IPv4 and IPv6;
+        /// "none" to clear): the node itself and the rest reach the internet directly
+        #[arg(long, value_delimiter = ',')]
+        sources: Option<Vec<String>>,
+        /// Routing table for the internet routes ("none": DVPN's own). Without --sources DVPN
+        /// adds no rule to it: your own rules (fwmark, iif) steer traffic there
+        #[arg(long)]
+        table: Option<String>,
     },
     /// Start peer discovery server
     Server {
@@ -1373,7 +1381,7 @@ fn main() {
                 _ => die(format!("no route to {node}")),
             }
         }
-        Some(Command::Exit { v4, v6, none, kill_switch, dns }) => {
+        Some(Command::Exit { v4, v6, none, kill_switch, dns, sources, table }) => {
             let mut e = conf.exits.clone();
             if none {
                 e = config::Exits::default();
@@ -1394,6 +1402,27 @@ fn main() {
                     .map(|s| s.parse().unwrap_or_else(|_| die(format!("--dns {s}: not an IP address"))))
                     .collect();
             }
+            if let Some(list) = sources {
+                (e.v4_sources, e.v6_sources) = (Vec::new(), Vec::new());
+                for s in list.iter().filter(|s| !s.is_empty() && *s != "none") {
+                    let net = s
+                        .parse::<ipnet::IpNet>()
+                        .or_else(|_| s.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                        .unwrap_or_else(|_| die(format!("--sources {s}: not a network")));
+                    match net {
+                        ipnet::IpNet::V4(n) => e.v4_sources.push(n),
+                        ipnet::IpNet::V6(n) => e.v6_sources.push(n),
+                    }
+                }
+            }
+            if let Some(t) = table {
+                e.table = if t == "none" {
+                    None
+                } else {
+                    let n = t.parse().unwrap_or_else(|_| die(format!("--table {t}: a number or none")));
+                    Some(config::check_table(n).unwrap_or_else(|err| die(format!("--{err}"))))
+                };
+            }
             if e != conf.exits {
                 conf.set_exits(&e);
                 conf.save();
@@ -1402,6 +1431,16 @@ fn main() {
             println!("IPv4 exit: {}\nIPv6 exit: {}", show(&e.v4), show(&e.v6));
             if !e.v4.is_empty() || !e.v6.is_empty() {
                 println!("kill switch: {}", if e.kill_switch() { "on (no gateway: no internet)" } else { "off" });
+            }
+            if e.split() {
+                let src = e.sources();
+                let table = e.table.unwrap_or(dvpn::sysroute::EXIT_TABLE);
+                if src.is_empty() {
+                    println!("only what your rules send to table {table} (DVPN adds no rule)");
+                } else {
+                    let s: Vec<String> = src.iter().map(|n| n.to_string()).collect();
+                    println!("only from {} (table {table}); this node itself goes direct", s.join(", "));
+                }
             }
             if !e.dns.is_empty() {
                 println!(

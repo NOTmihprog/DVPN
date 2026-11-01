@@ -267,12 +267,41 @@ pub struct Exits {
     /// DNS servers to use through the gateway while it is active (no DNS leak to the local
     /// network or the provider).
     pub dns: Vec<std::net::IpAddr>,
+    /// Only these sources go through the gateway (policy routing: `ip rule from <src> lookup
+    /// <table>`); the node itself and everything else reach the internet directly. Empty: the
+    /// whole node goes through the gateway, unless `table` is set.
+    pub v4_sources: Vec<ipnet::Ipv4Net>,
+    pub v6_sources: Vec<ipnet::Ipv6Net>,
+    /// The routing table for the internet routes (gateway and kill switch) instead of DVPN's
+    /// own. Without `*_sources` DVPN adds no rule for it: the system's own rules (a fwmark, an
+    /// interface) decide what goes there.
+    pub table: Option<u32>,
 }
 
 impl Exits {
     pub fn kill_switch(&self) -> bool {
         self.kill_switch.unwrap_or(true)
     }
+
+    /// The internet routes go to their own table, not to everyone (`*_sources` or `table`).
+    pub fn split(&self) -> bool {
+        self.table.is_some() || !self.v4_sources.is_empty() || !self.v6_sources.is_empty()
+    }
+
+    /// The sources routed through the gateway, both families.
+    pub fn sources(&self) -> Vec<ipnet::IpNet> {
+        let v4 = self.v4_sources.iter().map(|n| ipnet::IpNet::V4(n.trunc()));
+        v4.chain(self.v6_sources.iter().map(|n| ipnet::IpNet::V6(n.trunc()))).collect()
+    }
+}
+
+/// Tables `[exit] table` may not name: unspec, default, main, local and DVPN's own.
+pub fn check_table(n: i64) -> anyhow::Result<u32> {
+    let t = u32::try_from(n).map_err(|_| anyhow!("table: {n} is not a table number"))?;
+    if t == 0 || (253..=255).contains(&t) || t == crate::sysroute::TABLE {
+        bail!("table: {t} is reserved (0, 253-255 are the system's, {} is DVPN's)", crate::sysroute::TABLE);
+    }
+    Ok(t)
 }
 
 fn parse_exits(t: &dyn toml_edit::TableLike) -> anyhow::Result<Exits> {
@@ -285,7 +314,7 @@ fn parse_exits(t: &dyn toml_edit::TableLike) -> anyhow::Result<Exits> {
             .collect()
     };
     for (k, _) in t.iter() {
-        if !["v4", "v6", "kill_switch", "dns"].contains(&k) {
+        if !["v4", "v6", "kill_switch", "dns", "v4_sources", "v6_sources", "table"].contains(&k) {
             bail!("unknown key {k}");
         }
     }
@@ -297,7 +326,30 @@ fn parse_exits(t: &dyn toml_edit::TableLike) -> anyhow::Result<Exits> {
         .iter()
         .map(|s| s.parse().map_err(|_| anyhow!("dns: {s} is not an IP address")))
         .collect::<anyhow::Result<_>>()?;
-    Ok(Exits { v4: list("v4")?, v6: list("v6")?, kill_switch, dns })
+    let v4_sources = list("v4_sources")?
+        .iter()
+        .map(|s| {
+            parse_source::<ipnet::Ipv4Net, std::net::Ipv4Addr>(s)
+                .map_err(|_| anyhow!("v4_sources: {s} is not an IPv4 network"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let v6_sources = list("v6_sources")?
+        .iter()
+        .map(|s| {
+            parse_source::<ipnet::Ipv6Net, std::net::Ipv6Addr>(s)
+                .map_err(|_| anyhow!("v6_sources: {s} is not an IPv6 network"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let table = match t.get("table") {
+        Some(v) => Some(check_table(v.as_integer().ok_or_else(|| anyhow!("table: expected a number"))?)?),
+        None => None,
+    };
+    Ok(Exits { v4: list("v4")?, v6: list("v6")?, kill_switch, dns, v4_sources, v6_sources, table })
+}
+
+/// A network, or an address alone (/32, /128).
+fn parse_source<N: std::str::FromStr + From<A>, A: std::str::FromStr>(s: &str) -> Result<N, ()> {
+    s.parse::<N>().or_else(|_| s.parse::<A>().map(N::from)).map_err(|_| ())
 }
 
 /// `[gateway]` (PLAN §12): NAT from the tunnel to `wan`, optional NDP proxy for members'
@@ -722,7 +774,7 @@ impl Config {
 
     /// Sets `[exit]` (an empty list removes it).
     pub fn set_exits(&mut self, exits: &Exits) {
-        if exits.v4.is_empty() && exits.v6.is_empty() && exits.kill_switch.is_none() && exits.dns.is_empty() {
+        if exits == &Exits::default() {
             self.doc.remove("exit");
         } else {
             let mut t = Table::new();
@@ -744,6 +796,20 @@ impl Config {
                     arr.push(d.to_string());
                 }
                 t["dns"] = value(arr);
+            }
+            let sources = |v: Vec<String>| {
+                let mut arr = toml_edit::Array::new();
+                v.iter().for_each(|s| arr.push(s.as_str()));
+                value(arr)
+            };
+            if !exits.v4_sources.is_empty() {
+                t["v4_sources"] = sources(exits.v4_sources.iter().map(|n| n.to_string()).collect());
+            }
+            if !exits.v6_sources.is_empty() {
+                t["v6_sources"] = sources(exits.v6_sources.iter().map(|n| n.to_string()).collect());
+            }
+            if let Some(n) = exits.table {
+                t["table"] = value(i64::from(n));
             }
             t.decor_mut()
                 .set_prefix("\n# gateways to the internet by priority (names or keys); the first alive one is used\n");
@@ -1081,6 +1147,18 @@ mod tests {
         assert!(c.exits.kill_switch(), "on by default");
         assert!(with_group("[exit]\ndns = [\"one.one\"]\n").is_err());
         assert!(with_group("[exit]\nv5 = []\n").is_err());
+        // policy routing: only some sources through the gateway, a table of the system's
+        let c = with_group("[exit]\nv4 = [\"vps1\"]\nv4_sources = [\"10.10.11.0/24\", \"10.10.12.5\"]\ntable = 445\n")
+            .unwrap();
+        assert_eq!(c.exits.v4_sources, vec!["10.10.11.0/24".parse().unwrap(), "10.10.12.5/32".parse().unwrap()]);
+        assert_eq!(c.exits.table, Some(445));
+        assert!(c.exits.split());
+        assert!(!with_group("[exit]\nv4 = [\"vps1\"]\n").unwrap().exits.split());
+        assert!(with_group("[exit]\nv4_sources = [\"fd00::/64\"]\n").is_err(), "IPv6 in v4_sources");
+        assert!(with_group("[exit]\nv6_sources = [\"10.0.0.0/8\"]\n").is_err());
+        for bad in ["0", "254", "7347", "-1", "\"main\""] {
+            assert!(with_group(&format!("[exit]\ntable = {bad}\n")).is_err(), "table = {bad}");
+        }
         let dir = temp_dir();
         let mut c = Config::load(&dir).unwrap();
         let e = Exits {
@@ -1088,6 +1166,9 @@ mod tests {
             v6: vec!["b".into(), "c".into()],
             kill_switch: Some(false),
             dns: vec!["1.1.1.1".parse().unwrap()],
+            v4_sources: vec!["10.10.11.0/24".parse().unwrap()],
+            v6_sources: vec!["fd00::/64".parse().unwrap()],
+            table: Some(445),
         };
         c.set_exits(&e);
         c.save();

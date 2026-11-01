@@ -297,10 +297,10 @@ sudo systemctl daemon-reload
 sudo rm -r /opt/dvpn            # вместе с ключами! у админа — сначала group backup
 ```
 
-После остановки в системе не должно остаться ничего от DVPN: `ip rule` без правил 7346/7347, нет таблиц
+После остановки в системе не должно остаться ничего от DVPN: `ip rule` без правил 7346/7347/7348, нет таблиц
 `nft list tables | grep dvpn`. Если узел был убит `kill -9`, правила, таблица маршрутов и ACL снимутся при следующем запуске, а таблица
-шлюза — если `[gateway]` ещё в конфиге. Вручную: `ip rule del priority 7346; ip rule del priority 7347` (то же с
-`ip -6`), `ip route flush table 7347` (и `-6`), `nft delete table inet dvpn_gw`, `nft delete table inet dvpn_acl`,
+шлюза — если `[gateway]` ещё в конфиге. Вручную: `ip rule del priority 7346; ip rule del priority 7347; ip rule del
+priority 7348` (то же с `ip -6`), `ip route flush table all proto 73` (и `-6`), `nft delete table inet dvpn_gw`, `nft delete table inet dvpn_acl`,
 записи NDP proxy — `ip -6 neigh show proxy`.
 
 ## Windows
