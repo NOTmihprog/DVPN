@@ -173,20 +173,23 @@ ok "a -> b goes directly nat1 -> nat2 ($((after - before)) packets)"
 
 # The overlay must be encrypted and masked: a marked ICMP payload must not show up on the
 # wan, peer datagrams must have no constant first byte, and equal pings must not give equal sizes.
+# -Z root: distro builds of tcpdump drop to a "tcpdump" user, which is unmapped inside unshare -r
+# (writing and reading the capture then fails silently).
 if command -v tcpdump >/dev/null; then
-    nsx wan timeout 5 tcpdump -i br0 -nn -U -w "$W/wan.pcap" udp >/dev/null 2>&1 &
+    nsx wan timeout 5 tcpdump -Z root -i br0 -nn -U -w "$W/wan.pcap" udp >/dev/null 2>&1 &
     tpid=$!
     sleep 1
     nsx a ping -c30 -i0.1 -p 6476706e2d6532652d 10.10.33.2 >/dev/null || fail "a -> b during capture"
     wait $tpid || true
-    [ -s "$W/wan.pcap" ] || fail "capture is empty"
+    # 24 bytes is the bare pcap file header
+    [ "$(stat -c %s "$W/wan.pcap")" -gt 1000 ] || fail "capture is empty"
     ! grep -q dvpn-e2e- "$W/wan.pcap" || fail "plaintext overlay payload seen on the wan"
     ok "no plaintext on the wan"
     if command -v python3 >/dev/null; then
         # peer datagrams only (the tracker on port 6485 is not masked until stage 3)
         # tcpdump decodes the link layer (it differs between hosts and containers); -x prints the
         # IP packet in hex, the UDP payload starts after the IP and UDP headers.
-        stats=$(tcpdump -r "$W/wan.pcap" -nn -x 'udp and not port 6485' 2>/dev/null | python3 -I -c '
+        stats=$(tcpdump -Z root -r "$W/wan.pcap" -nn -x 'udp and not port 6485' 2>/dev/null | python3 -I -c '
 import sys
 from collections import Counter
 first, sizes, pkts, cur = Counter(), Counter(), [], None
