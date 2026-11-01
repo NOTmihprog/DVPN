@@ -35,6 +35,10 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(45);
 const PEER_SYNC: Duration = Duration::from_secs(60);
 /// Admins renew certificates that expire sooner than this.
 const RENEW_BEFORE: u64 = 10 * 24 * 3600;
+/// Attempts to reach a static peer without a session back off from 1 s to this.
+const STATIC_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// After a psk epoch switch the old psk is still accepted this long, for nodes that learned
 /// about the switch late (PLAN §4.4). Longer than a session lives, so no session is cut short.
 const EPOCH_GRACE_MS: u64 = 10 * 60 * 1000;
@@ -53,6 +57,8 @@ pub struct GroupCtx {
     pub on_cert: Box<dyn Fn(&Cert) + Send + Sync>,
     /// Called with (epoch, psk) once a new psk epoch is active, to persist it.
     pub on_epoch: Box<dyn Fn(u32, [u8; 32]) + Send + Sync>,
+    /// `[[static_peers]]`: connected to directly, without a tracker (PLAN §10).
+    pub statics: Vec<crate::group::StaticRef>,
 }
 
 type EpochPsk = (u32, [u8; 32]);
@@ -305,6 +311,9 @@ impl Node {
         if self.tun.is_some() {
             tokio::spawn(self.clone().tun_loop());
         }
+        if !self.group.statics.is_empty() {
+            tokio::spawn(self.clone().static_loop());
+        }
     }
 
     /// Sends a handshake to `peer`'s endpoint unless one went out less than `min_interval` ago.
@@ -406,7 +415,9 @@ impl Node {
                     continue;
                 }
                 let has_session = self.links.current(&id).is_some();
-                if self.links.needs_handshake(&id) {
+                // static peers without a session are tried by static_loop, with backoff
+                let static_pending = !has_session && self.group.statics.iter().any(|s| s.key == id);
+                if self.links.needs_handshake(&id) && !static_pending {
                     self.handshake(id, if has_session { REKEY_RETRY } else { PUNCH_INTERVAL }).await;
                 }
                 let keepalive = rand::rng().random_range(KEEPALIVE);
@@ -417,6 +428,59 @@ impl Node {
                 if has_session && synced.is_none_or(|t| t.elapsed() >= PEER_SYNC) {
                     self.sync_peer(id).await;
                 }
+            }
+        }
+    }
+
+    /// Connects to static peers on our own: no tracker needed. Each attempt takes the next
+    /// endpoint (DNS names are resolved every time, so a changed address is found), and the
+    /// pause between attempts doubles up to a minute while the peer does not answer.
+    async fn static_loop(self: Arc<Self>) {
+        struct Try {
+            next: Instant,
+            backoff: Duration,
+            turn: usize,
+        }
+        let mut tries: HashMap<NodeId, Try> = HashMap::new();
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            for sp in &self.group.statics {
+                let t = tries.entry(sp.key).or_insert(Try {
+                    next: Instant::now(),
+                    backoff: Duration::from_secs(1),
+                    turn: 0,
+                });
+                if self.links.current(&sp.key).is_some() {
+                    t.backoff = Duration::from_secs(1);
+                    t.next = Instant::now();
+                    continue;
+                }
+                if Instant::now() < t.next {
+                    continue;
+                }
+                let ep = &sp.endpoints[t.turn % sp.endpoints.len()];
+                t.turn += 1;
+                let jitter = Duration::from_millis(rand::rng().random_range(0..500));
+                t.next = Instant::now() + t.backoff + jitter;
+                t.backoff = (t.backoff * 2).min(STATIC_MAX_BACKOFF);
+                // IPv4 underlay until the dual-stack socket (PLAN stage 3.11)
+                let addr = match tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(ep.as_str())).await {
+                    Ok(Ok(mut addrs)) => addrs.find(SocketAddr::is_ipv4),
+                    Ok(Err(e)) => {
+                        log::debug!("Static | {ep}: {e}");
+                        None
+                    }
+                    Err(_) => None,
+                };
+                let Some(addr) = addr else {
+                    log::debug!("Static | {} {ep}: no IPv4 address", node(sp.key));
+                    continue;
+                };
+                if self.storage.endpoint(&sp.key) != Some(addr) {
+                    self.storage.set_peer(sp.key, PeerUpdate { endpoint: Some(Some(addr)), ..Default::default() });
+                }
+                log::debug!("Static | handshake to {} at {addr}", node(sp.key));
+                self.handshake(sp.key, Duration::ZERO).await;
             }
         }
     }

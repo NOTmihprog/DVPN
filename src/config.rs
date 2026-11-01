@@ -9,7 +9,7 @@ use rand::RngExt;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::crypto::{decode_b64, decode_key32, encode_b64};
-use crate::group::{Cert, GroupId, GroupSecret, TrackerRef};
+use crate::group::{Cert, GroupId, GroupSecret, StaticRef, TrackerRef};
 use crate::identity::Identity;
 use crate::obfs::{MAX_PAD, MAX_WIRE, Profile, Template};
 
@@ -116,6 +116,8 @@ pub struct Config {
     doc: DocumentMut,
     pub identity: Identity,
     pub groups: Vec<GroupConfig>,
+    /// `[[static_peers]]`: nodes connected to directly, without a tracker (PLAN §10).
+    pub static_peers: Vec<StaticRef>,
     pub peer: PeerConfig,
     pub net: Option<NetConfig>,
     pub servers: Vec<ServerConfig>,
@@ -229,6 +231,33 @@ pub fn parse_obfs(entries: &[(String, String)]) -> anyhow::Result<Profile> {
     p.junk_size = jmin..=jmax;
     p.signatures = signatures.into_iter().flatten().collect();
     Ok(p)
+}
+
+/// `host:port`, `ip:port` or `[ipv6]:port`.
+pub fn check_endpoint(s: &str) -> anyhow::Result<()> {
+    let (host, port) = s.rsplit_once(':').ok_or_else(|| anyhow!("{s}: expected host:port"))?;
+    port.parse::<u16>().map_err(|_| anyhow!("{s}: bad port"))?;
+    if host.is_empty() {
+        bail!("{s}: empty host");
+    }
+    Ok(())
+}
+
+fn parse_static_peer(t: &Table) -> anyhow::Result<StaticRef> {
+    let key = get_str(t, "key")?.parse().map_err(|e| anyhow!("key: {e}"))?;
+    let arr = t.get("endpoints").and_then(Item::as_array).ok_or_else(|| anyhow!("endpoints: expected a list"))?;
+    let mut endpoints = Vec::new();
+    for v in arr {
+        let e = v.as_str().ok_or_else(|| anyhow!("endpoints: expected strings"))?;
+        check_endpoint(e)?;
+        endpoints.push(e.to_owned());
+    }
+    if endpoints.is_empty() {
+        bail!("endpoints: empty");
+    }
+    // `group` (which group's psk) is accepted for the format of PLAN §12; with one group per
+    // node it is that group
+    Ok(StaticRef { key, endpoints })
 }
 
 fn parse_group(t: &Table) -> anyhow::Result<GroupConfig> {
@@ -421,11 +450,21 @@ impl Config {
                 groups.push(g);
             }
         }
+        let mut static_peers = Vec::new();
+        if let Some(item) = doc.get("static_peers") {
+            let arr = item
+                .as_array_of_tables()
+                .ok_or_else(|| anyhow!("static_peers must be [[static_peers]] sections in {file}"))?;
+            for (i, t) in arr.iter().enumerate() {
+                static_peers
+                    .push(parse_static_peer(t).map_err(|e| anyhow!("[[static_peers]] #{} {e:#} in {file}", i + 1))?);
+            }
+        }
         if section(&doc, "group").is_some() {
             log::warn!("[group] psk in {file} is ignored: create or join a group (dvpn group --help)");
         }
 
-        Ok(Config { path, doc, identity, groups, peer, net, servers, log_level, local_server_key })
+        Ok(Config { path, doc, identity, groups, static_peers, peer, net, servers, log_level, local_server_key })
     }
 
     pub fn group(&self, name_or_id: &str) -> Option<&GroupConfig> {
@@ -496,6 +535,28 @@ impl Config {
                 self.doc.remove("groups");
             }
         }
+        true
+    }
+
+    /// Adds `[[static_peers]]` for a node unless it is listed already; returns whether it was added.
+    pub fn add_static_peer(&mut self, p: &StaticRef) -> bool {
+        if p.key == self.identity.id() || self.static_peers.iter().any(|s| s.key == p.key) {
+            return false;
+        }
+        let mut t = Table::new();
+        t["key"] = value(p.key.to_string());
+        let mut arr = toml_edit::Array::new();
+        for e in &p.endpoints {
+            arr.push(e.as_str());
+        }
+        t["endpoints"] = value(arr);
+        if self.doc.get("static_peers").is_none() {
+            self.doc["static_peers"] = Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+        }
+        if let Some(a) = self.doc["static_peers"].as_array_of_tables_mut() {
+            a.push(t);
+        }
+        self.static_peers.push(p.clone());
         true
     }
 
@@ -597,6 +658,12 @@ mod tests {
             ..g.clone()
         };
         conf.add_group(member.clone());
+        let sp = StaticRef {
+            key: Identity::generate().id(),
+            endpoints: vec!["vpn.example:8647".into(), "[2001:db8::1]:8647".into()],
+        };
+        assert!(conf.add_static_peer(&sp));
+        assert!(!conf.add_static_peer(&sp));
         let t = TrackerRef { host: "t.example".into(), port: 7000, key: [5; 32] };
         assert!(conf.add_server(&t));
         assert!(!conf.add_server(&t), "same key already configured");
@@ -611,6 +678,7 @@ mod tests {
         std::fs::write(dir.join(CONFIG_FILE_NAME), doc.to_string()).unwrap();
         let mut back = Config::load(&dir).unwrap();
         assert_eq!(back.groups.len(), 2);
+        assert_eq!(back.static_peers, vec![sp]);
         let (a, m) = (&back.groups[0], &back.groups[1]);
         assert_eq!((a.id, a.psk, a.ipv4()), (g.id, g.psk, Some(Ipv4Addr::new(10, 10, 33, 5))));
         assert!(a.secret.is_some() && m.secret.is_none());
@@ -735,6 +803,16 @@ mod tests {
         ] {
             let err = format!("{:#}", with_group(&format!("[groups.obfs]\n{bad}\n")).err().unwrap());
             assert!(err.contains(why) && err.contains("[groups.obfs]"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn endpoints() {
+        for ok in ["1.2.3.4:5", "vpn.example.com:8647", "[2001:db8::1]:8647"] {
+            assert!(check_endpoint(ok).is_ok(), "{ok}");
+        }
+        for bad in ["1.2.3.4", "host:99999", ":80", "host:port"] {
+            assert!(check_endpoint(bad).is_err(), "{bad}");
         }
     }
 

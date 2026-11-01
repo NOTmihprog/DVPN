@@ -13,7 +13,7 @@ use dvpn::{api, config, logger, node, tracker_server, transport};
 
 use dvpn::config::{Config, GroupConfig, SOCKET_DEFAULT_ADDR, STATE_FILE_NAME, parse_obfs};
 use dvpn::crypto::{encode_b64, random_bytes};
-use dvpn::group::{CertBody, GroupSecret, Invite, JOIN_TTL_SECS, now_unix};
+use dvpn::group::{CertBody, GroupSecret, Invite, JOIN_TTL_SECS, StaticRef, now_unix};
 use dvpn::identity::{Identity, NodeId};
 use dvpn::state::{Body, Membership, StateStore};
 use dvpn::storage::{PeerStorage, PeerUpdate};
@@ -98,6 +98,10 @@ enum GroupCommand {
         /// Hours the invite can be used
         #[arg(long, default_value_t = JOIN_TTL_SECS / 3600)]
         ttl: u64,
+        /// This node's fixed address (host:port, repeatable): the new node connects to it
+        /// directly, with or without a tracker (set a fixed [peer] bind_port)
+        #[arg(long = "static", value_name = "HOST:PORT")]
+        statics: Vec<String>,
     },
     /// Join a group by invite (from the argument, a file or stdin)
     Join {
@@ -246,19 +250,28 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             println!("The group secret is in config.toml ([[groups]] secret): back it up, it cannot be recovered.");
             println!("Invite nodes with: dvpn group invite --name <name>");
         }
-        GroupCommand::Invite { group, name, addr, ttl } => {
+        GroupCommand::Invite { group, name, addr, ttl, statics } => {
             let g = pick_group(conf, &group);
             let Some(secret) = &g.secret else { die(format!("only admins of {} can invite", g.name)) };
             let own = g.ipv4().unwrap_or_else(|| die("this node has no address in the group"));
             let net = Ipv4Net::new(own, net_prefix(conf)).unwrap_or_else(|e| die(e)).trunc();
             let addr = addr.unwrap_or_else(|| free_host(net, &[own]));
-            if conf.servers.is_empty() {
-                log::warn!("No [servers] configured: the invite has no tracker, the new node will not find anybody");
+            for e in &statics {
+                config::check_endpoint(e).unwrap_or_else(|e| die(format!("--static {e:#}")));
+            }
+            if conf.servers.is_empty() && statics.is_empty() {
+                log::warn!("No [servers] and no --static: the new node will not find anybody");
+            }
+            if !statics.is_empty() && conf.peer.port_range.0 != conf.peer.port_range.1 {
+                log::warn!("[peer] bind_port is a range: give this node a fixed port for --static to work");
             }
             let template = CertBody::new(conf.identity.id(), &name, host_net(addr));
             let join = secret.grant_join(template, now_unix() + ttl * 3600);
             let trackers = conf.servers.iter().map(|s| s.tracker_ref()).collect();
-            let inv = Invite::new(&g.name, g.epoch, g.psk, g.obfs_entries.clone(), trackers, join);
+            let mut inv = Invite::new(&g.name, g.epoch, g.psk, g.obfs_entries.clone(), trackers, join);
+            if !statics.is_empty() {
+                inv.statics.push(StaticRef { key: conf.identity.id(), endpoints: statics });
+            }
             eprintln!("Invite for {name} ({addr}) to {}, valid {ttl} h, for one node:", g.name);
             println!("{}", inv.encode());
         }
@@ -290,8 +303,13 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             while conf.group(&name).is_some() {
                 name.push('_');
             }
-            let added: Vec<String> =
+            let mut added: Vec<String> =
                 inv.trackers.iter().filter(|t| conf.add_server(t)).map(|t| format!("{}:{}", t.host, t.port)).collect();
+            for sp in &inv.statics {
+                if conf.add_static_peer(sp) {
+                    added.push(format!("static {}", sp.endpoints.join(", ")));
+                }
+            }
             conf.add_group(GroupConfig {
                 name: name.clone(),
                 id: inv.group(),
@@ -306,7 +324,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             let addr = body.ipv4().map_or_else(|| "no address".into(), |a| a.to_string());
             println!("Joined group {name} ({}) as {}, {addr}", inv.group(), body.name);
             if !added.is_empty() {
-                println!("Added servers: {}", added.join(", "));
+                println!("Added: {}", added.join(", "));
             }
         }
         GroupCommand::List => {
@@ -479,7 +497,11 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         log::info!("Network disabled");
     }
     if conf.servers.is_empty() {
-        log::warn!("No [servers] configured, peers can only be reached via endpoints set through the API");
+        if conf.static_peers.is_empty() {
+            log::warn!("No [servers] and no [[static_peers]]: only nodes that connect to this one are reachable");
+        } else {
+            log::info!("No [servers]: connecting to {} static peers only", conf.static_peers.len());
+        }
     }
 
     let transport = transport::Transport::new(conf.peer.bind_addr, conf.peer.port_range)
@@ -528,6 +550,7 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
             }
             Err(e) => log::warn!("Config | renewed certificate not saved: {e:#}"),
         }),
+        statics: conf.static_peers.clone(),
         on_epoch: Box::new(move |epoch, psk| match Config::load(&dir2) {
             Ok(mut conf) => {
                 conf.set_group_epoch(&group_id, epoch, &psk);

@@ -282,4 +282,24 @@ ok "a <-> c survives a NAT address change (roaming)"
 wait_for 20 grep -q 'moved 203.0.113.11:.* -> 203.0.113.13:' "$W/tracker.log" || fail "tracker did not follow a's new address"
 ok "tracker session survives the NAT address change"
 
+# ---- static peers, no tracker ---------------------------------------------------------
+# Everything is stopped; a new group whose admin S1 (on C's public address, fixed port) invites
+# S2 (behind nat1) with --static: S2 connects straight to S1, no tracker exists any more.
+cleanup
+PIDS=""
+mkdir s1 s2
+"$D" --dir "$W/s1" show-key >/dev/null 2>&1
+sed -i 's/^bind_port = .*/bind_port = "7000"/' s1/config.toml
+"$D" --dir "$W/s1" group create solo -a 10.10.44.1 -n s1 >/dev/null || fail "s1: group create"
+inv=$("$D" --dir "$W/s1" group invite -n s2 -a 10.10.44.2 --static 203.0.113.20:7000 2>/dev/null) || fail "s1: invite"
+"$D" --dir "$W/s2" group join "$inv" >/dev/null 2>&1 || fail "s2: join"
+grep -q '^\[\[static_peers\]\]' s2/config.toml || fail "s2: no [[static_peers]] from the invite"
+! grep -q '^\[servers' s2/config.toml || fail "s2 has a tracker configured"
+bg node-s1 c "$D" --dir "$W/s1" -a 127.0.0.1:9902
+bg node-s2 a "$D" --dir "$W/s2" -a 127.0.0.1:9902
+for n in a c; do wait_for 10 nsx $n ip -4 addr show dnet || fail "static: no tun in $n"; done
+reach a s1 10.10.44.1
+reach c s2 10.10.44.2
+ok "connected by a static address, without a tracker"
+
 echo "PASS"

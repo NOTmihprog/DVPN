@@ -291,7 +291,15 @@ pub struct TrackerRef {
     pub key: [u8; 32],
 }
 
-const INVITE_VERSION: u8 = 1;
+/// A node reachable at fixed addresses (PLAN §10), as given in invites and `[[static_peers]]`:
+/// endpoints are `host:port` text (domain names are resolved when connecting).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticRef {
+    pub key: NodeId,
+    pub endpoints: Vec<String>,
+}
+
+const INVITE_VERSION: u8 = 2;
 
 /// Everything a node needs to join a group (PLAN §5.3), as one base64url string: the group psk
 /// of the current epoch, the obfuscation profile, trackers, and a one-time join key with its grant.
@@ -306,6 +314,9 @@ pub struct Invite {
     pub obfs: Vec<(String, String)>,
     pub trackers: Vec<TrackerRef>,
     pub join: Join,
+    /// Nodes to connect to directly (the inviting admin's node, if it has a fixed address): a
+    /// group can work without any tracker.
+    pub statics: Vec<StaticRef>,
 }
 
 impl fmt::Debug for Invite {
@@ -350,7 +361,7 @@ impl Invite {
         trackers: Vec<TrackerRef>,
         join: Join,
     ) -> Self {
-        Invite { version: INVITE_VERSION, name: name.to_owned(), epoch, psk, obfs, trackers, join }
+        Invite { version: INVITE_VERSION, name: name.to_owned(), epoch, psk, obfs, trackers, join, statics: Vec::new() }
     }
 
     pub fn group(&self) -> GroupId {
