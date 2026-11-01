@@ -563,6 +563,7 @@ wan_port6 x6 2001:db8::11
 wan_port6 y6 2001:db8::12
 ! nsx x6 ip -4 addr show scope global | grep -q inet || fail "x6 has an IPv4 address"
 bg tracker6 wan "$D" --dir "$W/trk" server -p 6485
+TRACKER6=$!
 wait_for 10 grep -q 'Server started' tracker6.log || fail "tracker did not start on ::"
 mkdir x6 y6
 "$D" --dir "$W/x6" show-key >/dev/null 2>&1
@@ -662,5 +663,15 @@ before=$(direct)
 nsx ma ping -c5 -i0.2 -W1 10.10.77.3 >/dev/null || fail "ma -> mc after the path opened"
 [ $(( $(direct) - before )) -ge 5 ] || fail "ma -> mc still not direct"
 ok "direct path opened: ma <-> mc go direct"
+
+# Without a tracker: it goes away, the admin changes a member, the record still reaches
+# everybody through the neighbours (STATE between link sessions)
+kill "$TRACKER6"
+"$D" --dir "$W/ma" node set mc --add-route 192.168.77.0/24 >/dev/null || fail "ma: node set without tracker"
+wait_for 40 sh -c "ip netns exec mb ip route show table 7347 | grep -q '192.168.77.0/24 dev dnet'" \
+    || fail "mb did not get mc's new subnet without a tracker"
+wait_for 10 sh -c "ip netns exec md ip route show table 7347 | grep -q '192.168.77.0/24 dev dnet'" \
+    || fail "md did not get mc's new subnet without a tracker"
+ok "without a tracker: a member change reaches everybody through the neighbours"
 
 echo "PASS"
