@@ -550,7 +550,8 @@ impl Api {
                 self.node
                     .direct_links()
                     .into_iter()
-                    .map(|(id, ep, rtt, alive, age)| {
+                    .map(|l| {
+                        let (id, ep, rtt, alive, age) = (l.peer, l.endpoint, l.rtt_ms, l.alive, l.age);
                         map(vec![
                             ("key", id.to_string().into()),
                             ("name", opt_str(storage.name(&id))),

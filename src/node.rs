@@ -49,6 +49,15 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// about the switch late (PLAN §4.4). Longer than a session lives, so no session is cut short.
 const EPOCH_GRACE_MS: u64 = 10 * 60 * 1000;
 
+/// A neighbour with a direct session, for diagnostics.
+pub struct DirectLink {
+    pub peer: NodeId,
+    pub endpoint: Option<SocketAddr>,
+    pub rtt_ms: Option<f64>,
+    pub alive: bool,
+    pub age: Duration,
+}
+
 /// The node's group: its records, our certificate, and the secret if we are an admin.
 pub struct GroupCtx {
     pub id: GroupId,
@@ -1000,14 +1009,20 @@ impl Node {
 
     // ---- diagnostics (dvpn status / neighbors / routes / path) ----
 
-    /// Peers with a direct session: (key, endpoint, RTT, alive, session age).
-    pub fn direct_links(&self) -> Vec<(NodeId, Option<SocketAddr>, Option<f64>, bool, Duration)> {
+    /// Peers with a direct session.
+    pub fn direct_links(&self) -> Vec<DirectLink> {
         self.storage
             .others()
             .into_iter()
             .filter_map(|p| {
                 let s = self.links.current(&p)?;
-                Some((p, self.storage.endpoint(&p), self.storage.rtt_ms(&p), self.link_alive(&p), s.age()))
+                Some(DirectLink {
+                    peer: p,
+                    endpoint: self.storage.endpoint(&p),
+                    rtt_ms: self.storage.rtt_ms(&p),
+                    alive: self.link_alive(&p),
+                    age: s.age(),
+                })
             })
             .collect()
     }
