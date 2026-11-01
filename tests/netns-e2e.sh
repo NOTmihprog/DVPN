@@ -350,6 +350,20 @@ for n in b c; do wait_for 30 renewed $n || fail "$n still has its invite certifi
 "$D" --dir "$W/a" group members | grep -q 'b .*10.10.33.2' || fail "a: b missing from group members"
 ok "invite certificates replaced by regular ones"
 
+# The admin changes members on the fly (new certificates in the group records): C gets one more
+# subnet, B a new address; everybody follows within seconds, B moves the address on its TUN.
+"$D" --dir "$W/a" node set c --add-route 192.168.31.0/24 >/dev/null || fail "node set c"
+"$D" --dir "$W/a" node set b --addr 10.10.33.22 >/dev/null || fail "node set b"
+wait_for 30 sh -c "ip netns exec b ip route show table 7347 | grep -q '192.168.31.0/24 dev dnet'" \
+    || fail "b did not learn c's new subnet"
+wait_for 30 sh -c "ip netns exec b ip -4 addr show dnet | grep -q 10.10.33.22" || fail "b did not take its new address"
+wait_for 20 nsx a ping -c1 -W1 10.10.33.22 || fail "a -> b at its new address"
+"$D" --dir "$W/a" node list | grep -q '| b .*10.10.33.22' || fail "node list does not show b's new address"
+"$D" --dir "$W/a" node set b --addr 10.10.33.2 >/dev/null || fail "node set b back"
+wait_for 30 sh -c "ip netns exec b ip -4 addr show dnet | grep -q '10.10.33.2/'" || fail "b did not take its address back"
+wait_for 20 nsx a ping -c1 -W1 10.10.33.2 || fail "a -> b at its old address again"
+ok "node set: new subnet for c and a new address for b reach everybody"
+
 # Revocation (before the roaming check, which leaves A without a tracker session for a
 # while): the admin revokes B with the CLI while its node runs; the node spreads the record
 # (tracker + direct), C drops B and B can no longer reach anybody.
@@ -489,16 +503,18 @@ plain ma | grep -q 'end-to-end session with mc' || plain mc | grep -q 'end-to-en
 via=$( (plain ma; plain mc) | sed -n 's/.*end-to-end session with [^ ]* via \(m[bd]\).*/\1/p' | tail -n1)
 ok "ma <-> mc through relay $via"
 
-# traceroute through the mesh: the relay shows up as a hop (by its overlay address), as an
-# ordinary router would; the end node lowers the TTL by the relays passed
+# traceroute through the mesh: a relay shows up as a hop (by its overlay address), as an
+# ordinary router would; the end node lowers the TTL by the relays passed. Both relays are
+# equally good, so the one in use is taken from the trace, not from when the session started.
 if command -v tracepath >/dev/null; then
-    case $via in mb) hop=2 ;; *) hop=4 ;; esac
     tp=$(nsx ma tracepath -n -m 5 10.10.77.3 2>&1 || true)
-    echo "$tp" | grep -q "10.10.77.$hop " || fail "tracepath ma -> mc does not show relay $via: $tp"
+    hop=$(echo "$tp" | awk '$1 == "1:" {print $2; exit}')
+    case $hop in 10.10.77.2) via=mb ;; 10.10.77.4) via=md ;; *) fail "tracepath ma -> mc shows no relay: $tp" ;; esac
     echo "$tp" | grep -q 'reached' || fail "tracepath ma -> mc did not reach mc: $tp"
     ula() { nsx "$1" ip -6 -o addr show dev dnet scope global | awk '{print $4}' | cut -d/ -f1; }
     tp6=$(nsx ma tracepath -6 -n -m 5 "$(ula mc)" 2>&1 || true)
-    echo "$tp6" | grep -q "$(ula "$via") " || fail "tracepath -6 ma -> mc does not show relay $via: $tp6"
+    hop6=$(echo "$tp6" | awk '$1 == "1:" {print $2; exit}')
+    [ "$hop6" = "$(ula mb)" ] || [ "$hop6" = "$(ula md)" ] || fail "tracepath -6 ma -> mc shows no relay: $tp6"
     ok "traceroute shows relay $via (IPv4 and IPv6)"
 else
     echo "skip: tracepath not found (traceroute through relays)"

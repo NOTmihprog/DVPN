@@ -67,6 +67,8 @@ pub struct GroupCtx {
     pub statics: Vec<crate::group::StaticRef>,
     /// `[ckr.remote_subnets]`: manual routes on top of the members' certificates (PLAN §7).
     pub routes: Vec<crate::ckr::Route>,
+    /// Prefix length of the group network on the TUN (`[net] mask`).
+    pub tun_prefix: u8,
     /// `[exit]` as at start; the node follows later changes in `config_path`.
     pub exits: crate::config::Exits,
     pub config_path: std::path::PathBuf,
@@ -84,7 +86,8 @@ pub struct Node {
     pub clients: Vec<Arc<TrackerClient>>,
     clients_by_addr: HashMap<SocketAddr, Arc<TrackerClient>>,
     tun: Option<Arc<AsyncDevice>>,
-    self_addr: Option<Ipv4Addr>,
+    /// Our IPv4 address in the group (it follows our certificate).
+    self_addr: parking_lot::RwLock<Option<Ipv4Addr>>,
     api_tx: OnceLock<mpsc::Sender<ApiPacket>>,
     epoch: Instant,
     group: GroupCtx,
@@ -145,7 +148,7 @@ impl Node {
             clients,
             clients_by_addr,
             tun: tun.map(Arc::new),
-            self_addr,
+            self_addr: parking_lot::RwLock::new(self_addr),
             api_tx: OnceLock::new(),
             epoch: Instant::now(),
             cert: parking_lot::RwLock::new(group.cert.clone()),
@@ -183,8 +186,21 @@ impl Node {
     /// Rebuilds the CKR table: every member's certificate prefixes and IPv6 ULA (sorted by key,
     /// so conflicts resolve the same way everywhere), then the manual routes over them.
     fn rebuild_ckr(&self) {
-        let certs = self.peer_certs.lock();
-        let mut peers: Vec<&Cert> = certs.values().collect();
+        // every member's newest certificate: from handshakes and trackers, or from the records
+        // (an admin changed its addresses or subnets: `dvpn node set`), revoked ones left out
+        let me = self.storage.self_id();
+        let m = Membership::of(&self.group.store, &self.group.id);
+        let mut newest: HashMap<NodeId, Cert> = HashMap::new();
+        for c in self.peer_certs.lock().values().cloned().chain(self.group.store.certs(&self.group.id)) {
+            let n = c.body.node;
+            if n == me || !m.admits(&c) {
+                continue;
+            }
+            if newest.get(&n).is_none_or(|old| old.body.not_after < c.body.not_after) {
+                newest.insert(n, c);
+            }
+        }
+        let mut peers: Vec<&Cert> = newest.values().collect();
         peers.sort_by_key(|c| c.body.node);
         let mut routes = Vec::new();
         for c in peers {
@@ -195,7 +211,6 @@ impl Node {
             let ula = crate::ckr::ula_addr(&self.group.id, &c.body.node);
             routes.push(crate::ckr::Route { net: ipnet::IpNet::from(IpAddr::V6(ula)), target, system: false });
         }
-        drop(certs);
         // the chosen gateways get the internet (private ranges stay local), manual routes on top
         let gw4 = self.exit4.lock().current;
         let gw6 = self.exit6.lock().current;
@@ -206,8 +221,7 @@ impl Node {
         }
         routes.extend(self.group.routes.iter().copied());
         if let Some(gw) = self.gateway.lock().as_mut() {
-            let prefixes: Vec<ipnet::IpNet> =
-                self.peer_certs.lock().values().flat_map(|c| c.body.prefixes.iter().copied()).collect();
+            let prefixes: Vec<ipnet::IpNet> = newest.values().flat_map(|c| c.body.prefixes.iter().copied()).collect();
             tokio::task::block_in_place(|| gw.apply(&prefixes));
         }
         let table = CkrTable::new(routes);
@@ -251,7 +265,6 @@ impl Node {
         for id in gone {
             log::info!("Group | {} revoked, dropped", node(id));
             self.peer_certs.lock().remove(&id);
-            self.rebuild_ckr();
             self.links.drop_peer(&id);
             self.e2e.drop_peer(&id);
             self.storage.del_peer(&id);
@@ -269,14 +282,55 @@ impl Node {
                 "Group | new certificate from an admin, valid {} more days",
                 (c.body.not_after - now_unix()) / 86400
             );
-            *self.cert.write() = c.clone();
             self.links.set_cert(c.clone());
             self.e2e.set_cert(c.clone());
             for client in &self.clients {
                 client.set_certs(vec![c.clone()]);
             }
             self.storage.set_peer(me, PeerUpdate::from_cert(&c));
+            let old = std::mem::replace(&mut *self.cert.write(), c.clone());
+            self.retune_tun(&old, &c);
             (self.group.on_cert)(&c);
+        }
+        // members' certificates in the records carry their current addresses and subnets
+        self.rebuild_ckr();
+    }
+
+    /// Our addresses changed with a new certificate (`dvpn node set`): move them on the TUN.
+    fn retune_tun(&self, old: &Cert, new: &Cert) {
+        let Some(tun) = &self.tun else { return };
+        let hosts6 = |c: &Cert| -> Vec<std::net::Ipv6Addr> {
+            c.body
+                .prefixes
+                .iter()
+                .filter_map(|p| match p {
+                    ipnet::IpNet::V6(n) if n.prefix_len() == 128 => Some(n.addr()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (o4, n4) = (old.body.ipv4(), new.body.ipv4());
+        if o4 != n4 {
+            if let Some(a) = n4 {
+                match tun.add_address_v4(a, self.group.tun_prefix) {
+                    Ok(()) => log::info!("TUN | address {a}/{}", self.group.tun_prefix),
+                    Err(e) => log::warn!("TUN | add {a}: {e}"),
+                }
+            }
+            if let Some(a) = o4 {
+                let _ = tun.remove_address(IpAddr::V4(a));
+            }
+            *self.self_addr.write() = n4;
+        }
+        let (o6, n6) = (hosts6(old), hosts6(new));
+        for a in n6.iter().filter(|a| !o6.contains(a)) {
+            match tun.add_address_v6(*a, 128u8) {
+                Ok(()) => log::info!("TUN | address {a}/128"),
+                Err(e) => log::warn!("TUN | add {a}: {e}"),
+            }
+        }
+        for a in o6.iter().filter(|a| !n6.contains(a)) {
+            let _ = tun.remove_address(IpAddr::V6(*a));
         }
     }
 
@@ -477,7 +531,7 @@ impl Node {
     fn own_candidates(&self) -> Vec<SocketAddr> {
         let Ok(local) = self.transport.local_addr() else { return Vec::new() };
         let mut c = crate::transport::local_candidates(local.port(), self.transport.families(), None);
-        c.retain(|a| Some(a.ip()) != self.self_addr.map(IpAddr::V4) && !self.in_overlay(a));
+        c.retain(|a| Some(a.ip()) != self.self_addr.read().map(IpAddr::V4) && !self.in_overlay(a));
         c.truncate(crate::proto::MAX_CANDIDATES);
         c
     }
@@ -487,7 +541,7 @@ impl Node {
     fn in_overlay(&self, a: &SocketAddr) -> bool {
         let ip = a.ip();
         ipnet::IpNet::V6(crate::ckr::ula_prefix(&self.group.id)).contains(&ip)
-            || self.self_addr.is_some_and(|s| IpAddr::V4(s) == ip)
+            || self.self_addr.read().is_some_and(|s| IpAddr::V4(s) == ip)
             || self.ckr.load().lookup(ip).is_some()
     }
 

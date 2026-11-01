@@ -60,6 +60,9 @@ enum Command {
     /// Groups: create one (this node becomes its admin), invite nodes, join by invite
     #[command(subcommand)]
     Group(GroupCommand),
+    /// Members: addresses, subnets and roles (admins change them with `node set`)
+    #[command(subcommand)]
+    Node(NodeCommand),
     /// Gateways to the internet, by priority (the first alive one is used), or none.
     /// Without options: show them. A running node follows the change within seconds
     Exit {
@@ -81,6 +84,43 @@ enum Command {
         /// Server bind port
         #[arg(short = 'p', long, default_value_t = 6485)]
         port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeCommand {
+    /// Members with their addresses, subnets and roles (from the group records)
+    List {
+        /// Group name or id (default: the only group)
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+    },
+    /// Change a member (admins only): a new certificate, spread to everybody within seconds
+    Set {
+        /// Node key, a unique key prefix, or a member name
+        #[arg(allow_hyphen_values = true)]
+        node: String,
+        /// Group name or id (default: the only group)
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+        /// New name
+        #[arg(short = 'n', long)]
+        name: Option<String>,
+        /// New IPv4 address in the group
+        #[arg(short = 'a', long)]
+        addr: Option<Ipv4Addr>,
+        /// Add a subnet behind the node, or a public IPv6 /128 for it (repeatable)
+        #[arg(long = "add-route", value_name = "PREFIX")]
+        add_route: Vec<IpNet>,
+        /// Remove a subnet or address (repeatable)
+        #[arg(long = "del-route", value_name = "PREFIX")]
+        del_route: Vec<IpNet>,
+        /// Let the node relay for others
+        #[arg(long, conflicts_with = "no_relay")]
+        relay: bool,
+        /// Stop the node relaying
+        #[arg(long)]
+        no_relay: bool,
     },
 }
 
@@ -271,6 +311,142 @@ fn backup_password(new: bool) -> String {
     p
 }
 
+/// A member by node key, exact name, or unique key prefix (names first).
+fn find_member(certs: &[dvpn::group::Cert], s: &str) -> NodeId {
+    if let Ok(k) = s.parse() {
+        return k;
+    }
+    let by_name: Vec<NodeId> = certs.iter().filter(|c| c.body.name == s).map(|c| c.body.node).collect();
+    let hits = if by_name.is_empty() {
+        certs.iter().filter(|c| c.body.node.to_string().starts_with(s)).map(|c| c.body.node).collect()
+    } else {
+        by_name
+    };
+    match hits.as_slice() {
+        [k] => *k,
+        [] => die(format!("{s}: no such member key, key prefix or name (see dvpn node list)")),
+        _ => die(format!("{s} matches {} members, give the key", hits.len())),
+    }
+}
+
+/// Every member's newest certificate in the records, plus our own from the config.
+fn member_certs(conf: &Config, g: &GroupConfig, store: &StateStore) -> Vec<dvpn::group::Cert> {
+    let mut v = store.certs(&g.id);
+    if let Some(own) = &g.cert
+        && !v.iter().any(|c| c.body.node == own.body.node && c.body.not_after >= own.body.not_after)
+    {
+        v.retain(|c| c.body.node != own.body.node);
+        v.push(own.clone());
+    }
+    let _ = conf;
+    v.sort_by(|a, b| a.body.name.cmp(&b.body.name));
+    v
+}
+
+fn cmd_node(conf: &mut Config, dir: &Path, cmd: NodeCommand) {
+    let store = StateStore::open(dir.join(STATE_FILE_NAME));
+    match cmd {
+        NodeCommand::List { group } => {
+            let g = pick_group(conf, &group);
+            let m = Membership::of(&store, &g.id);
+            let rows: Vec<Vec<String>> = member_certs(conf, g, &store)
+                .iter()
+                .map(|c| {
+                    let b = &c.body;
+                    let mut roles = Vec::new();
+                    for (bit, name) in [(dvpn::group::Roles::ADMIN, "admin"), (dvpn::group::Roles::RELAY, "relay")] {
+                        if b.roles.has(bit) {
+                            roles.push(name);
+                        }
+                    }
+                    let addrs: Vec<String> = b
+                        .prefixes
+                        .iter()
+                        .filter(|p| p.max_prefix_len() == p.prefix_len())
+                        .map(|p| p.addr().to_string())
+                        .collect();
+                    let routes: Vec<String> = b
+                        .prefixes
+                        .iter()
+                        .filter(|p| p.max_prefix_len() != p.prefix_len())
+                        .map(|p| p.to_string())
+                        .collect();
+                    vec![
+                        b.name.clone(),
+                        b.node.short(),
+                        addrs.join(", "),
+                        routes.join(", "),
+                        roles.join(","),
+                        if m.revoked.contains(&b.node) {
+                            "revoked".into()
+                        } else {
+                            format!("{} d", b.not_after.saturating_sub(now_unix()) / 86400)
+                        },
+                    ]
+                })
+                .collect();
+            println!("\n{}\n", github_table(&["Name", "Key", "Addresses", "Routes", "Roles", "Cert valid"], &rows));
+        }
+        NodeCommand::Set { node, group, name, addr, add_route, del_route, relay, no_relay } => {
+            if !dvpn::clock::trusted() {
+                die("the clock is earlier than this build: set it (NTP) before signing certificates");
+            }
+            let g = pick_group(conf, &group).clone();
+            let Some(secret) = &g.secret else { die(format!("only admins of {} can change members", g.name)) };
+            let certs = member_certs(conf, &g, &store);
+            let key = find_member(&certs, &node);
+            let Some(base) = certs.iter().find(|c| c.body.node == key) else {
+                die(format!("{node}: not seen yet (the admin node issues its certificate when it sees it online)"))
+            };
+            let mut body = base.body.clone();
+            if let Some(n) = name {
+                body.name = n;
+            }
+            if let Some(a) = addr {
+                let taken = certs.iter().filter(|c| c.body.node != key).any(|c| c.body.ipv4() == Some(a));
+                if taken {
+                    die(format!("{a} is taken by another member"));
+                }
+                let own = body.ipv4();
+                body.prefixes.retain(|p| !matches!(p, IpNet::V4(n) if Some(n.addr()) == own && n.prefix_len() == 32));
+                body.prefixes.insert(0, IpNet::V4(Ipv4Net::new(a, 32).expect("/32")));
+            }
+            for r in &del_route {
+                body.prefixes.retain(|p| p.trunc() != r.trunc());
+            }
+            for r in &add_route {
+                let r = r.trunc();
+                if !body.prefixes.contains(&r) {
+                    body.prefixes.push(r);
+                }
+            }
+            if relay {
+                body.roles.0 |= dvpn::group::Roles::RELAY;
+            }
+            if no_relay {
+                body.roles.0 &= !dvpn::group::Roles::RELAY;
+            }
+            body.not_after = now_unix() + dvpn::group::CERT_TTL_SECS;
+            body.serial = u64::from_le_bytes(random_bytes());
+            let cert = secret.issue(body);
+            store.add(secret, Body::Cert(Box::new(cert.clone())), false);
+            store.save();
+            if key == conf.identity.id() {
+                conf.set_group_cert(&g.id, &cert);
+                conf.save();
+            }
+            let b = &cert.body;
+            println!(
+                "{} ({}): {}",
+                b.name,
+                b.node.short(),
+                b.prefixes.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+            );
+            println!("A running node of this admin spreads it within seconds; the member picks it up.");
+        }
+    }
+}
+
 fn epoch_of(changed: &[dvpn::state::Entry]) -> u32 {
     changed
         .iter()
@@ -333,7 +509,9 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             let Some(secret) = &g.secret else { die(format!("only admins of {} can invite", g.name)) };
             let own = g.ipv4().unwrap_or_else(|| die("this node has no address in the group"));
             let net = Ipv4Net::new(own, net_prefix(conf)).unwrap_or_else(|e| die(e)).trunc();
-            let addr = addr.unwrap_or_else(|| free_host(net, &[own]));
+            // a free address: none of the members' (the records) nor our own
+            let taken: Vec<Ipv4Addr> = state().certs(&g.id).iter().filter_map(|c| c.body.ipv4()).chain([own]).collect();
+            let addr = addr.unwrap_or_else(|| free_host(net, &taken));
             for e in &statics {
                 config::check_endpoint(e).unwrap_or_else(|e| die(format!("--static {e:#}")));
             }
@@ -478,28 +656,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             let Some(secret) = &g.secret else { die(format!("only admins of {} can revoke", g.name)) };
             let store = state();
             let certs = store.certs(&g.id);
-            let key: NodeId = match node.parse() {
-                Ok(k) => k,
-                Err(_) => {
-                    // an exact name first, a key prefix only if no name matches
-                    let by_name: Vec<NodeId> =
-                        certs.iter().filter(|c| c.body.name == node).map(|c| c.body.node).collect();
-                    let hits = if by_name.is_empty() {
-                        certs
-                            .iter()
-                            .filter(|c| c.body.node.to_string().starts_with(&node))
-                            .map(|c| c.body.node)
-                            .collect()
-                    } else {
-                        by_name
-                    };
-                    match hits.as_slice() {
-                        [k] => *k,
-                        [] => die(format!("{node}: no such member key, key prefix or name (see dvpn group members)")),
-                        _ => die(format!("{node} matches {} members, give the key", hits.len())),
-                    }
-                }
-            };
+            let key = find_member(&certs, &node);
             if key == conf.identity.id() {
                 die("an admin cannot revoke itself; leave the group instead");
             }
@@ -791,6 +948,7 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         statics: conf.static_peers.clone(),
         routes: conf.remote_subnets.clone(),
         exits: conf.exits.clone(),
+        tun_prefix: conf.net.as_ref().map_or(24, |n| n.prefix),
         config_path: conf.path().to_path_buf(),
         on_epoch: Box::new(move |epoch, psk| match Config::load(&dir2) {
             Ok(mut conf) => {
@@ -885,6 +1043,7 @@ fn main() {
         Some(Command::GenKey | Command::ShowKey { key: Some(_) }) => unreachable!(),
         Some(Command::ShowKey { key: None }) => println!("{}", conf.identity.id()),
         Some(Command::Group(cmd)) => cmd_group(&mut conf, &dir, cmd),
+        Some(Command::Node(cmd)) => cmd_node(&mut conf, &dir, cmd),
         Some(Command::Exit { v4, v6, none }) => {
             let mut e = conf.exits.clone();
             if none {
