@@ -128,6 +128,7 @@
 - [x] **4.3** TUN→сеть: `dst → CkrTable → NodeId` (любой источник: свой, LAN за узлом, интернет у exit); сеть→TUN: обратный путь `CkrTable(src) == отправитель`; IPv6-пакеты больше не отбрасываются
 - [x] **4.4** автоматические маршруты из `prefixes` сертификатов (`group create/invite --route`), ручные `[ckr.remote_subnets]` поверх
 - [~] **4.5** системные маршруты Linux (`sysroute.rs`, `ip`): таблица 7347, правила `main suppress_prefixlength 0` + `not fwmark 0x7347 lookup 7347`, diff при изменении CKR, снятие при выходе (Ctrl+C, SIGTERM) и чистка после сбоя, `[net] manage_routes`; Windows/macOS — пока предупреждение
+  - [ ] **Windows** (нужно, решение 2026-11-01): системные маршруты через IP Helper API (`CreateIpForwardEntry2` / `DeleteIpForwardEntry2`, метрика на интерфейсе Wintun) или `route.exe`; аналог fwmark — сокет DVPN привязан к физическому интерфейсу маршрута по умолчанию (`IP_UNICAST_IF` / `IPV6_UNICAST_IF`, как wireguard-windows), с перепривязкой при смене сети; затем kill switch (маршруты в Wintun) и DNS (NRPT или настройка DNS интерфейса). Проверка — на Windows-машине или Windows-раннере
 - [x] **4.6** underlay-исключения: решено через fwmark на сокете DVPN (как `wg-quick`) — свой трафик всегда мимо туннеля, отдельные `!ip/32` не нужны (решение в PLAN §7)
 - [~] **4.7** MTU: отказ при `mtu < 1280` (IPv6 на TUN); пакеты больше MTU ядро не отдаёт в TUN и само отвечает PTB/Frag Needed пересылаемым; генерация ICMP при relay — этап 5
 - [x] **4.8** фаззинг-цель `ckr_spec`: разбор синтаксиса записей + поиск по построенной таблице
