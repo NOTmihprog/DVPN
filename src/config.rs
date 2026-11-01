@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
@@ -32,8 +32,8 @@ private_key = "{private_key}"
 "#;
 
 const DEFAULT_CONFIG: &str = r#"[peer]
-# local bind ip
-bind_addr = "0.0.0.0"
+# local bind ip: "::" = IPv6 and IPv4 on one socket, "0.0.0.0" = IPv4 only
+bind_addr = "::"
 
 # local port or port range, example: "8647", "8647-9942"
 bind_port = "8647-9942"
@@ -62,7 +62,7 @@ log_level = "INFO"
 "#;
 
 pub struct PeerConfig {
-    pub bind_addr: Ipv4Addr,
+    pub bind_addr: IpAddr,
     pub port_range: (u16, u16),
 }
 
@@ -78,7 +78,8 @@ pub struct ServerConfig {
     /// As written (domain or IP), for invites.
     pub host: String,
     pub port: u16,
-    pub addr: SocketAddr,
+    /// Every address the host resolved to, IPv6 first (they are all tried at once).
+    pub addrs: Vec<SocketAddr>,
     pub key: VerifyingKey,
 }
 
@@ -347,14 +348,19 @@ fn parse_net(t: &Table) -> anyhow::Result<NetConfig> {
 fn parse_server(name: &str, t: &Table) -> anyhow::Result<ServerConfig> {
     let host = get_str(t, "addr")?;
     let port: u16 = get_str_or_int(t, "port")?.parse().context("port")?;
-    let addr = (host, port)
+    let mut addrs: Vec<SocketAddr> = (host.trim_start_matches('[').trim_end_matches(']'), port)
         .to_socket_addrs()
         .with_context(|| format!("resolve {host}"))?
-        .find(SocketAddr::is_ipv4)
-        .ok_or_else(|| anyhow!("{host} has no ipv4 address"))?;
+        .map(crate::transport::normalize)
+        .collect();
+    addrs.sort_by_key(|a| (a.is_ipv4(), *a));
+    addrs.dedup();
+    if addrs.is_empty() {
+        bail!("{host} has no address");
+    }
     let key_bytes = decode_key32(get_str(t, "key")?).context("key")?;
     let key = VerifyingKey::from_bytes(&key_bytes).map_err(|e| anyhow!("key: {e}"))?;
-    Ok(ServerConfig { name: name.to_owned(), host: host.to_owned(), port, addr, key })
+    Ok(ServerConfig { name: name.to_owned(), host: host.to_owned(), port, addrs, key })
 }
 
 fn parse_log_level(s: &str) -> anyhow::Result<LevelFilter> {

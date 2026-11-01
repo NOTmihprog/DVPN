@@ -46,14 +46,19 @@ pub const MAX_DATAGRAM: usize = 65507;
 
 /// Most groups one announce may list.
 pub const MAX_ANNOUNCE_CERTS: usize = 16;
+/// Most address candidates a node announces (PLAN §9.1).
+pub const MAX_CANDIDATES: usize = 8;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TrackerMsg {
     /// Client -> server: "I am at the address you see this packet from, a member of the groups
     /// of these certificates". Who "I" is, the session handshake proved (the client's static key
     /// is its node key); the server checks each certificate against its group id (PLAN §11).
+    /// `candidates` are the node's own interface addresses with its port (LAN, IPv6), tried by
+    /// peers besides the address the tracker sees.
     Announce {
         certs: Vec<Cert>,
+        candidates: Vec<SocketAddr>,
     },
     /// Server -> client: the member with this certificate is reachable at `addr`. Sent for every
     /// online member of the client's groups in reply to an announce (the client's own address
@@ -61,6 +66,7 @@ pub enum TrackerMsg {
     Found {
         cert: Box<Cert>,
         addr: SocketAddr,
+        candidates: Vec<SocketAddr>,
     },
     /// Group records both ways (`state.rs`), for the groups the client is a verified member of.
     Sync(SyncMsg),

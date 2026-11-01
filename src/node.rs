@@ -80,6 +80,9 @@ pub struct Node {
     cert: parking_lot::RwLock<Cert>,
     /// The verified certificates of peers we have seen, for re-checking them when records change.
     peer_certs: parking_lot::Mutex<HashMap<NodeId, Cert>>,
+    /// Further addresses to try for peers without a session (PLAN §9.1): the candidates they
+    /// announced to the tracker, or all addresses of a static peer.
+    candidates: parking_lot::Mutex<HashMap<NodeId, Vec<SocketAddr>>>,
     last_peer_sync: parking_lot::Mutex<HashMap<NodeId, Instant>>,
     /// The psk epoch we are in, and the previous one while it is still accepted (until unix ms).
     psk: parking_lot::Mutex<(EpochPsk, Option<(EpochPsk, u64)>)>,
@@ -98,7 +101,7 @@ impl Node {
         group: GroupCtx,
     ) -> Arc<Self> {
         let clients: Vec<_> = clients.into_iter().map(Arc::new).collect();
-        let clients_by_addr = clients.iter().map(|c| (c.addr, c.clone())).collect();
+        let clients_by_addr = clients.iter().flat_map(|c| c.addrs().iter().map(move |a| (*a, c.clone()))).collect();
         Arc::new(Node {
             storage,
             transport,
@@ -114,6 +117,7 @@ impl Node {
             epoch_warned: std::sync::atomic::AtomicU32::new(0),
             group,
             peer_certs: parking_lot::Mutex::new(HashMap::new()),
+            candidates: parking_lot::Mutex::new(HashMap::new()),
             last_peer_sync: parking_lot::Mutex::new(HashMap::new()),
         })
     }
@@ -317,14 +321,40 @@ impl Node {
     }
 
     /// Sends a handshake to `peer`'s endpoint unless one went out less than `min_interval` ago.
+    /// The same handshake goes to the peer's endpoint and, while there is no session, to all its
+    /// candidate addresses at once (happy eyeballs, IPv6 first): the first that answers becomes
+    /// the endpoint (`roam`), copies arriving elsewhere are dropped as replays.
     async fn handshake(&self, peer: NodeId, min_interval: Duration) {
-        let Some(route) = self.storage.route_by_id(&peer) else { return };
-        if let Some(packets) = self.links.initiate(peer, min_interval) {
-            log::debug!("Link | handshake to {}", node(peer));
-            for p in &packets {
-                self.transport.send_to(p, route.endpoint).await;
+        let mut targets: Vec<SocketAddr> = self.storage.route_by_id(&peer).map(|r| r.endpoint).into_iter().collect();
+        if self.links.current(&peer).is_none() {
+            let fam = self.transport.families();
+            for c in self.candidates.lock().get(&peer).into_iter().flatten() {
+                if fam.reaches(c) && !targets.contains(c) {
+                    targets.push(*c);
+                }
             }
         }
+        if targets.is_empty() {
+            return;
+        }
+        if let Some(packets) = self.links.initiate(peer, min_interval) {
+            log::debug!("Link | handshake to {} at {targets:?}", node(peer));
+            for t in &targets {
+                for p in &packets {
+                    self.transport.send_to(p, *t).await;
+                }
+            }
+        }
+    }
+
+    /// Our own address candidates for the tracker: interface addresses with our port, not the
+    /// overlay address.
+    fn own_candidates(&self) -> Vec<SocketAddr> {
+        let Ok(local) = self.transport.local_addr() else { return Vec::new() };
+        let mut c = crate::transport::local_candidates(local.port(), self.transport.families(), None);
+        c.retain(|a| Some(a.ip()) != self.self_addr.map(IpAddr::V4));
+        c.truncate(crate::proto::MAX_CANDIDATES);
+        c
     }
 
     /// Sends `[kind][body]` to `peer` over its session. Not for the TUN hot path.
@@ -348,15 +378,24 @@ impl Node {
     }
 
     async fn send_tracker(&self, client: &TrackerClient, out: Output) {
-        for p in &out.packets {
-            self.transport.send_to(p, client.addr).await;
+        let to: Vec<SocketAddr> = if out.to_all { client.addrs().to_vec() } else { vec![client.addr()] };
+        for a in &to {
+            for p in &out.packets {
+                self.transport.send_to(p, *a).await;
+            }
+        }
+        if !out.candidates.is_empty() {
+            let mut cands = self.candidates.lock();
+            for (peer, c) in out.candidates.iter().cloned() {
+                cands.insert(peer, c);
+            }
         }
         for cert in &out.members {
             Box::pin(self.member_seen(cert)).await;
         }
         self.apply(&out.changed);
         if let Some(connected) = out.status {
-            self.storage.emit(Event::Server { addr: client.addr, connected });
+            self.storage.emit(Event::Server { addr: client.addr(), connected });
             if !connected && self.transport.can_change_port() && self.clients.iter().all(|c| !c.is_connected()) {
                 self.transport.change_port().await;
             }
@@ -365,10 +404,17 @@ impl Node {
 
     async fn tracker_loop(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut cands = Vec::new();
+        let mut cands_at: Option<Instant> = None;
         loop {
             tick.tick().await;
+            // interfaces change rarely; look again every 15 s
+            if cands_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(15)) {
+                cands = self.own_candidates();
+                cands_at = Some(Instant::now());
+            }
             for c in &self.clients {
-                let out = c.tick();
+                let out = c.tick(&cands);
                 self.send_tracker(c, out).await;
             }
         }
@@ -439,17 +485,12 @@ impl Node {
         struct Try {
             next: Instant,
             backoff: Duration,
-            turn: usize,
         }
         let mut tries: HashMap<NodeId, Try> = HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             for sp in &self.group.statics {
-                let t = tries.entry(sp.key).or_insert(Try {
-                    next: Instant::now(),
-                    backoff: Duration::from_secs(1),
-                    turn: 0,
-                });
+                let t = tries.entry(sp.key).or_insert(Try { next: Instant::now(), backoff: Duration::from_secs(1) });
                 if self.links.current(&sp.key).is_some() {
                     t.backoff = Duration::from_secs(1);
                     t.next = Instant::now();
@@ -458,28 +499,29 @@ impl Node {
                 if Instant::now() < t.next {
                     continue;
                 }
-                let ep = &sp.endpoints[t.turn % sp.endpoints.len()];
-                t.turn += 1;
                 let jitter = Duration::from_millis(rand::rng().random_range(0..500));
                 t.next = Instant::now() + t.backoff + jitter;
                 t.backoff = (t.backoff * 2).min(STATIC_MAX_BACKOFF);
-                // IPv4 underlay until the dual-stack socket (PLAN stage 3.11)
-                let addr = match tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(ep.as_str())).await {
-                    Ok(Ok(mut addrs)) => addrs.find(SocketAddr::is_ipv4),
-                    Ok(Err(e)) => {
-                        log::debug!("Static | {ep}: {e}");
-                        None
+                // every endpoint, every resolved address of it: tried at once, IPv6 first
+                let fam = self.transport.families();
+                let mut addrs: Vec<SocketAddr> = Vec::new();
+                for ep in &sp.endpoints {
+                    match tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(ep.as_str())).await {
+                        Ok(Ok(r)) => addrs.extend(r.map(crate::transport::normalize).filter(|a| fam.reaches(a))),
+                        Ok(Err(e)) => log::debug!("Static | {ep}: {e}"),
+                        Err(_) => log::debug!("Static | {ep}: DNS timeout"),
                     }
-                    Err(_) => None,
-                };
-                let Some(addr) = addr else {
-                    log::debug!("Static | {} {ep}: no IPv4 address", node(sp.key));
+                }
+                addrs.sort_by_key(|a| a.is_ipv4());
+                addrs.dedup();
+                let Some(&first) = addrs.first() else {
+                    log::debug!("Static | {}: no reachable address", node(sp.key));
                     continue;
                 };
-                if self.storage.endpoint(&sp.key) != Some(addr) {
-                    self.storage.set_peer(sp.key, PeerUpdate { endpoint: Some(Some(addr)), ..Default::default() });
+                if self.storage.endpoint(&sp.key).is_none_or(|e| !addrs.contains(&e)) {
+                    self.storage.set_peer(sp.key, PeerUpdate { endpoint: Some(Some(first)), ..Default::default() });
                 }
-                log::debug!("Static | handshake to {} at {addr}", node(sp.key));
+                self.candidates.lock().insert(sp.key, addrs);
                 self.handshake(sp.key, Duration::ZERO).await;
             }
         }
@@ -518,7 +560,7 @@ impl Node {
             // Peer packets have no readable type byte, so trackers are told apart by address.
             match self.clients_by_addr.get(&from) {
                 Some(c) => {
-                    let out = c.handle(&buf[..n], &self.storage);
+                    let out = c.handle(&buf[..n], from, &self.storage);
                     self.send_tracker(c, out).await;
                 }
                 None => self.handle_peer_packet(&mut buf[..n], from).await,
@@ -633,7 +675,7 @@ impl Node {
     pub async fn shutdown(&self) {
         for c in &self.clients {
             if let Some(p) = c.close() {
-                self.transport.send_to(&p, c.addr).await;
+                self.transport.send_to(&p, c.addr()).await;
             }
         }
     }

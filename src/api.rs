@@ -431,7 +431,7 @@ impl Api {
             "peer_crypto_status" => {
                 if peer.is_some_and(|id| self.node.links.current(&id).is_some()) { "noise_ikpsk2" } else { "no" }.into()
             }
-            "servers" => Value::Array(self.node.clients.iter().map(|c| addr_value(Some(c.addr))).collect()),
+            "servers" => Value::Array(self.node.clients.iter().map(|c| addr_value(Some(c.addr()))).collect()),
             "server_status" => client().map_or(Value::Nil, |c| c.is_connected().into()),
             "server_key" => client().map_or(Value::Nil, |c| Value::Binary(c.key.to_bytes().to_vec())),
             "server_last_announce" => client().map_or(Value::Nil, |c| c.timestamps().0.into()),

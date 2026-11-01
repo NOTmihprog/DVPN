@@ -16,8 +16,9 @@ use crate::link::Session;
 use crate::logger::node as show;
 use crate::noise::{TAG_LEN, Tai64n};
 use crate::obfs::MAX_PAD;
-use crate::proto::{DATA, DATA_HDR, HS_INIT, MAX_ANNOUNCE_CERTS, MAX_DATAGRAM, TrackerMsg};
+use crate::proto::{DATA, DATA_HDR, HS_INIT, MAX_ANNOUNCE_CERTS, MAX_CANDIDATES, MAX_DATAGRAM, TrackerMsg};
 use crate::state::{Entry, Membership, StateStore, SyncMsg, record_key};
+use crate::transport::{bind_udp, normalize, wire_addr};
 use crate::tunnel::{self, MAX_SKEW, TrackerKeys};
 
 /// A client that sent nothing for this long is dropped.
@@ -31,6 +32,8 @@ struct Client {
     next: Option<Arc<Session>>,
     /// Verified certificates, by group (empty until it announces).
     certs: HashMap<GroupId, Cert>,
+    /// Its own addresses as announced (LAN, IPv6).
+    candidates: Vec<SocketAddr>,
     announced: bool,
     last_seen: Instant,
 }
@@ -116,18 +119,20 @@ impl Server {
         log::info!("Server | node {:#} {} dropped", show(node), c.addr);
     }
 
-    /// The online member `node` of `group`: its certificate and address.
-    fn member(&self, group: &GroupId, node: &NodeId) -> Option<(Cert, SocketAddr)> {
+    /// What to tell others about the online member `node` of `group`.
+    fn member(&self, group: &GroupId, node: &NodeId) -> Option<TrackerMsg> {
         let c = self.clients.get(node)?;
-        Some((c.certs.get(group)?.clone(), c.addr))
+        let cert = Box::new(c.certs.get(group)?.clone());
+        Some(TrackerMsg::Found { cert, addr: c.addr, candidates: c.candidates.clone() })
     }
 
     /// Tells the other online members of `node`'s groups where it is.
     fn notify_members(&self, out: &mut Out, node: NodeId) {
         let Some(c) = self.clients.get(&node) else { return };
-        for (g, cert) in &c.certs {
+        for g in c.certs.keys() {
+            let Some(found) = self.member(g, &node) else { continue };
             for m in self.groups.get(g).into_iter().flatten().filter(|m| **m != node) {
-                self.send(out, m, &TrackerMsg::Found { cert: Box::new(cert.clone()), addr: c.addr });
+                self.send(out, m, &found);
             }
         }
     }
@@ -151,6 +156,7 @@ impl Server {
             current: None,
             next: None,
             certs: HashMap::new(),
+            candidates: Vec::new(),
             announced: false,
             last_seen: Instant::now(),
         });
@@ -189,7 +195,7 @@ impl Server {
             self.notify_members(out, node);
         }
         match TrackerMsg::decode(&packet[plain]) {
-            Some(TrackerMsg::Announce { certs }) => self.announce(out, node, certs),
+            Some(TrackerMsg::Announce { certs, candidates }) => self.announce(out, node, certs, candidates),
             Some(TrackerMsg::Sync(msg)) => self.sync(out, node, msg),
             Some(TrackerMsg::Close) => self.drop_client(out, node, false),
             Some(TrackerMsg::Found { .. }) => {}
@@ -197,7 +203,14 @@ impl Server {
         }
     }
 
-    fn announce(&mut self, out: &mut Out, node: NodeId, certs: Vec<Cert>) {
+    fn announce(&mut self, out: &mut Out, node: NodeId, certs: Vec<Cert>, candidates: Vec<SocketAddr>) {
+        let mut candidates: Vec<SocketAddr> = candidates
+            .into_iter()
+            .map(normalize)
+            .filter(|a| a.port() != 0 && !a.ip().is_unspecified() && !a.ip().is_multicast())
+            .take(MAX_CANDIDATES)
+            .collect();
+        candidates.dedup();
         let now = now_unix();
         let mut valid: HashMap<GroupId, Cert> = HashMap::new();
         for c in certs.into_iter().take(MAX_ANNOUNCE_CERTS) {
@@ -223,11 +236,11 @@ impl Server {
             }
         }
         let Some(c) = self.clients.get_mut(&node) else { return };
-        let changed = !c.announced || c.certs != valid;
+        let changed = !c.announced || c.certs != valid || c.candidates != candidates;
+        c.candidates = candidates;
         let left: Vec<GroupId> = c.certs.keys().filter(|g| !valid.contains_key(g)).copied().collect();
         c.announced = true;
         c.certs = valid;
-        let addr = c.addr;
         self.unindex(node, left);
 
         let groups: Vec<GroupId> = self.clients[&node].certs.keys().copied().collect();
@@ -237,14 +250,15 @@ impl Server {
                 log::info!("Server | node {:#} joined group {}", show(node), g.short());
             }
             let members: Vec<NodeId> = members.iter().copied().collect();
-            let (mine, _) = self.member(&g, &node).expect("just indexed");
+            let mine = self.member(&g, &node).expect("just indexed");
             // Every announce refreshes the announcer's view of its groups (its own address
-            // included); the others hear about it when it is new or its certificate changed.
+            // included); the others hear about it when it is new or its certificate or
+            // candidates changed.
             for m in members {
-                let Some((cert, m_addr)) = self.member(&g, &m) else { continue };
-                self.send(out, &node, &TrackerMsg::Found { cert: Box::new(cert), addr: m_addr });
+                let Some(found) = self.member(&g, &m) else { continue };
+                self.send(out, &node, &found);
                 if changed && m != node {
-                    self.send(out, &m, &TrackerMsg::Found { cert: Box::new(mine.clone()), addr });
+                    self.send(out, &m, &mine);
                 }
             }
         }
@@ -270,7 +284,7 @@ impl Server {
             let membership = Membership::of(&self.store, &g);
             let members: Vec<NodeId> = self.groups.get(&g).map(|m| m.iter().copied().collect()).unwrap_or_default();
             for m in members {
-                let Some((cert, _)) = self.member(&g, &m) else { continue };
+                let Some(TrackerMsg::Found { cert, .. }) = self.member(&g, &m) else { continue };
                 // a revoked member gets the records too, so it knows why nobody answers
                 if m != node {
                     for msg in SyncMsg::records(records.clone()) {
@@ -328,8 +342,11 @@ impl Server {
     }
 }
 
-pub async fn run(sock: UdpSocket, identity: Identity) {
-    let sock = Arc::new(sock);
+/// Serves on `addr:port` (`::` = IPv6 and IPv4 on one socket).
+pub async fn run(addr: std::net::IpAddr, port: u16, identity: Identity) -> std::io::Result<()> {
+    let (sock, families) = bind_udp(addr, port)?;
+    log::info!("Server started listen: {}", std::net::SocketAddr::new(addr, port));
+    let sock: Arc<UdpSocket> = Arc::new(sock);
     let server = Arc::new(Mutex::new(Server::new(identity)));
 
     let gc = {
@@ -340,7 +357,9 @@ pub async fn run(sock: UdpSocket, identity: Identity) {
                 tick.tick().await;
                 let out = server.lock().collect_garbage();
                 for (p, a) in out {
-                    let _ = sock.send_to(&p, a).await;
+                    if let Some(a) = wire_addr(families, a) {
+                        let _ = sock.send_to(&p, a).await;
+                    }
                 }
             }
         })
@@ -355,14 +374,15 @@ pub async fn run(sock: UdpSocket, identity: Identity) {
                 continue;
             }
         };
-        let out = server.lock().handle(&buf[..n], from);
+        let out = server.lock().handle(&buf[..n], normalize(from));
         for (p, a) in out {
-            if let Err(e) = sock.send_to(&p, a).await {
+            let Some(to) = wire_addr(families, a) else { continue };
+            if let Err(e) = sock.send_to(&p, to).await {
                 log::info!("Server | send to {a} error: {e}");
             }
         }
         if gc.is_finished() {
-            break;
+            return Ok(());
         }
     }
 }
@@ -430,7 +450,7 @@ mod tests {
         let mut v: Vec<_> = msgs
             .iter()
             .filter_map(|m| match m {
-                TrackerMsg::Found { cert, addr } => Some((cert.body.node, *addr)),
+                TrackerMsg::Found { cert, addr, .. } => Some((cert.body.node, *addr)),
                 _ => None,
             })
             .collect();
@@ -447,7 +467,7 @@ mod tests {
         let mut st = server();
         let g = GroupSecret::generate();
         let c = connect(&mut st, "198.51.100.1:4000");
-        let replies = send(&mut st, &c, &TrackerMsg::Announce { certs: vec![cert(&g, &c)] });
+        let replies = send(&mut st, &c, &TrackerMsg::Announce { candidates: vec![], certs: vec![cert(&g, &c)] });
         assert_eq!(found(&replies), vec![(c.id.id(), c.addr)]);
         assert!(st.groups[&g.id()].contains(&c.id.id()));
     }
@@ -484,14 +504,34 @@ mod tests {
         let g = GroupSecret::generate();
         let a = connect(&mut st, "198.51.100.1:4000");
         let mut b = connect(&mut st, "198.51.100.2:4000");
-        send(&mut st, &a, &TrackerMsg::Announce { certs: vec![cert(&g, &a)] });
-        send(&mut st, &b, &TrackerMsg::Announce { certs: vec![cert(&g, &b)] });
+        send(&mut st, &a, &TrackerMsg::Announce { candidates: vec![], certs: vec![cert(&g, &a)] });
+        send(&mut st, &b, &TrackerMsg::Announce { candidates: vec![], certs: vec![cert(&g, &b)] });
         // b's NAT gives it a new address: the same session goes on, a learns the new address
         b.addr = "198.51.100.22:5000".parse().unwrap();
-        let out = st.handle(&seal(&b, &TrackerMsg::Announce { certs: vec![cert(&g, &b)] }), b.addr);
+        let out = st.handle(&seal(&b, &TrackerMsg::Announce { candidates: vec![], certs: vec![cert(&g, &b)] }), b.addr);
         let to_a: Vec<_> = out.iter().filter(|(_, t)| *t == a.addr).map(|(p, _)| open(&a, p)).collect();
         assert!(found(&to_a).contains(&(b.id.id(), b.addr)), "a told about b's new address");
         assert_eq!(st.clients[&b.id.id()].addr, b.addr);
+    }
+
+    #[test]
+    fn candidates_passed_on() {
+        let mut st = server();
+        let g = GroupSecret::generate();
+        let a = connect(&mut st, "198.51.100.1:4000");
+        let b = connect(&mut st, "198.51.100.2:4000");
+        let cands: Vec<SocketAddr> = vec!["192.168.1.5:4000".parse().unwrap(), "[2001:db8::5]:4000".parse().unwrap()];
+        let junk: Vec<SocketAddr> = vec!["0.0.0.0:1".parse().unwrap(), "10.0.0.1:0".parse().unwrap()];
+        let all = [cands.clone(), junk, vec!["[::ffff:10.1.1.1]:4000".parse().unwrap()]].concat();
+        send(&mut st, &a, &TrackerMsg::Announce { certs: vec![cert(&g, &a)], candidates: all });
+        let replies = send(&mut st, &b, &TrackerMsg::Announce { certs: vec![cert(&g, &b)], candidates: vec![] });
+        let got = replies.iter().find_map(|m| match m {
+            TrackerMsg::Found { cert, candidates, .. } if cert.body.node == a.id.id() => Some(candidates.clone()),
+            _ => None,
+        });
+        let mut want = cands;
+        want.push("10.1.1.1:4000".parse().unwrap());
+        assert_eq!(got, Some(want), "unspecified and port-0 candidates dropped, mapped ones normalized");
     }
 
     #[test]
@@ -501,12 +541,13 @@ mod tests {
         let a = connect(&mut st, "198.51.100.1:4000");
         let b = connect(&mut st, "198.51.100.2:4000");
         let x = connect(&mut st, "198.51.100.3:4000");
-        send(&mut st, &a, &TrackerMsg::Announce { certs: vec![cert(&g, &a)] });
-        send(&mut st, &x, &TrackerMsg::Announce { certs: vec![cert(&other, &x)] });
+        send(&mut st, &a, &TrackerMsg::Announce { candidates: vec![], certs: vec![cert(&g, &a)] });
+        send(&mut st, &x, &TrackerMsg::Announce { candidates: vec![], certs: vec![cert(&other, &x)] });
 
         // b comes online: it learns a (and itself), and a learns b in the same step
         let b_cert = cert(&g, &b);
-        let out = st.handle(&seal(&b, &TrackerMsg::Announce { certs: vec![b_cert.clone()] }), b.addr);
+        let out =
+            st.handle(&seal(&b, &TrackerMsg::Announce { candidates: vec![], certs: vec![b_cert.clone()] }), b.addr);
         let to = |c: &Client| -> Vec<TrackerMsg> {
             out.iter().filter(|(_, t)| *t == c.addr).map(|(p, _)| open(c, p)).collect()
         };
@@ -517,7 +558,7 @@ mod tests {
         assert!(to(&x).is_empty(), "another group hears nothing");
 
         // a later announce refreshes b's view but does not notify a again
-        let out = st.handle(&seal(&b, &TrackerMsg::Announce { certs: vec![b_cert] }), b.addr);
+        let out = st.handle(&seal(&b, &TrackerMsg::Announce { candidates: vec![], certs: vec![b_cert] }), b.addr);
         assert!(out.iter().all(|(_, t)| *t == b.addr));
         assert_eq!(out.len(), 2);
 
@@ -537,7 +578,9 @@ mod tests {
         forged.body.name = "admin".into();
         let someone_else = g.issue(CertBody::new(Identity::generate().id(), "n", vec![]));
         for bad in [g.issue(expired), someone_else, forged] {
-            assert!(found(&send(&mut st, &c, &TrackerMsg::Announce { certs: vec![bad] })).is_empty());
+            assert!(
+                found(&send(&mut st, &c, &TrackerMsg::Announce { candidates: vec![], certs: vec![bad] })).is_empty()
+            );
             assert!(st.groups.is_empty());
         }
     }
@@ -548,9 +591,17 @@ mod tests {
         let g = GroupSecret::generate();
         let join = g.grant_join(CertBody::new(Identity::generate().id(), "n", vec![]), u64::MAX);
         let a = connect(&mut st, "198.51.100.1:4000");
-        assert_eq!(found(&send(&mut st, &a, &TrackerMsg::Announce { certs: vec![join.enroll(a.id.id())] })).len(), 1);
+        assert_eq!(
+            found(&send(
+                &mut st,
+                &a,
+                &TrackerMsg::Announce { candidates: vec![], certs: vec![join.enroll(a.id.id())] }
+            ))
+            .len(),
+            1
+        );
         let b = connect(&mut st, "198.51.100.2:4000");
-        let m = TrackerMsg::Announce { certs: vec![join.enroll(b.id.id())] };
+        let m = TrackerMsg::Announce { candidates: vec![], certs: vec![join.enroll(b.id.id())] };
         assert!(found(&send(&mut st, &b, &m)).is_empty(), "second use of the invite");
         assert_eq!(st.groups[&g.id()].len(), 1);
     }
@@ -561,9 +612,9 @@ mod tests {
         let g = GroupSecret::generate();
         let a = connect(&mut st, "198.51.100.1:4000");
         let b = connect(&mut st, "198.51.100.2:4000");
-        send(&mut st, &a, &TrackerMsg::Announce { certs: vec![cert(&g, &a)] });
+        send(&mut st, &a, &TrackerMsg::Announce { candidates: vec![], certs: vec![cert(&g, &a)] });
         let b_cert = cert(&g, &b);
-        send(&mut st, &b, &TrackerMsg::Announce { certs: vec![b_cert.clone()] });
+        send(&mut st, &b, &TrackerMsg::Announce { candidates: vec![], certs: vec![b_cert.clone()] });
 
         // a (an admin's node) pushes a revocation of b
         let admin = StateStore::memory();
@@ -573,7 +624,9 @@ mod tests {
         assert!(!st.groups[&g.id()].contains(&b.id.id()), "b left the index");
         assert!(st.store.revoked(&g.id()).contains(&b.id.id()));
         // and b cannot come back
-        assert!(found(&send(&mut st, &b, &TrackerMsg::Announce { certs: vec![b_cert] })).is_empty());
+        assert!(
+            found(&send(&mut st, &b, &TrackerMsg::Announce { candidates: vec![], certs: vec![b_cert] })).is_empty()
+        );
 
         // records of a group the sender is not in are refused
         let h = GroupSecret::generate();

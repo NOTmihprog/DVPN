@@ -302,4 +302,44 @@ reach a s1 10.10.44.1
 reach c s2 10.10.44.2
 ok "connected by a static address, without a tracker"
 
+# ---- pure IPv6 ------------------------------------------------------------------------
+# Two new namespaces with IPv6 only (no IPv4 address at all) on the wan, a tracker on its
+# IPv6 address (the same dual-stack socket also serves IPv4): X6 creates a group, Y6 joins by
+# invite, they find each other through the tracker and talk over IPv6.
+cleanup
+PIDS=""
+nsx wan ip -6 addr add 2001:db8::1/64 dev br0 nodad
+for n in x6 y6; do ip netns add $n; nsx $n ip link set lo up; done
+wan_port6() { # wan_port6 NS ADDR
+    ip link add "w-$1" type veth peer name wan0
+    ip link set wan0 netns "$1"
+    ip link set "w-$1" netns wan
+    nsx wan ip link set "w-$1" master br0 up
+    nsx "$1" ip -6 addr add "$2/64" dev wan0 nodad
+    nsx "$1" ip link set wan0 up
+}
+wan_port6 x6 2001:db8::11
+wan_port6 y6 2001:db8::12
+! nsx x6 ip -4 addr show scope global | grep -q inet || fail "x6 has an IPv4 address"
+bg tracker6 wan "$D" --dir "$W/trk" server -p 6485
+wait_for 10 grep -q 'Server started' tracker6.log || fail "tracker did not start on ::"
+mkdir x6 y6
+"$D" --dir "$W/x6" show-key >/dev/null 2>&1
+cat >> x6/config.toml <<TOML
+
+[servers.v6]
+addr = "2001:db8::1"
+port = 6485
+key = "$TKEY"
+TOML
+"$D" --dir "$W/x6" group create six -a 10.10.66.1 -n x6 >/dev/null || fail "x6: group create"
+inv=$("$D" --dir "$W/x6" group invite -n y6 -a 10.10.66.2 2>/dev/null) || fail "x6: invite"
+"$D" --dir "$W/y6" group join "$inv" >/dev/null 2>&1 || fail "y6: join"
+bg node-x6 x6 "$D" --dir "$W/x6" -a 127.0.0.1:9902
+bg node-y6 y6 "$D" --dir "$W/y6" -a 127.0.0.1:9902
+reach x6 y6 10.10.66.2
+reach y6 x6 10.10.66.1
+grep -q 'new endpoint \[2001:db8::12\]' "$W/node-x6.log" || fail "x6 did not get y6's IPv6 endpoint"
+ok "pure IPv6: tracker, discovery and the tunnel over IPv6"
+
 echo "PASS"

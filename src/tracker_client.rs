@@ -78,13 +78,20 @@ impl Default for State {
 #[derive(Default)]
 pub struct Output {
     pub packets: Vec<Vec<u8>>,
+    /// Send `packets` to every address of the tracker, not just the current one: a handshake
+    /// while not connected goes to all of them at once (IPv6 and IPv4), the first to answer wins.
+    pub to_all: bool,
     pub status: Option<bool>,
     pub members: Vec<Cert>,
+    /// Address candidates of members, as the tracker reported them.
+    pub candidates: Vec<(NodeId, Vec<SocketAddr>)>,
     pub changed: Vec<Entry>,
 }
 
 pub struct TrackerClient {
-    pub addr: SocketAddr,
+    /// All addresses of the tracker (IPv6 first); `cur` is the one the session runs over.
+    addrs: Vec<SocketAddr>,
+    cur: std::sync::atomic::AtomicUsize,
     pub key: VerifyingKey,
     keys: TrackerKeys,
     identity: Arc<Identity>,
@@ -116,16 +123,17 @@ impl State {
 impl TrackerClient {
     pub fn new(
         name: String,
-        addr: SocketAddr,
+        addrs: Vec<SocketAddr>,
         key: VerifyingKey,
         identity: Arc<Identity>,
         certs: Vec<Cert>,
         store: Arc<StateStore>,
     ) -> Self {
-        let log_prefix = format!("Client {name} {addr} |");
+        let log_prefix = format!("Client {name} |");
         log::info!("{log_prefix} Connection status initiated");
         TrackerClient {
-            addr,
+            addrs,
+            cur: Default::default(),
             key,
             keys: TrackerKeys::new(NodeId::from(key)),
             identity,
@@ -140,6 +148,15 @@ impl TrackerClient {
     pub fn set_certs(&self, certs: Vec<Cert>) {
         *self.certs.lock() = certs;
         self.state.lock().last_announce = None;
+    }
+
+    /// The address the session runs over (or the next to try).
+    pub fn addr(&self) -> SocketAddr {
+        self.addrs[self.cur.load(std::sync::atomic::Ordering::Relaxed) % self.addrs.len()]
+    }
+
+    pub fn addrs(&self) -> &[SocketAddr] {
+        &self.addrs
     }
 
     fn in_group(&self, g: &crate::group::GroupId) -> bool {
@@ -167,8 +184,8 @@ impl TrackerClient {
         (s.announce_ts, s.announce_ts, s.response_ts)
     }
 
-    /// Called once per second.
-    pub fn tick(&self) -> Output {
+    /// Called once per second, with our address candidates to announce.
+    pub fn tick(&self, candidates: &[SocketAddr]) -> Output {
         let mut out = Output::default();
         let mut s = self.state.lock();
 
@@ -187,6 +204,7 @@ impl TrackerClient {
             && let Some((packets, hello)) = tunnel::client_hello(&self.keys, &self.identity, rand::random())
         {
             out.packets.extend(packets);
+            out.to_all = !s.connected;
             s.hello = Some((hello, Instant::now()));
             if !s.connected {
                 log::debug!("{} Connection status connecting", self.log_prefix);
@@ -196,10 +214,13 @@ impl TrackerClient {
         if !s.connected {
             return out;
         }
+        // a rekey handshake goes to the current address only
+        let mut rest = Output::default();
 
         if s.last_announce.is_none_or(|t| t.elapsed() >= ANNOUNCE_INTERVAL) {
             log::debug!("{} Send announce", self.log_prefix);
-            s.send(&mut out, &TrackerMsg::Announce { certs: self.certs.lock().clone() });
+            let msg = TrackerMsg::Announce { certs: self.certs.lock().clone(), candidates: candidates.to_vec() };
+            s.send(&mut rest, &msg);
             s.last_announce = Some(Instant::now());
             s.announce_ts = unix_now();
         }
@@ -208,15 +229,16 @@ impl TrackerClient {
             let groups: Vec<_> = self.certs.lock().iter().map(|c| c.body.group).collect();
             for g in groups {
                 for m in SyncMsg::summaries(&self.store, &g) {
-                    s.send(&mut out, &TrackerMsg::Sync(m));
+                    s.send(&mut rest, &TrackerMsg::Sync(m));
                 }
             }
             s.last_sync = Some(Instant::now());
         }
+        out.packets.extend(rest.packets);
         out
     }
 
-    pub fn handle(&self, packet: &[u8], storage: &PeerStorage) -> Output {
+    pub fn handle(&self, packet: &[u8], from: SocketAddr, storage: &PeerStorage) -> Output {
         let mut out = Output::default();
         let mut p = packet.to_vec();
         let Some(len) = self.keys.obfs.open(&mut p) else { return out };
@@ -233,12 +255,15 @@ impl TrackerClient {
                     return out;
                 };
                 s.hello = None;
+                if let Some(i) = self.addrs.iter().position(|a| *a == from) {
+                    self.cur.store(i, std::sync::atomic::Ordering::Relaxed);
+                }
                 s.previous = s.session.replace(Arc::new(session));
                 s.rekey_after = rand::rng().random_range(REKEY);
                 s.last_response = Some(Instant::now());
                 s.response_ts = unix_now();
                 if !s.connected {
-                    log::info!("{} Connection status connected", self.log_prefix);
+                    log::info!("{} Connection status connected via {from}", self.log_prefix);
                     s.connected = true;
                     s.retry = Duration::from_secs(1);
                     s.last_announce = None;
@@ -259,9 +284,10 @@ impl TrackerClient {
                 s.last_response = Some(Instant::now());
                 s.response_ts = unix_now();
                 match TrackerMsg::decode(&p[plain]) {
-                    Some(TrackerMsg::Found { cert, addr }) => {
+                    Some(TrackerMsg::Found { cert, addr, candidates }) => {
                         drop(s);
                         if self.found(&cert, addr, storage) {
+                            out.candidates.push((cert.body.node, candidates));
                             out.members.push(*cert);
                         }
                     }

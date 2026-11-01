@@ -1,5 +1,5 @@
 use std::io::{BufRead, Write};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
@@ -62,9 +62,9 @@ enum Command {
     Group(GroupCommand),
     /// Start peer discovery server
     Server {
-        /// Server bind ipv4 addr
-        #[arg(short = 'a', long, default_value = "0.0.0.0")]
-        addr: Ipv4Addr,
+        /// Server bind address: "::" = IPv6 and IPv4 on one socket
+        #[arg(short = 'a', long, default_value = "::")]
+        addr: std::net::IpAddr,
         /// Server bind port
         #[arg(short = 'p', long, default_value_t = 6485)]
         port: u16,
@@ -531,7 +531,16 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
     let clients = conf
         .servers
         .iter()
-        .map(|s| TrackerClient::new(s.name.clone(), s.addr, s.key, identity.clone(), vec![cert.clone()], store.clone()))
+        .map(|s| {
+            TrackerClient::new(
+                s.name.clone(),
+                s.addrs.clone(),
+                s.key,
+                identity.clone(),
+                vec![cert.clone()],
+                store.clone(),
+            )
+        })
         .collect();
     let group_id = group.id;
     let dir2 = dir.clone();
@@ -567,7 +576,7 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
     node.shutdown().await;
 }
 
-async fn run_server(conf: &mut Config, addr: Ipv4Addr, port: u16) {
+async fn run_server(conf: &mut Config, addr: std::net::IpAddr, port: u16) {
     let key = match conf.local_server_key {
         Some(k) => SigningKey::from_bytes(&k),
         None => SigningKey::from_bytes(&random_bytes()),
@@ -577,13 +586,13 @@ async fn run_server(conf: &mut Config, addr: Ipv4Addr, port: u16) {
         conf.set_local_server(&key.to_bytes(), &public);
         conf.save();
     }
-    let sock = tokio::net::UdpSocket::bind(SocketAddrV4::new(addr, port))
-        .await
-        .unwrap_or_else(|e| die(format!("Socket bind error: {e}")));
     log::info!("Public key: {}", encode_b64(&public));
-    log::info!("Server started listen: {addr}:{port}");
     tokio::select! {
-        _ = tracker_server::run(sock, Identity::from_seed(&key.to_bytes())) => {}
+        r = tracker_server::run(addr, port, Identity::from_seed(&key.to_bytes())) => {
+            if let Err(e) = r {
+                die(format!("Socket bind error: {e}"));
+            }
+        }
         _ = wait_ctrl_c() => {}
     }
     log::info!("Server stopped");
