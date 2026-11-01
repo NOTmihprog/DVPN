@@ -14,6 +14,8 @@ use crate::identity::Identity;
 use crate::obfs::{MAX_PAD, MAX_WIRE, Profile, Template};
 
 pub const CONFIG_FILE_NAME: &str = "config.toml";
+/// Group records (`state.rs`), next to the config.
+pub const STATE_FILE_NAME: &str = "state.bin";
 /// Overrides `[identity] private_key`; never written to the config file.
 pub const PRIVATE_KEY_ENV: &str = "DVPN_PRIVATE_KEY";
 
@@ -457,6 +459,16 @@ impl Config {
             arr.push(t);
         }
         self.groups.push(g);
+    }
+
+    /// Replaces this node's certificate in a group (renewed by an admin).
+    pub fn set_group_cert(&mut self, id: &GroupId, cert: &Cert) -> bool {
+        let Some(i) = self.groups.iter().position(|g| &g.id == id) else { return false };
+        self.groups[i].cert = Some(cert.clone());
+        if let Some(t) = self.doc.get_mut("groups").and_then(Item::as_array_of_tables_mut).and_then(|a| a.get_mut(i)) {
+            t["cert"] = value(encode_b64(&cert.encode()));
+        }
+        true
     }
 
     pub fn remove_group(&mut self, id: &GroupId) -> bool {

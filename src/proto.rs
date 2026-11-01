@@ -21,7 +21,8 @@
 //! Noise messages start with the Elligator2 representative of the ephemeral key. Indices are
 //! random per session; the receiver finds the session by `receiver_idx`, so the sender's
 //! address plays no role in authentication. The DATA header (padding length included) is the
-//! AEAD's associated data. Kinds: 0 = control (ping/pong), 1 = IP packet for the TUN device, 32..=255 = API clients.
+//! AEAD's associated data. Kinds: 0 = control (ping/pong), 1 = IP packet for the TUN device, 2 = group
+//! records (`state::SyncMsg`), 32..=255 = API clients.
 //! ```text
 //! CONTROL  [0][PING|PONG][echo_ts u64 LE][random padding]
 //! ```
@@ -33,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::group::Cert;
 use crate::identity::NodeId;
+use crate::state::SyncMsg;
 
 pub const HELLO: u8 = 0x01;
 pub const HELLO_ACK: u8 = 0x02;
@@ -54,6 +56,8 @@ pub const ANNOUNCE_SIG_CTX: &[u8] = b"dvpn/4 announce";
 
 pub const KIND_CONTROL: u8 = 0;
 pub const KIND_IP: u8 = 1;
+/// Group records between neighbours: `SyncMsg`.
+pub const KIND_STATE: u8 = 2;
 pub const KIND_API_MIN: u8 = 32;
 pub const KIND_API_MAX: u8 = 255;
 
@@ -84,6 +88,8 @@ pub enum TrackerMsg {
         cert: Box<Cert>,
         addr: SocketAddr,
     },
+    /// Group records both ways (`state.rs`), for the groups the client is a verified member of.
+    Sync(SyncMsg),
     Close,
 }
 

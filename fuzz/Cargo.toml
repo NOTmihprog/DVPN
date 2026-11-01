@@ -54,3 +54,10 @@ path = "fuzz_targets/group_cert.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "state_sync"
+path = "fuzz_targets/state_sync.rs"
+test = false
+doc = false
+bench = false

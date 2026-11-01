@@ -11,10 +11,11 @@ use log::LevelFilter;
 
 use dvpn::{api, config, logger, node, tracker_server, transport};
 
-use dvpn::config::{Config, GroupConfig, SOCKET_DEFAULT_ADDR, parse_obfs};
+use dvpn::config::{Config, GroupConfig, SOCKET_DEFAULT_ADDR, STATE_FILE_NAME, parse_obfs};
 use dvpn::crypto::{encode_b64, random_bytes};
 use dvpn::group::{CertBody, GroupSecret, Invite, JOIN_TTL_SECS, now_unix};
-use dvpn::identity::Identity;
+use dvpn::identity::{Identity, NodeId};
+use dvpn::state::{Body, Membership, StateStore};
 use dvpn::storage::{PeerStorage, PeerUpdate};
 use dvpn::tracker_client::TrackerClient;
 
@@ -109,6 +110,21 @@ enum GroupCommand {
     },
     /// List the groups of this node
     List,
+    /// Members known from the group records (admins see everybody who joined)
+    Members {
+        /// Group name or id (default: the only group)
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+    },
+    /// Exclude a node from the group (admins only); a running node spreads it within seconds
+    Revoke {
+        /// Node key, a unique key prefix, or a member name (see `group members`)
+        #[arg(allow_hyphen_values = true)]
+        node: String,
+        /// Group name or id (default: the only group)
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+    },
     /// Leave a group (removes it from config.toml)
     Leave {
         /// Group name or id
@@ -160,7 +176,17 @@ fn host_net(addr: Ipv4Addr) -> Vec<IpNet> {
     vec![IpNet::V4(Ipv4Net::new(addr, 32).expect("/32 is valid"))]
 }
 
-fn cmd_group(conf: &mut Config, cmd: GroupCommand) {
+fn pick_group<'a>(conf: &'a Config, group: &Option<String>) -> &'a GroupConfig {
+    match group {
+        Some(gr) => conf.group(gr).unwrap_or_else(|| die(format!("no group {gr}"))),
+        None if conf.groups.len() == 1 => &conf.groups[0],
+        None if conf.groups.is_empty() => die("not in any group"),
+        None => die("give the group with --group"),
+    }
+}
+
+fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
+    let state = || StateStore::open(dir.join(STATE_FILE_NAME));
     match cmd {
         GroupCommand::Create { name, addr, node_name } => {
             if conf.group(&name).is_some() {
@@ -195,11 +221,7 @@ fn cmd_group(conf: &mut Config, cmd: GroupCommand) {
             println!("Invite nodes with: dvpn group invite --name <name>");
         }
         GroupCommand::Invite { group, name, addr, ttl } => {
-            let g = match &group {
-                Some(gr) => conf.group(gr).unwrap_or_else(|| die(format!("no group {gr}"))),
-                None if conf.groups.len() == 1 => &conf.groups[0],
-                None => die("give the group with --group"),
-            };
+            let g = pick_group(conf, &group);
             let Some(secret) = &g.secret else { die(format!("only admins of {} can invite", g.name)) };
             let own = g.ipv4().unwrap_or_else(|| die("this node has no address in the group"));
             let net = Ipv4Net::new(own, net_prefix(conf)).unwrap_or_else(|e| die(e)).trunc();
@@ -282,6 +304,67 @@ fn cmd_group(conf: &mut Config, cmd: GroupCommand) {
                 .collect();
             println!("\n{}\n", github_table(&["Group", "Id", "Role", "Name", "Addr", "Cert valid"], &rows));
         }
+        GroupCommand::Members { group } => {
+            let g = pick_group(conf, &group);
+            let store = state();
+            let m = Membership::of(&store, &g.id);
+            let mut certs = store.certs(&g.id);
+            certs.sort_by(|a, b| a.body.name.cmp(&b.body.name));
+            let mut rows: Vec<Vec<String>> = certs
+                .iter()
+                .map(|c| {
+                    vec![
+                        c.body.name.clone(),
+                        c.body.node.to_string(),
+                        c.body.ipv4().map_or_else(String::new, |a| a.to_string()),
+                        if m.revoked.contains(&c.body.node) {
+                            "revoked".into()
+                        } else {
+                            format!("{} d", c.body.not_after.saturating_sub(now_unix()) / 86400)
+                        },
+                    ]
+                })
+                .collect();
+            for r in &m.revoked {
+                if !certs.iter().any(|c| c.body.node == *r) {
+                    rows.push(vec![String::new(), r.to_string(), String::new(), "revoked".into()]);
+                }
+            }
+            println!("\n{}\n", github_table(&["Name", "Key", "Addr", "Cert valid"], &rows));
+            if rows.is_empty() {
+                println!("No records yet: members appear once an admin node has seen them online.");
+            }
+        }
+        GroupCommand::Revoke { node, group } => {
+            let g = pick_group(conf, &group);
+            let Some(secret) = &g.secret else { die(format!("only admins of {} can revoke", g.name)) };
+            let store = state();
+            let certs = store.certs(&g.id);
+            let key: NodeId = match node.parse() {
+                Ok(k) => k,
+                Err(_) => {
+                    let hits: Vec<NodeId> = certs
+                        .iter()
+                        .filter(|c| c.body.name == node || c.body.node.to_string().starts_with(&node))
+                        .map(|c| c.body.node)
+                        .collect();
+                    match hits.as_slice() {
+                        [k] => *k,
+                        [] => die(format!("{node}: no such member key, key prefix or name (see dvpn group members)")),
+                        _ => die(format!("{node} matches {} members, give the key", hits.len())),
+                    }
+                }
+            };
+            if key == conf.identity.id() {
+                die("an admin cannot revoke itself; leave the group instead");
+            }
+            store.add(secret, Body::Revoke { key }, false);
+            store.save();
+            let name =
+                certs.iter().find(|c| c.body.node == key).map_or_else(String::new, |c| format!(" ({})", c.body.name));
+            println!("Revoked {key}{name} in group {}", g.name);
+            println!("A running node of this admin spreads it to the trackers and members within seconds.");
+        }
         GroupCommand::Leave { group } => {
             let id = conf.group(&group).unwrap_or_else(|| die(format!("no group {group}"))).id;
             if conf.groups.iter().any(|g| g.id == id && g.secret.is_some()) {
@@ -320,13 +403,22 @@ async fn wait_ctrl_c() {
     log::info!(" Pressed Ctrl+C, exiting.");
 }
 
-async fn run_node(conf: Config, api_addr: Option<String>) {
+async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
     let group = match conf.groups.as_slice() {
         [] => die("not in any group: create one (dvpn group create) or join one (dvpn group join)"),
         [g] => g.clone(),
         _ => die("several groups per node come later (PLAN stage 3.5): leave all but one"),
     };
-    let Some(cert) = group.cert.clone() else { die(format!("no certificate for group {}", group.name)) };
+    let Some(mut cert) = group.cert.clone() else { die(format!("no certificate for group {}", group.name)) };
+    let store = Arc::new(StateStore::open(dir.join(STATE_FILE_NAME)));
+    // a renewed certificate may have arrived while the config was not updated
+    if let Some(c) = store.cert(&group.id, &conf.identity.id())
+        && c.body.not_after > cert.body.not_after
+    {
+        conf.set_group_cert(&group.id, &c);
+        conf.save();
+        cert = c;
+    }
     if let Err(e) = cert.verify(&group.id, Some(now_unix())) {
         die(format!("own certificate in group {}: {e}; ask an admin for a new invite", group.name));
     }
@@ -374,9 +466,23 @@ async fn run_node(conf: Config, api_addr: Option<String>) {
     let clients = conf
         .servers
         .iter()
-        .map(|s| TrackerClient::new(s.name.clone(), s.addr, s.key, identity.clone(), vec![cert.clone()]))
+        .map(|s| TrackerClient::new(s.name.clone(), s.addr, s.key, identity.clone(), vec![cert.clone()], store.clone()))
         .collect();
-    let node = node::Node::new(storage.clone(), transport, links, clients, tun, self_addr);
+    let group_id = group.id;
+    let ctx = node::GroupCtx {
+        id: group.id,
+        secret: group.secret.clone(),
+        cert: cert.clone(),
+        store,
+        on_cert: Box::new(move |c| match Config::load(&dir) {
+            Ok(mut conf) => {
+                conf.set_group_cert(&group_id, c);
+                conf.save();
+            }
+            Err(e) => log::warn!("Config | renewed certificate not saved: {e:#}"),
+        }),
+    };
+    let node = node::Node::new(storage.clone(), transport, links, clients, tun, self_addr, ctx);
     node.start();
     let _api = api::Api::start(node.clone(), api_sock);
 
@@ -444,11 +550,11 @@ fn main() {
         None => {
             log::info!("Starting dvpn {VERSION}");
             log::info!("Node key: {}", conf.identity.id());
-            rt.block_on(run_node(conf, cli.api_addr));
+            rt.block_on(run_node(conf, dir, cli.api_addr));
         }
         Some(Command::GenKey | Command::ShowKey { key: Some(_) }) => unreachable!(),
         Some(Command::ShowKey { key: None }) => println!("{}", conf.identity.id()),
-        Some(Command::Group(cmd)) => cmd_group(&mut conf, cmd),
+        Some(Command::Group(cmd)) => cmd_group(&mut conf, &dir, cmd),
         Some(Command::Server { addr, port }) => rt.block_on(run_server(&mut conf, addr, port)),
     }
 }

@@ -7,6 +7,7 @@ use rand::RngExt;
 use tokio::sync::mpsc;
 use tun_rs::AsyncDevice;
 
+use crate::group::{CERT_TTL_SECS, Cert, GroupId, GroupSecret, now_unix};
 use crate::identity::NodeId;
 use crate::link::{Links, Received};
 use crate::logger::node;
@@ -14,8 +15,9 @@ use crate::noise::TAG_LEN;
 use crate::obfs::MAX_PAD;
 use crate::packet::{self, IpInfo};
 use crate::proto::{
-    CONTROL_LEN, CONTROL_PING, CONTROL_PONG, DATA_HDR, KIND_API_MIN, KIND_CONTROL, KIND_IP, MAX_DATAGRAM,
+    CONTROL_LEN, CONTROL_PING, CONTROL_PONG, DATA_HDR, KIND_API_MIN, KIND_CONTROL, KIND_IP, KIND_STATE, MAX_DATAGRAM,
 };
+use crate::state::{Body, Entry, Membership, StateStore, SyncMsg, record_key};
 use crate::storage::{Event, PeerStorage, PeerUpdate};
 use crate::tracker_client::{Output, TrackerClient};
 use crate::transport::Transport;
@@ -29,6 +31,20 @@ const KEEPALIVE: std::ops::Range<Duration> = Duration::from_secs(12)..Duration::
 /// The link loop runs at random intervals around a second, for the same reason.
 const LINK_TICK: std::ops::Range<Duration> = Duration::from_millis(700)..Duration::from_millis(1300);
 const LINK_TIMEOUT: Duration = Duration::from_secs(45);
+/// Group records are compared with each neighbour this often (and when a session comes up).
+const PEER_SYNC: Duration = Duration::from_secs(60);
+/// Admins renew certificates that expire sooner than this.
+const RENEW_BEFORE: u64 = 10 * 24 * 3600;
+
+/// The node's group: its records, our certificate, and the secret if we are an admin.
+pub struct GroupCtx {
+    pub id: GroupId,
+    pub secret: Option<GroupSecret>,
+    pub cert: Cert,
+    pub store: Arc<StateStore>,
+    /// Called with our certificate when an admin renewed it, to persist it.
+    pub on_cert: Box<dyn Fn(&Cert) + Send + Sync>,
+}
 
 /// A packet for an API client: (route, from peer, payload).
 pub type ApiPacket = (u8, NodeId, Vec<u8>);
@@ -43,6 +59,11 @@ pub struct Node {
     self_addr: Option<Ipv4Addr>,
     api_tx: OnceLock<mpsc::Sender<ApiPacket>>,
     epoch: Instant,
+    group: GroupCtx,
+    cert: parking_lot::RwLock<Cert>,
+    /// The verified certificates of peers we have seen, for re-checking them when records change.
+    peer_certs: parking_lot::Mutex<HashMap<NodeId, Cert>>,
+    last_peer_sync: parking_lot::Mutex<HashMap<NodeId, Instant>>,
 }
 
 impl Node {
@@ -53,6 +74,7 @@ impl Node {
         clients: Vec<TrackerClient>,
         tun: Option<AsyncDevice>,
         self_addr: Option<Ipv4Addr>,
+        group: GroupCtx,
     ) -> Arc<Self> {
         let clients: Vec<_> = clients.into_iter().map(Arc::new).collect();
         let clients_by_addr = clients.iter().map(|c| (c.addr, c.clone())).collect();
@@ -66,7 +88,126 @@ impl Node {
             self_addr,
             api_tx: OnceLock::new(),
             epoch: Instant::now(),
+            cert: parking_lot::RwLock::new(group.cert.clone()),
+            group,
+            peer_certs: parking_lot::Mutex::new(HashMap::new()),
+            last_peer_sync: parking_lot::Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn group_id(&self) -> GroupId {
+        self.group.id
+    }
+
+    pub fn store(&self) -> &StateStore {
+        &self.group.store
+    }
+
+    // ---- group records ----
+
+    /// Acts on changed records: saves them, applies revocations to sessions and peers, and picks
+    /// up a renewed certificate of ours.
+    fn apply(&self, changed: &[Entry]) {
+        if changed.is_empty() {
+            return;
+        }
+        let store = &self.group.store;
+        store.save();
+        let m = Membership::of(store, &self.group.id);
+        self.links.set_membership(m.clone());
+        let gone: Vec<NodeId> =
+            self.peer_certs.lock().iter().filter(|(_, c)| !m.admits(c)).map(|(id, _)| *id).collect();
+        for id in gone {
+            log::info!("Group | {} revoked, dropped", node(id));
+            self.peer_certs.lock().remove(&id);
+            self.links.drop_peer(&id);
+            self.storage.del_peer(&id);
+        }
+        let me = self.storage.self_id();
+        if m.revoked.contains(&me) {
+            log::error!("Group | this node is revoked from the group");
+        }
+        if let Some(c) = store.cert(&self.group.id, &me)
+            && c.body.not_after > self.cert.read().body.not_after
+            && c.verify(&self.group.id, Some(now_unix())).is_ok()
+        {
+            log::info!(
+                "Group | new certificate from an admin, valid {} more days",
+                (c.body.not_after - now_unix()) / 86400
+            );
+            *self.cert.write() = c.clone();
+            self.links.set_cert(c.clone());
+            for client in &self.clients {
+                client.set_certs(vec![c.clone()]);
+            }
+            self.storage.set_peer(me, PeerUpdate::from_cert(&c));
+            (self.group.on_cert)(&c);
+        }
+    }
+
+    /// Sends records we just learned or made to trackers and neighbours.
+    async fn spread(&self, changed: &[Entry]) {
+        if changed.is_empty() {
+            return;
+        }
+        let keys: Vec<_> = changed.iter().map(|e| record_key(&e.group, &e.id)).collect();
+        let records = self.group.store.get(&self.group.id, &keys);
+        for c in &self.clients {
+            let out = c.sync(SyncMsg::records(records.clone()));
+            self.send_tracker(c, out).await;
+        }
+        for peer in self.storage.others() {
+            if self.links.current(&peer).is_some() {
+                for m in SyncMsg::records(records.clone()) {
+                    self.send_kind(&peer, KIND_STATE, &m.encode()).await;
+                }
+            }
+        }
+    }
+
+    /// A member's certificate seen in a handshake or from a tracker. Admins turn invite
+    /// certificates into regular ones (revoking the join key, so the invite is used up) and
+    /// renew certificates that expire soon.
+    async fn member_seen(&self, cert: &Cert) {
+        let id = cert.body.node;
+        if id != self.storage.self_id() {
+            self.peer_certs.lock().insert(id, cert.clone());
+        }
+        let Some(secret) = &self.group.secret else { return };
+        let store = &self.group.store;
+        let renew = cert.grant.is_some() || cert.body.not_after < now_unix() + RENEW_BEFORE;
+        let issued = store.cert(&self.group.id, &id).is_some_and(|c| c.body.not_after > cert.body.not_after);
+        if !renew || issued || !Membership::of(store, &self.group.id).admits(cert) {
+            return;
+        }
+        let mut body = cert.body.clone();
+        body.not_after = now_unix() + CERT_TTL_SECS;
+        body.serial = rand::random();
+        let mut changed = vec![store.add(secret, Body::Cert(Box::new(secret.issue(body))), false)];
+        if let Some(jk) = cert.join_key() {
+            changed.push(store.add(secret, Body::Revoke { key: jk }, false));
+            log::info!("Group | {} joined by invite: regular certificate issued, invite used up", node(id));
+        } else {
+            log::info!("Group | certificate of {} renewed", node(id));
+        }
+        self.apply(&changed);
+        self.spread(&changed).await;
+    }
+
+    async fn sync_peer(&self, peer: NodeId) {
+        self.last_peer_sync.lock().insert(peer, Instant::now());
+        for m in SyncMsg::summaries(&self.group.store, &self.group.id) {
+            self.send_kind(&peer, KIND_STATE, &m.encode()).await;
+        }
+    }
+
+    async fn handle_state(&self, peer: NodeId, body: &[u8]) {
+        let Some(msg) = SyncMsg::decode(body) else { return };
+        let (replies, changed) = msg.handle(&self.group.store, |g| *g == self.group.id);
+        for r in replies {
+            self.send_kind(&peer, KIND_STATE, &r.encode()).await;
+        }
+        self.apply(&changed);
     }
 
     pub fn set_api_sink(&self, tx: mpsc::Sender<ApiPacket>) {
@@ -78,6 +219,15 @@ impl Node {
     }
 
     pub fn start(self: &Arc<Self>) {
+        self.links.set_membership(Membership::of(&self.group.store, &self.group.id));
+        {
+            let me = self.clone();
+            tokio::spawn(async move {
+                // an admin renews its own certificate too
+                let own = me.cert.read().clone();
+                me.member_seen(&own).await;
+            });
+        }
         tokio::spawn(self.clone().udp_loop());
         tokio::spawn(self.clone().link_loop());
         tokio::spawn(self.clone().tracker_loop());
@@ -121,6 +271,10 @@ impl Node {
         for p in &out.packets {
             self.transport.send_to(p, client.addr).await;
         }
+        for cert in &out.members {
+            Box::pin(self.member_seen(cert)).await;
+        }
+        self.apply(&out.changed);
         if let Some(connected) = out.status {
             self.storage.emit(Event::Server { addr: client.addr, connected });
             if !connected && self.transport.can_change_port() && self.clients.iter().all(|c| !c.is_connected()) {
@@ -168,6 +322,10 @@ impl Node {
             let tick = rand::rng().random_range(LINK_TICK); // ThreadRng must not live across .await
             tokio::time::sleep(tick).await;
             self.links.expire();
+            // records written by the CLI (e.g. dvpn group revoke)
+            let changed = self.group.store.reload();
+            self.apply(&changed);
+            self.spread(&changed).await;
             for (id, link) in self.storage.links() {
                 if link.last_seen.unwrap_or(link.since).elapsed() > LINK_TIMEOUT {
                     log::info!("Link | peer {} timed out, endpoint dropped", node(id));
@@ -182,6 +340,10 @@ impl Node {
                 let keepalive = rand::rng().random_range(KEEPALIVE);
                 if has_session && link.last_ping.is_none_or(|t| t.elapsed() >= keepalive) {
                     self.send_ping(id).await;
+                }
+                let synced = self.last_peer_sync.lock().get(&id).copied();
+                if has_session && synced.is_none_or(|t| t.elapsed() >= PEER_SYNC) {
+                    self.sync_peer(id).await;
                 }
             }
         }
@@ -249,6 +411,7 @@ impl Node {
                     storage.set_peer(peer, update);
                 }
                 self.roam(peer, from);
+                self.member_seen(&cert).await;
                 storage.update_link(&peer, |l| l.last_seen = Some(Instant::now()));
                 match reply {
                     Some(r) => self.transport.send_to(&r, from).await,
@@ -280,6 +443,7 @@ impl Node {
                         }
                     }
                     KIND_CONTROL => self.handle_control(peer, body).await,
+                    KIND_STATE => self.handle_state(peer, body).await,
                     k if k >= KIND_API_MIN => {
                         if let Some(tx) = self.api_tx.get() {
                             let _ = tx.try_send((k, peer, body.to_vec()));

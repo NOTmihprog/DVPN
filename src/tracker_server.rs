@@ -12,6 +12,7 @@ use crate::group::{Cert, GroupId, now_unix};
 use crate::identity::NodeId;
 use crate::logger::node as show;
 use crate::proto::{HELLO, MAX_ANNOUNCE_CERTS, MAX_DATAGRAM, TRACKER, TrackerMsg};
+use crate::state::{Entry, Membership, StateStore, SyncMsg, record_key};
 
 const TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -23,12 +24,28 @@ struct Session {
     last_announce: Instant,
 }
 
-#[derive(Default)]
 struct State {
     sessions: HashMap<SocketAddr, Session>,
     by_node: HashMap<NodeId, SocketAddr>,
     /// Online members of each group (PLAN §11).
     groups: HashMap<GroupId, HashSet<NodeId>>,
+    /// Group records (revocations, issued certificates), replicated from members; memory only,
+    /// members push them again after a restart.
+    store: StateStore,
+    /// Join key -> the first node that enrolled with it: an invite works for one node only.
+    joins: HashMap<NodeId, NodeId>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            sessions: HashMap::new(),
+            by_node: HashMap::new(),
+            groups: HashMap::new(),
+            store: StateStore::memory(),
+            joins: HashMap::new(),
+        }
+    }
 }
 
 type Out = Vec<(Vec<u8>, SocketAddr)>;
@@ -89,13 +106,24 @@ impl State {
         for c in certs.into_iter().take(MAX_ANNOUNCE_CERTS) {
             let group = c.body.group;
             match c.verify(&group, Some(now)) {
-                Ok(()) if c.body.node == node => {
+                Ok(()) if c.body.node != node => log::info!("Server | {addr} certificate of another node ignored"),
+                Ok(()) if !Membership::of(&self.store, &group).admits(&c) => {
+                    log::info!("Server | {addr} {:#}: revoked in group {}", show(node), group.short())
+                }
+                Ok(()) => {
+                    if let Some(jk) = c.join_key() {
+                        let first = *self.joins.entry(jk).or_insert(node);
+                        if first != node {
+                            log::info!("Server | {addr} {:#}: invite already used by {:#}", show(node), show(first));
+                            continue;
+                        }
+                    }
                     valid.insert(group, c);
                 }
-                Ok(()) => log::info!("Server | {addr} certificate of another node ignored"),
                 Err(e) => log::info!("Server | {addr} {:#}: {e}", show(node)),
             }
         }
+        let s = self.sessions.get_mut(&addr).unwrap();
 
         let first = s.node.is_none();
         let changed = first || s.certs != valid;
@@ -134,6 +162,44 @@ impl State {
         }
     }
 
+    /// Group records from a member: answer, store, pass new ones on to the other online members,
+    /// and drop members that the new records revoked.
+    fn sync(&mut self, out: &mut Out, addr: SocketAddr, msg: SyncMsg) {
+        let Some(groups) = self.sessions.get(&addr).map(|s| s.certs.keys().copied().collect::<HashSet<_>>()) else {
+            return;
+        };
+        let (replies, changed) = msg.handle(&self.store, |g| groups.contains(g));
+        for r in replies {
+            self.send(out, addr, &TrackerMsg::Sync(r));
+        }
+        let mut by_group: HashMap<GroupId, Vec<Entry>> = HashMap::new();
+        for e in changed {
+            by_group.entry(e.group).or_default().push(e);
+        }
+        for (g, entries) in by_group {
+            let keys: Vec<_> = entries.iter().map(|e| record_key(&g, &e.id)).collect();
+            let records = self.store.get(&g, &keys);
+            let membership = Membership::of(&self.store, &g);
+            let members: Vec<NodeId> = self.groups.get(&g).map(|m| m.iter().copied().collect()).unwrap_or_default();
+            for m in members {
+                let Some((cert, m_addr)) = self.member(&g, &m) else { continue };
+                // a revoked member gets the records too, so it knows why nobody answers
+                if m_addr != addr {
+                    for msg in SyncMsg::records(records.clone()) {
+                        self.send(out, m_addr, &TrackerMsg::Sync(msg));
+                    }
+                }
+                if !membership.admits(&cert) {
+                    log::info!("Server | node {:#} revoked in group {}", show(m), g.short());
+                    if let Some(s) = self.sessions.get_mut(&m_addr) {
+                        s.certs.remove(&g);
+                    }
+                    self.unindex(m, [g]);
+                }
+            }
+        }
+    }
+
     fn handle(&mut self, identity: &SigningKey, packet: &[u8], from: SocketAddr) -> Out {
         let mut out = Out::new();
         match packet.first() {
@@ -162,6 +228,7 @@ impl State {
                         self.drop_session(&mut out, from, false);
                         log::info!("Server | connection close from {from}");
                     }
+                    Some(TrackerMsg::Sync(msg)) => self.sync(&mut out, from, msg),
                     Some(TrackerMsg::Found { .. }) => {}
                     None => {
                         log::info!("Server | Packet from {from} decode error");
@@ -230,6 +297,7 @@ mod tests {
     use crate::crypto::{ClientHandshake, random_bytes};
     use crate::group::{CertBody, GroupSecret};
     use crate::identity::Identity;
+    use crate::state::Body;
 
     struct Client {
         addr: SocketAddr,
@@ -343,6 +411,54 @@ mod tests {
             assert!(found(&send(&mut st, &server, &mut c, &msg)).is_empty());
             assert!(st.groups.is_empty());
         }
+    }
+
+    #[test]
+    fn invite_works_for_one_node_only() {
+        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
+        let g = GroupSecret::generate();
+        let join = g.grant_join(CertBody::new(Identity::generate().id(), "n", vec![]), u64::MAX);
+        let (a, b) = (Identity::generate(), Identity::generate());
+        let mut ca = connect(&mut st, &server, "198.51.100.1:4000");
+        let m = announce(&a, vec![join.enroll(a.id())], &ca.session);
+        assert_eq!(found(&send(&mut st, &server, &mut ca, &m)).len(), 1);
+        let mut cb = connect(&mut st, &server, "198.51.100.2:4000");
+        let m = announce(&b, vec![join.enroll(b.id())], &cb.session);
+        assert!(found(&send(&mut st, &server, &mut cb, &m)).is_empty(), "second use of the invite");
+        assert_eq!(st.groups[&g.id()].len(), 1);
+    }
+
+    #[test]
+    fn revocation_spreads_and_unindexes() {
+        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
+        let g = GroupSecret::generate();
+        let (a, b) = (Identity::generate(), Identity::generate());
+        let mut ca = connect(&mut st, &server, "198.51.100.1:4000");
+        let mut cb = connect(&mut st, &server, "198.51.100.2:4000");
+        let m = announce(&a, vec![cert(&g, &a)], &ca.session);
+        send(&mut st, &server, &mut ca, &m);
+        let m = announce(&b, vec![cert(&g, &b)], &cb.session);
+        send(&mut st, &server, &mut cb, &m);
+
+        // a (an admin's node) pushes a revocation of b
+        let admin = StateStore::memory();
+        admin.add(&g, Body::Revoke { key: b.id() }, false);
+        let keys: Vec<_> = admin.summary(&g.id()).iter().map(|(k, _)| *k).collect();
+        let msg = TrackerMsg::Sync(SyncMsg::Records { records: admin.get(&g.id(), &keys) });
+        send(&mut st, &server, &mut ca, &msg);
+        assert!(!st.groups[&g.id()].contains(&b.id()), "b left the index");
+        assert!(st.store.revoked(&g.id()).contains(&b.id()));
+        // and b cannot come back
+        let m = announce(&b, vec![cert(&g, &b)], &cb.session);
+        assert!(found(&send(&mut st, &server, &mut cb, &m)).is_empty());
+
+        // records of a group the sender is not in are refused
+        let h = GroupSecret::generate();
+        admin.add(&h, Body::Revoke { key: a.id() }, false);
+        let keys: Vec<_> = admin.summary(&h.id()).iter().map(|(k, _)| *k).collect();
+        let msg = TrackerMsg::Sync(SyncMsg::Records { records: admin.get(&h.id(), &keys) });
+        send(&mut st, &server, &mut ca, &msg);
+        assert!(st.store.revoked(&h.id()).is_empty());
     }
 
     #[test]

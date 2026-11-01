@@ -10,10 +10,14 @@ use crate::group::{Cert, now_unix};
 use crate::identity::Identity;
 use crate::logger::node;
 use crate::proto::{HELLO_ACK, TRACKER, TrackerMsg};
+use crate::state::{Entry, Membership, StateStore, SyncMsg};
 use crate::storage::{PeerStorage, PeerUpdate};
 
 /// Each announce also refreshes the members list (and their current addresses) from the server.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(15);
+/// Group records are compared with the server this often (and right after connecting); new
+/// records reach us sooner, the server forwards them as they arrive.
+const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
 /// A link that answered within this time is not replaced by a tracker-reported endpoint.
 const LIVE_LINK: Duration = Duration::from_secs(20);
@@ -27,17 +31,21 @@ struct State {
     handshake: Option<ClientHandshake>,
     session: Option<TrackerSession>,
     last_announce: Option<Instant>,
+    last_sync: Option<Instant>,
     last_response: Option<Instant>,
     // Wall-clock copies of the above, reported through the API.
     announce_ts: f64,
     response_ts: f64,
 }
 
-/// Packets to send to the server plus an optional connection status change.
+/// Packets to send to the server, an optional connection status change, and what the node
+/// should act on: group members the server reported, records that changed our state.
 #[derive(Default)]
 pub struct Output {
     pub packets: Vec<Vec<u8>>,
     pub status: Option<bool>,
+    pub members: Vec<Cert>,
+    pub changed: Vec<Entry>,
 }
 
 pub struct TrackerClient {
@@ -45,7 +53,8 @@ pub struct TrackerClient {
     pub key: VerifyingKey,
     identity: Arc<Identity>,
     /// Our membership certificates, one per group.
-    certs: Vec<Cert>,
+    certs: Mutex<Vec<Cert>>,
+    store: Arc<StateStore>,
     state: Mutex<State>,
     log_prefix: String,
 }
@@ -63,10 +72,45 @@ impl State {
 }
 
 impl TrackerClient {
-    pub fn new(name: String, addr: SocketAddr, key: VerifyingKey, identity: Arc<Identity>, certs: Vec<Cert>) -> Self {
+    pub fn new(
+        name: String,
+        addr: SocketAddr,
+        key: VerifyingKey,
+        identity: Arc<Identity>,
+        certs: Vec<Cert>,
+        store: Arc<StateStore>,
+    ) -> Self {
         let log_prefix = format!("Client {name} {addr} |");
         log::info!("{log_prefix} Connection status initiated");
-        TrackerClient { addr, key, identity, certs, state: Mutex::new(State::default()), log_prefix }
+        TrackerClient {
+            addr,
+            key,
+            identity,
+            certs: Mutex::new(certs),
+            store,
+            state: Mutex::new(State::default()),
+            log_prefix,
+        }
+    }
+
+    /// Replaces our certificates (renewed by an admin); announced from the next announce on.
+    pub fn set_certs(&self, certs: Vec<Cert>) {
+        *self.certs.lock() = certs;
+        self.state.lock().last_announce = None;
+    }
+
+    fn in_group(&self, g: &crate::group::GroupId) -> bool {
+        self.certs.lock().iter().any(|c| &c.body.group == g)
+    }
+
+    /// Sends sync messages (e.g. records just created here) if connected.
+    pub fn sync(&self, msgs: Vec<SyncMsg>) -> Output {
+        let mut out = Output::default();
+        let mut s = self.state.lock();
+        for m in msgs {
+            s.send(&mut out, &TrackerMsg::Sync(m));
+        }
+        out
     }
 
     pub fn is_connected(&self) -> bool {
@@ -103,10 +147,20 @@ impl TrackerClient {
         if s.last_announce.is_none_or(|t| t.elapsed() >= ANNOUNCE_INTERVAL) {
             log::debug!("{} Send announce", self.log_prefix);
             let sig = self.identity.sign(s.session.as_ref().expect("checked above").announce_msg());
-            let msg = TrackerMsg::Announce { node: self.identity.id(), certs: self.certs.clone(), sig };
+            let msg = TrackerMsg::Announce { node: self.identity.id(), certs: self.certs.lock().clone(), sig };
             s.send(&mut out, &msg);
             s.last_announce = Some(Instant::now());
             s.announce_ts = unix_now();
+        }
+
+        if s.last_sync.is_none_or(|t| t.elapsed() >= SYNC_INTERVAL) {
+            let groups: Vec<_> = self.certs.lock().iter().map(|c| c.body.group).collect();
+            for g in groups {
+                for m in SyncMsg::summaries(&self.store, &g) {
+                    s.send(&mut out, &TrackerMsg::Sync(m));
+                }
+            }
+            s.last_sync = Some(Instant::now());
         }
         out
     }
@@ -126,6 +180,7 @@ impl TrackerClient {
                 s.last_response = Some(Instant::now());
                 s.response_ts = unix_now();
                 s.last_announce = None;
+                s.last_sync = None;
                 if !was_connected {
                     log::info!("{} Connection status connected", self.log_prefix);
                     out.status = Some(true);
@@ -142,7 +197,17 @@ impl TrackerClient {
                         s.last_response = Some(Instant::now());
                         s.response_ts = unix_now();
                         drop(s);
-                        self.found(&cert, addr, storage);
+                        if self.found(&cert, addr, storage) {
+                            out.members.push(*cert);
+                        }
+                    }
+                    Some(TrackerMsg::Sync(msg)) => {
+                        s.last_response = Some(Instant::now());
+                        let (replies, changed) = msg.handle(&self.store, |g| self.in_group(g));
+                        for r in replies {
+                            s.send(&mut out, &TrackerMsg::Sync(r));
+                        }
+                        out.changed = changed;
                     }
                     Some(TrackerMsg::Close) => {
                         log::info!("{} Connection closed from server", self.log_prefix);
@@ -160,21 +225,26 @@ impl TrackerClient {
 
     /// A member of one of our groups is at `addr`. The certificate is checked here too: the
     /// tracker is not trusted with membership.
-    fn found(&self, cert: &Cert, addr: SocketAddr, storage: &PeerStorage) {
+    /// Returns whether it is a valid member other than us.
+    fn found(&self, cert: &Cert, addr: SocketAddr, storage: &PeerStorage) -> bool {
         let peer = cert.body.node;
-        if !self.certs.iter().any(|c| c.body.group == cert.body.group) {
-            return;
+        if !self.in_group(&cert.body.group) {
+            return false;
         }
         if let Err(e) = cert.verify(&cert.body.group, Some(now_unix())) {
             log::info!("{} Peer {} from the server: {e}", self.log_prefix, node(peer));
-            return;
+            return false;
         }
         if storage.is_self(&peer) {
             if storage.endpoint(&peer) != Some(addr) {
                 log::info!("{} New self endpoint {addr}", self.log_prefix);
                 storage.set_peer(peer, PeerUpdate { endpoint: Some(Some(addr)), ..Default::default() });
             }
-            return;
+            return false;
+        }
+        if !Membership::of(&self.store, &cert.body.group).admits(cert) {
+            log::debug!("{} Peer {} from the server is revoked", self.log_prefix, node(peer));
+            return false;
         }
         let mut update = PeerUpdate::from_cert(cert);
         if let Some((r, _)) = storage.get(&peer)
@@ -198,6 +268,7 @@ impl TrackerClient {
         if update.name.is_some() || update.endpoint.is_some() {
             storage.set_peer(peer, update);
         }
+        true
     }
 
     /// Best-effort goodbye on shutdown.

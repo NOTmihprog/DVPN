@@ -15,6 +15,7 @@ pub mod obfs;
 pub mod packet;
 pub mod proto;
 pub mod replay;
+pub mod state;
 pub mod storage;
 pub mod tracker_client;
 pub mod tracker_server;

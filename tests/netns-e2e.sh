@@ -222,6 +222,24 @@ else
     echo "skip: iperf3 not found"
 fi
 
+# Invites are one-time: once the admin node (A) sees B and C online, it issues them regular
+# certificates (which they save) and revokes the join keys.
+renewed() { ! "$D" --dir "$W/$1" group list | grep -q '(invite)'; }
+for n in b c; do wait_for 30 renewed $n || fail "$n still has its invite certificate"; done
+"$D" --dir "$W/a" group members | grep -q 'b .*10.10.33.2' || fail "a: b missing from group members"
+ok "invite certificates replaced by regular ones"
+
+# Revocation (before the roaming check, which leaves A without a tracker session for a
+# while): the admin revokes B with the CLI while its node runs; the node spreads the record
+# (tracker + direct), C drops B and B can no longer reach anybody.
+"$D" --dir "$W/a" group revoke b >/dev/null || fail "group revoke"
+wait_for 20 grep -q 'revoked, dropped' "$W/node-c.log" || fail "c did not drop revoked b"
+wait_for 20 grep -q 'this node is revoked' "$W/node-b.log" || fail "b did not learn it is revoked"
+! nsx c ping -c2 -W1 10.10.33.2 >/dev/null 2>&1 || fail "c still reaches revoked b"
+! nsx b ping -c2 -W1 10.10.33.1 >/dev/null 2>&1 || fail "revoked b still reaches a"
+nsx a ping -c2 -W1 10.10.33.3 >/dev/null || fail "a -> c broken by the revocation"
+ok "revoked b is cut off, a <-> c unaffected"
+
 # Roaming: nat1 gets a new public address, so A's packets suddenly come from elsewhere
 # (removing the address also drops nat1's masquerade mappings). C must follow A to the new
 # endpoint on the first authenticated packet, without waiting for the tracker.

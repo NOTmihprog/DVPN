@@ -71,6 +71,11 @@ impl GroupSecret {
         SigningKey::from_bytes(&hkdf32(&self.0, &[b"dvpn/4 group sign"]))
     }
 
+    /// Signs with the group key (state records, PLAN §8.1).
+    pub fn sign(&self, msg: &[u8]) -> Signature {
+        self.signing_key().sign(msg)
+    }
+
     pub fn id(&self) -> GroupId {
         self.signing_key().verifying_key().into()
     }

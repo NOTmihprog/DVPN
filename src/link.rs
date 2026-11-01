@@ -22,6 +22,7 @@ use crate::noise::{self, HandshakePayload, Initiator, Responder, TAG_LEN, Tai64n
 use crate::obfs::{MAX_PAD, Obfs, Profile};
 use crate::proto::{DATA, DATA_HDR, HS_INIT, HS_INIT_HDR, HS_RESP, HS_RESP_HDR};
 use crate::replay::ReplayWindow;
+use crate::state::Membership;
 
 /// The initiator starts a new handshake after this long (minus jitter, so peers don't rekey
 /// in lockstep).
@@ -227,6 +228,10 @@ pub enum Received {
 pub struct Links {
     identity: Arc<Identity>,
     group: Group,
+    /// Our certificate as currently sent (renewed at runtime; `group.cert` is the initial one).
+    cert: RwLock<Cert>,
+    /// Revocations from the group records.
+    membership: RwLock<Membership>,
     obfs: Arc<Obfs>,
     inner: RwLock<Inner>,
 }
@@ -234,7 +239,25 @@ pub struct Links {
 impl Links {
     pub fn new(identity: Arc<Identity>, group: Group) -> Self {
         let obfs = Arc::new(Obfs::new(&group.psk, group.obfs.clone()));
-        Links { identity, group, obfs, inner: RwLock::new(Inner::default()) }
+        Links {
+            identity,
+            cert: RwLock::new(group.cert.clone()),
+            group,
+            membership: RwLock::new(Membership::default()),
+            obfs,
+            inner: RwLock::new(Inner::default()),
+        }
+    }
+
+    /// Sends this certificate in handshakes from now on.
+    pub fn set_cert(&self, cert: Cert) {
+        *self.cert.write() = cert;
+    }
+
+    /// New handshakes are checked against this; existing sessions of revoked nodes are dropped
+    /// by the caller (`drop_peer`).
+    pub fn set_membership(&self, m: Membership) {
+        *self.membership.write() = m;
     }
 
     /// Pads and masks a finished handshake packet in `out` (header with a zero pad field).
@@ -250,7 +273,7 @@ impl Links {
 
     fn payload(&self) -> Vec<u8> {
         let mut p = HandshakePayload::new(0, *self.group.id.as_bytes());
-        p.cert = self.group.cert.encode();
+        p.cert = self.cert.read().encode();
         p.encode()
     }
 
@@ -264,6 +287,10 @@ impl Links {
         let cert = Cert::decode(&p.cert)?;
         if let Err(e) = cert.verify(&self.group.id, Some(now_unix())) {
             log::debug!("Link | handshake from {} with {e}", crate::logger::node(cert.body.node));
+            return None;
+        }
+        if !self.membership.read().admits(&cert) {
+            log::debug!("Link | handshake from revoked {}", crate::logger::node(cert.body.node));
             return None;
         }
         (cert.body.node != self.identity.id()).then_some(cert)
@@ -489,6 +516,19 @@ mod tests {
         let (a, b) = (side(&GroupSecret::generate()), side(&GroupSecret::generate()));
         assert!(!handshake(&a, &b), "other psk and group id: no reply");
         assert!(a.links.current(&b.id).is_none() && b.links.current(&a.id).is_none());
+    }
+
+    #[test]
+    fn revoked_member_no_session() {
+        let (a, b) = pair();
+        assert!(handshake(&a, &b));
+        let m = Membership { revoked: [a.id].into(), ..Default::default() };
+        b.links.set_membership(m.clone());
+        std::thread::sleep(Duration::from_millis(40)); // next handshake timestamp
+        assert!(!handshake(&a, &b), "b refuses revoked a");
+        a.links.set_membership(Membership { revoked: [b.id].into(), ..Default::default() });
+        b.links.set_membership(Membership::default());
+        assert!(!handshake(&b, &a) && !handshake(&a, &b), "a refuses revoked b, also as initiator");
     }
 
     #[test]
