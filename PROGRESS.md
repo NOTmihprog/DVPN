@@ -85,12 +85,15 @@
 
 ## Этап 3. Группы с сертификатами, трекер v4, статические пиры, IPv6 underlay (§5, §10, §11, §9.1)
 
-- [ ] **3.1** `group.rs`: `group_secret` → HKDF → `group_sign_key`/`group_id`, `group_psk`, `group_enc` (§5.1)
-- [ ] **3.2** `MemberCert` (роли, `allowed_prefixes`, `not_after`, `serial`, подпись); проверка в handshake и на трекере
-- [ ] **3.3** админы/участники, выдача и продление сертификатов, запись-отзыв (`revoke`), `psk_epoch`
+- [x] **3.1** `group.rs`: `group_secret` → HKDF-SHA256 → `group_sign_key`/`group_id`, `psk(epoch)` (§5.1); `group_enc` — в этапе 6 (выводится из psk эпохи, §8.1)
+- [~] **3.2** `MemberCert` (роли, `allowed_prefixes`, `not_after`, `serial`, подпись); проверка в handshake и на трекере
+  - [x] `Cert`/`CertBody`/`Roles`, прямая подпись группой и делегированная (`JoinGrant` → join-ключ → узел), `verify(group, now?)`; тесты подделки полей, чужого grant, admin в делегированном
+  - [ ] сертификат в payload handshake, проверка при приёме; адрес/имя пира — из сертификата
+  - [ ] проверка на трекере
+- [ ] **3.3** хранилище записей (§8.1, решение этапа 3): `Entry` (HLC, автор, подпись, LWW), типы `Revoke`, `Epoch` (psk, запечатанный каждому участнику), `Cert`; обмен через трекер и напрямую; продление сертификатов админом; одноразовость join-ключа
 - [ ] **3.4** окно перехода psk/профиля (§4.4): приём обоих, отправка новым после `active_from`
 - [ ] **3.5** несколько групп, выбор psk по `group_id` из payload; изоляция групп
-- [ ] **3.6** invite (base64url), `dvpn group create/invite/join/leave/list`, одноразовый join-ключ
+- [ ] **3.6** invite (base64url: psk эпохи, профиль маскировки, трекеры, join-ключ + grant + шаблон), `dvpn group create/invite/join/leave/list`; конфиг `[[groups]]` (§12); убрать `peers.json` и `set/del/import/export` (решение этапа 3)
 - [ ] **3.7** `dvpn group backup/restore` (пароль, argon2 + XChaCha20); права `0600` на ключи, предупреждение (§14a)
 - [ ] **3.8** трекер v4: `TrackerMsg` (§11), индекс `group_id → онлайн`, `Found` без взаимного Search, списки endpoint-ов
 - [ ] **3.9** маскировка трекер-сессии + защита от зондирования (§11.1)

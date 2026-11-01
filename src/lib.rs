@@ -5,6 +5,7 @@ pub mod api;
 pub mod config;
 pub mod crypto;
 pub mod elligator;
+pub mod group;
 pub mod identity;
 pub mod link;
 pub mod logger;
