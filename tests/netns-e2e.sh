@@ -128,6 +128,14 @@ table ip exitnat {
     chain exits { type filter hook forward priority 0; iifname "dnet" oifname "wan0" counter name exited; }
 }
 NFT
+# A is the second gateway for B: forwarding (set by lan) and NAT towards its uplink
+nsx a nft -f - <<NFT
+table ip exitnat {
+    counter exited { }
+    chain post { type nat hook postrouting priority 100; oifname "up0" ip saddr 10.10.33.0/24 masquerade; }
+    chain exits { type filter hook forward priority 0; iifname "dnet" oifname "up0" counter name exited; }
+}
+NFT
 ok "topology up"
 
 # ---- tracker --------------------------------------------------------------------------
@@ -179,12 +187,8 @@ join() { # join NAME ADDR [invite options]
 }
 join b 10.10.33.2
 join c 10.10.33.3 --route 192.168.30.0/24
-# B sends its internet traffic through C (manual CKR routes: an exit)
-cat >> b/config.toml <<TOML
-
-[ckr.remote_subnets]
-"$("$D" --dir "$W/c" show-key)" = ["0.0.0.0/1", "128.0.0.0/1"]
-TOML
+# B sends its internet traffic through C, or A if C is down (gateways by priority)
+"$D" --dir "$W/b" exit --v4 c,a >/dev/null || fail "b: exit"
 "$D" --dir "$W/b" group list | grep -q 'e2e.*member.*10.10.33.2' || fail "b: group list"
 
 # The admin's secret survives the admin node: a password-protected backup restores the group on
@@ -254,6 +258,24 @@ nsx b ping -c3 -i0.2 -W1 203.0.113.1 >/dev/null || fail "b -> internet through t
 [ $(( $(masq) - before )) -ge 3 ] || fail "b's internet traffic did not go through c"
 nsx b ping -c2 -W1 10.10.33.1 >/dev/null || fail "b -> a broken by the exit routes"
 ok "exit: b reaches the internet through c"
+
+# C becomes unreachable for B: B's internet moves to its second gateway, A
+from=$(($(wc -l < "$W/node-b.log") + 1))
+nsx b nft -f - <<NFT
+table inet blockc {
+    chain out { type filter hook output priority 0; ip daddr 203.0.113.20 drop; }
+    chain in { type filter hook input priority 0; ip saddr 203.0.113.20 drop; }
+}
+NFT
+# only log lines written after the block count (at start b may have used a for a moment)
+wait_for 60 sh -c "tail -n +$from '$W/node-b.log' | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'Exit | IPv4 via a'" \
+    || fail "b did not switch its exit to a"
+masq_a() { nsx a nft list counter ip exitnat exited | awk '/packets/ {print $2}'; }
+before=$(masq_a)
+nsx b ping -c3 -i0.2 -W1 203.0.113.1 >/dev/null || fail "b -> internet through a"
+[ $(( $(masq_a) - before )) -ge 3 ] || fail "b's internet traffic did not go through a"
+nsx b nft delete table inet blockc
+ok "exit failover: c unreachable, b goes through a"
 
 # A<->B must be a direct nat1 -> nat2 UDP flow (the tracker never forwards traffic).
 nat2nat() { nsx nat1 nft list counter ip watch nat2nat | awk '/packets/ {print $2}'; }

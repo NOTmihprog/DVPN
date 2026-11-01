@@ -60,6 +60,19 @@ enum Command {
     /// Groups: create one (this node becomes its admin), invite nodes, join by invite
     #[command(subcommand)]
     Group(GroupCommand),
+    /// Gateways to the internet, by priority (the first alive one is used), or none.
+    /// Without options: show them. A running node follows the change within seconds
+    Exit {
+        /// IPv4 gateways, best first: member names or node keys, comma separated
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        v4: Option<Vec<String>>,
+        /// IPv6 gateways, best first
+        #[arg(long, value_delimiter = ',', allow_hyphen_values = true)]
+        v6: Option<Vec<String>>,
+        /// No gateway: the internet is reached directly, as without DVPN
+        #[arg(long, conflicts_with_all = ["v4", "v6"])]
+        none: bool,
+    },
     /// Start peer discovery server
     Server {
         /// Server bind address: "::" = IPv6 and IPv4 on one socket
@@ -765,6 +778,8 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         }),
         statics: conf.static_peers.clone(),
         routes: conf.remote_subnets.clone(),
+        exits: conf.exits.clone(),
+        config_path: conf.path().to_path_buf(),
         on_epoch: Box::new(move |epoch, psk| match Config::load(&dir2) {
             Ok(mut conf) => {
                 conf.set_group_epoch(&group_id, epoch, &psk);
@@ -851,6 +866,24 @@ fn main() {
         Some(Command::GenKey | Command::ShowKey { key: Some(_) }) => unreachable!(),
         Some(Command::ShowKey { key: None }) => println!("{}", conf.identity.id()),
         Some(Command::Group(cmd)) => cmd_group(&mut conf, &dir, cmd),
+        Some(Command::Exit { v4, v6, none }) => {
+            let mut e = conf.exits.clone();
+            if none {
+                e = config::Exits::default();
+            }
+            if let Some(v) = v4 {
+                e.v4 = v.into_iter().filter(|s| !s.is_empty()).collect();
+            }
+            if let Some(v) = v6 {
+                e.v6 = v.into_iter().filter(|s| !s.is_empty()).collect();
+            }
+            if e != conf.exits {
+                conf.set_exits(&e);
+                conf.save();
+            }
+            let show = |l: &[String]| if l.is_empty() { "none".to_owned() } else { l.join(" > ") };
+            println!("IPv4 exit: {}\nIPv6 exit: {}", show(&e.v4), show(&e.v6));
+        }
         Some(Command::Server { addr, port }) => rt.block_on(run_server(&mut conf, addr, port)),
     }
 }

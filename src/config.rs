@@ -123,6 +123,8 @@ pub struct Config {
     pub static_peers: Vec<StaticRef>,
     /// `[ckr.remote_subnets]`: manual routes, `"<node key>" = ["192.168.50.0/24", "~10.0.0.0/8"]`.
     pub remote_subnets: Vec<crate::ckr::Route>,
+    /// `[exit]`: gateways to the internet, by priority.
+    pub exits: Exits,
     pub peer: PeerConfig,
     pub net: Option<NetConfig>,
     pub servers: Vec<ServerConfig>,
@@ -246,6 +248,41 @@ pub fn check_endpoint(s: &str) -> anyhow::Result<()> {
         bail!("{s}: empty host");
     }
     Ok(())
+}
+
+/// `[exit]`: the gateways this node sends its internet traffic through, in priority order
+/// (member names or node keys); the first one alive is used. Empty: no exit, the internet is
+/// reached directly as without DVPN.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Exits {
+    pub v4: Vec<String>,
+    pub v6: Vec<String>,
+}
+
+fn parse_exits(t: &dyn toml_edit::TableLike) -> anyhow::Result<Exits> {
+    let list = |k: &str| -> anyhow::Result<Vec<String>> {
+        let Some(item) = t.get(k) else { return Ok(Vec::new()) };
+        let arr = item.as_array().ok_or_else(|| anyhow!("{k}: expected a list of names or keys"))?;
+        arr.iter()
+            .map(|v| v.as_str().map(|s| s.trim().to_owned()).ok_or_else(|| anyhow!("{k}: expected strings")))
+            .filter(|r| r.as_ref().map_or(true, |s| !s.is_empty()))
+            .collect()
+    };
+    for (k, _) in t.iter() {
+        if k != "v4" && k != "v6" {
+            bail!("unknown key {k}");
+        }
+    }
+    Ok(Exits { v4: list("v4")?, v6: list("v6")? })
+}
+
+/// Reads only `[exit]` from a config file: a running node follows changes to it.
+pub fn read_exits(path: &Path) -> anyhow::Result<Exits> {
+    let doc: DocumentMut = std::fs::read_to_string(path)?.parse()?;
+    match doc.get("exit") {
+        Some(item) => parse_exits(item.as_table_like().ok_or_else(|| anyhow!("[exit] is not a table"))?),
+        None => Ok(Exits::default()),
+    }
 }
 
 fn parse_remote_subnets(t: &dyn toml_edit::TableLike) -> anyhow::Result<Vec<crate::ckr::Route>> {
@@ -494,6 +531,11 @@ impl Config {
             }
             None => Vec::new(),
         };
+        let exits = match doc.get("exit") {
+            Some(item) => parse_exits(item.as_table_like().ok_or_else(|| anyhow!("[exit] is not a table in {file}"))?)
+                .map_err(|e| anyhow!("[exit] {e:#} in {file}"))?,
+            None => Exits::default(),
+        };
         if section(&doc, "group").is_some() {
             log::warn!("[group] psk in {file} is ignored: create or join a group (dvpn group --help)");
         }
@@ -505,6 +547,7 @@ impl Config {
             groups,
             static_peers,
             remote_subnets,
+            exits,
             peer,
             net,
             servers,
@@ -569,6 +612,28 @@ impl Config {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Sets `[exit]` (an empty list removes it).
+    pub fn set_exits(&mut self, exits: &Exits) {
+        if exits.v4.is_empty() && exits.v6.is_empty() {
+            self.doc.remove("exit");
+        } else {
+            let mut t = Table::new();
+            for (k, v) in [("v4", &exits.v4), ("v6", &exits.v6)] {
+                if !v.is_empty() {
+                    let mut arr = toml_edit::Array::new();
+                    for e in v {
+                        arr.push(e.as_str());
+                    }
+                    t[k] = value(arr);
+                }
+            }
+            t.decor_mut()
+                .set_prefix("\n# gateways to the internet by priority (names or keys); the first alive one is used\n");
+            self.doc["exit"] = Item::Table(t);
+        }
+        self.exits = exits.clone();
     }
 
     /// Replaces this node's certificate in a group (renewed by an admin).
@@ -891,6 +956,23 @@ mod tests {
         let err =
             format!("{:#}", with_group(&format!("[ckr.remote_subnets]\n\"{k}\" = [\"10.0.0.0/99\"]\n")).err().unwrap());
         assert!(err.contains("10.0.0.0/99"), "{err}");
+    }
+
+    #[test]
+    fn exits() {
+        let c = with_group("[exit]\nv4 = [\"vps1\", \"vps2\"]\n").unwrap();
+        assert_eq!(c.exits, Exits { v4: vec!["vps1".into(), "vps2".into()], v6: vec![] });
+        assert!(with_group("[exit]\nv5 = []\n").is_err());
+        let dir = temp_dir();
+        let mut c = Config::load(&dir).unwrap();
+        let e = Exits { v4: vec!["a".into()], v6: vec!["b".into(), "c".into()] };
+        c.set_exits(&e);
+        c.save();
+        assert_eq!(read_exits(&dir.join(CONFIG_FILE_NAME)).unwrap(), e);
+        c.set_exits(&Exits::default());
+        c.save();
+        assert_eq!(read_exits(&dir.join(CONFIG_FILE_NAME)).unwrap(), Exits::default());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

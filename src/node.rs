@@ -67,6 +67,9 @@ pub struct GroupCtx {
     pub statics: Vec<crate::group::StaticRef>,
     /// `[ckr.remote_subnets]`: manual routes on top of the members' certificates (PLAN §7).
     pub routes: Vec<crate::ckr::Route>,
+    /// `[exit]` as at start; the node follows later changes in `config_path`.
+    pub exits: crate::config::Exits,
+    pub config_path: std::path::PathBuf,
 }
 
 type EpochPsk = (u32, [u8; 32]);
@@ -104,6 +107,10 @@ pub struct Node {
     probes: parking_lot::Mutex<HashMap<u16, (Vec<u8>, Instant)>>,
     /// Reports sent in the current second (rate limit).
     reports: parking_lot::Mutex<(Instant, u32)>,
+    /// `[exit]` and the config file's mtime it was read at; the chosen IPv4 / IPv6 gateways.
+    exits: parking_lot::Mutex<(crate::config::Exits, Option<std::time::SystemTime>)>,
+    exit4: parking_lot::Mutex<crate::exit::ExitChooser>,
+    exit6: parking_lot::Mutex<crate::exit::ExitChooser>,
     /// Further addresses to try for peers without a session (PLAN §9.1): the candidates they
     /// announced to the tracker, or all addresses of a static peer.
     candidates: parking_lot::Mutex<HashMap<NodeId, Vec<SocketAddr>>>,
@@ -126,6 +133,7 @@ impl Node {
         group: GroupCtx,
     ) -> Arc<Self> {
         let group_id = group.id;
+        let exits = (group.exits.clone(), std::fs::metadata(&group.config_path).and_then(|m| m.modified()).ok());
         let clients: Vec<_> = clients.into_iter().map(Arc::new).collect();
         let clients_by_addr = clients.iter().flat_map(|c| c.addrs().iter().map(move |a| (*a, c.clone()))).collect();
         Arc::new(Node {
@@ -152,6 +160,9 @@ impl Node {
             last_routing_sync: parking_lot::Mutex::new(HashMap::new()),
             probes: parking_lot::Mutex::new(HashMap::new()),
             reports: parking_lot::Mutex::new((Instant::now(), 0)),
+            exits: parking_lot::Mutex::new(exits),
+            exit4: parking_lot::Mutex::new(Default::default()),
+            exit6: parking_lot::Mutex::new(Default::default()),
             candidates: parking_lot::Mutex::new(HashMap::new()),
             last_peer_sync: parking_lot::Mutex::new(HashMap::new()),
         })
@@ -182,6 +193,14 @@ impl Node {
             routes.push(crate::ckr::Route { net: ipnet::IpNet::from(IpAddr::V6(ula)), target, system: false });
         }
         drop(certs);
+        // the chosen gateways get the internet (private ranges stay local), manual routes on top
+        let gw4 = self.exit4.lock().current;
+        let gw6 = self.exit6.lock().current;
+        for (gw, spec) in [(gw4, "inetv4"), (gw6, "inetv6")] {
+            if let Some(gw) = gw {
+                routes.extend(crate::ckr::parse_spec(spec, gw).expect("valid spec"));
+            }
+        }
         routes.extend(self.group.routes.iter().copied());
         let table = CkrTable::new(routes);
         if let Some((sys, connected)) = self.sys_routes.lock().as_mut() {
@@ -822,6 +841,63 @@ impl Node {
         }
         if due || expired {
             self.recompute_routes();
+        }
+        self.exit_tick();
+    }
+
+    /// A gateway from `[exit]`: a member name or a node key.
+    fn resolve_member(&self, s: &str) -> Option<NodeId> {
+        if let Ok(k) = s.parse::<NodeId>() {
+            return Some(k);
+        }
+        self.peer_certs.lock().values().find(|c| c.body.name == s).map(|c| c.body.node)
+    }
+
+    /// Follows `[exit]` changes in the config, picks the gateways (first alive by priority, see
+    /// `exit.rs`) and moves the internet routes when they change.
+    fn exit_tick(&self) {
+        let path = &self.group.config_path;
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let exits = {
+            let mut e = self.exits.lock();
+            if mtime != e.1 {
+                e.1 = mtime;
+                match crate::config::read_exits(path) {
+                    Ok(new) if new != e.0 => {
+                        log::info!("Exit | gateways from config: IPv4 {:?}, IPv6 {:?}", new.v4, new.v6);
+                        e.0 = new;
+                    }
+                    Ok(_) => {}
+                    Err(err) => log::warn!("Exit | [exit] in {}: {err:#}", path.display()),
+                }
+            }
+            e.0.clone()
+        };
+        let me = self.storage.self_id();
+        let resolve = |l: &[String]| -> Vec<NodeId> {
+            l.iter().filter_map(|s| self.resolve_member(s)).filter(|g| *g != me).collect()
+        };
+        let (p4, p6) = (resolve(&exits.v4), resolve(&exits.v6));
+        let now = Instant::now();
+        let alive = |g: &NodeId| self.next_hop(g).is_some();
+        let mut changed = false;
+        for (chooser, prio, fam) in [(&self.exit4, &p4, "IPv4"), (&self.exit6, &p6, "IPv6")] {
+            let mut ch = chooser.lock();
+            let old = ch.current;
+            let new = ch.choose(prio, alive, now);
+            if new != old {
+                changed = true;
+                match new {
+                    Some(g) => log::info!("Exit | {fam} via {}", node(g)),
+                    None if !prio.is_empty() || old.is_some() => {
+                        log::warn!("Exit | {fam}: no gateway alive, internet goes direct")
+                    }
+                    None => {}
+                }
+            }
+        }
+        if changed {
+            self.rebuild_ckr();
         }
     }
 

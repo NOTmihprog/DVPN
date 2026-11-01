@@ -8,6 +8,7 @@ pub mod clock;
 pub mod config;
 pub mod crypto;
 pub mod elligator;
+pub mod exit;
 pub mod group;
 pub mod identity;
 pub mod link;
