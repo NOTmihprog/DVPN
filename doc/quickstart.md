@@ -95,5 +95,5 @@ dvpn status              # свой ключ, адреса, серверы об�
 * Узлы за строгим NAT (мобильные сети) — назначьте VPS [ретранслятором](mesh.md):
   `dvpn node set vps --relay`.
 * Ограничить доступ внутри сети — [ACL](acl.md).
-* Запуск как служба — [install.md](install.md#запуск-как-службы-systemd).
+* Запуск как служба — [install.md](install.md#служба-узла-systemd).
 * Если что-то не работает — [troubleshooting.md](troubleshooting.md).
