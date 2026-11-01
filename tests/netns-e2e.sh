@@ -648,7 +648,9 @@ fi
 # diagnostics from the running node (through its API)
 dv() { n=$1; shift; nsx "$n" "$D" --dir "$W/$n" -a 127.0.0.1:9902 "$@"; }
 p=$(dv ma path mc 2>&1) || fail "path: $p"
-echo "$p" | grep -q " -> $via -> mc" || fail "path ma -> mc does not go through $via: $p"
+# the first hop is ours to know; later hops are predicted from our link-state view, which may
+# lag a moment behind (ma -> md -> mb -> mc while md's link to mc is still being announced)
+echo "$p" | grep -qE " -> $via( -> m[bd])* -> mc\$" || fail "path ma -> mc does not go through $via: $p"
 dv ma status 2>&1 | grep -q 'group' || fail "status"
 dv ma neighbors 2>&1 | grep -q "| $via " || fail "neighbors of ma do not list $via"
 dv ma routes 2>&1 | grep -q "| mc .*| $via " || fail "routes of ma: mc not via $via"
