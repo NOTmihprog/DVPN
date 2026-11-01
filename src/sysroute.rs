@@ -44,7 +44,7 @@ pub fn wanted(routes: &[crate::ckr::Route], connected: &[IpNet]) -> BTreeSet<Sys
         .iter()
         .filter(|r| r.system && !connected.iter().any(|c| c.contains(&r.net)))
         .map(|r| match r.target {
-            crate::ckr::Target::Node(_) => SysRoute::Dev(r.net),
+            crate::ckr::Target::Node(_) | crate::ckr::Target::Blackhole => SysRoute::Dev(r.net),
             crate::ckr::Target::Exclude => SysRoute::Throw(r.net),
         })
         .collect()

@@ -165,9 +165,38 @@ pub fn mdns_answer(query: &[u8], zone: &Zone, domain: &str) -> Option<(Vec<u8>, 
 }
 
 /// Serves `zone` on `addr:53` until the process ends.
-pub async fn serve(addr: IpAddr, zone: Arc<ArcSwap<Zone>>, domain: String) {
+/// DNS servers to forward other names to (`[exit] dns`, while a gateway is active).
+pub type Upstream = Arc<ArcSwap<Vec<IpAddr>>>;
+
+/// Whether a query asks for a name in our zone.
+fn in_zone(query: &[u8], domain: &str) -> bool {
+    question(query).is_some_and(|(name, _, _)| name == domain || name.ends_with(&format!(".{domain}")))
+}
+
+/// Forwards a query to the upstream servers in turn (through the tunnel: they are public
+/// addresses, routed to the gateway) and relays the first answer.
+async fn forward(query: Vec<u8>, from: SocketAddr, upstream: Vec<IpAddr>, sock: Arc<UdpSocket>) {
+    for server in upstream {
+        let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+        let Ok(up) = UdpSocket::bind(bind).await else { continue };
+        if up.send_to(&query, SocketAddr::new(server, 53)).await.is_err() {
+            continue;
+        }
+        let mut buf = vec![0u8; 4096];
+        if let Ok(Ok((n, _))) = tokio::time::timeout(std::time::Duration::from_secs(2), up.recv_from(&mut buf)).await
+            && n >= 2
+            && buf[..2] == query[..2]
+        {
+            let _ = sock.send_to(&buf[..n], from).await;
+            return;
+        }
+    }
+}
+
+/// Serves `zone` on `addr:53` until the process ends; other names go to `upstream` if set.
+pub async fn serve(addr: IpAddr, zone: Arc<ArcSwap<Zone>>, domain: String, upstream: Upstream) {
     let sock = match UdpSocket::bind(SocketAddr::new(addr, 53)).await {
-        Ok(s) => s,
+        Ok(s) => Arc::new(s),
         Err(e) => {
             log::warn!("DNS | cannot listen on {addr}:53: {e}");
             return;
@@ -177,9 +206,26 @@ pub async fn serve(addr: IpAddr, zone: Arc<ArcSwap<Zone>>, domain: String) {
     let mut buf = [0u8; 512];
     loop {
         let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+        let up = upstream.load();
+        if !up.is_empty() && n >= 12 && !in_zone(&buf[..n], &domain) {
+            tokio::spawn(forward(buf[..n].to_vec(), from, up.to_vec(), sock.clone()));
+            continue;
+        }
         if let Some(reply) = answer(&buf[..n], &zone.load(), &domain) {
             let _ = sock.send_to(&reply, from).await;
         }
+    }
+}
+
+/// All names to us (and so through the gateway) or only our domain, in systemd-resolved.
+pub fn resolved_route_all(tun: &str, domain: &str, all: bool) {
+    let run =
+        |args: &[&str]| std::process::Command::new("resolvectl").args(args).output().is_ok_and(|o| o.status.success());
+    let d = format!("~{domain}");
+    let ok = if all { run(&["domain", tun, &d, "~."]) } else { run(&["domain", tun, &d]) };
+    let _ = run(&["default-route", tun, if all { "yes" } else { "no" }]);
+    if ok {
+        log::info!("DNS | systemd-resolved: {} through the tunnel", if all { "all names" } else { "only *.dvpn" });
     }
 }
 

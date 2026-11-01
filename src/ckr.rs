@@ -39,6 +39,8 @@ pub enum Target {
     Node(NodeId),
     /// `!prefix`: not through the tunnel.
     Exclude,
+    /// Into the tunnel and dropped there: the kill switch while no gateway is alive.
+    Blackhole,
 }
 
 /// One parsed entry.
@@ -167,7 +169,7 @@ impl CkrTable {
     pub fn lookup(&self, ip: IpAddr) -> Option<NodeId> {
         match self.target(ip)? {
             Target::Node(n) => Some(n),
-            Target::Exclude => None,
+            Target::Exclude | Target::Blackhole => None,
         }
     }
 

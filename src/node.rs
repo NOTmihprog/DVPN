@@ -72,6 +72,10 @@ pub struct GroupCtx {
     /// The group's local name and the DNS zone of members' names (`[dns]`), if served.
     pub group_name: String,
     pub dns: Option<(String, Arc<arc_swap::ArcSwap<crate::dns::Zone>>)>,
+    /// Where the DNS server forwards other names (`[exit] dns` while a gateway is active).
+    pub dns_upstream: crate::dns::Upstream,
+    /// Change systemd-resolved (split DNS, all names through the gateway): the TUN name.
+    pub resolved_tun: Option<String>,
     /// `[exit]` as at start; the node follows later changes in `config_path`.
     pub exits: crate::config::Exits,
     pub config_path: std::path::PathBuf,
@@ -117,6 +121,8 @@ pub struct Node {
     exits: parking_lot::Mutex<(crate::config::Exits, Option<std::time::SystemTime>)>,
     exit4: parking_lot::Mutex<crate::exit::ExitChooser>,
     exit6: parking_lot::Mutex<crate::exit::ExitChooser>,
+    /// Kill switch on for IPv4 / IPv6: gateways configured, none alive.
+    kill: parking_lot::Mutex<(bool, bool)>,
     /// The ACL chain now installed (to re-render only on changes).
     acl: parking_lot::Mutex<Option<String>>,
     /// `[gateway]`: NAT and NDP proxy for members' public IPv6 addresses.
@@ -173,6 +179,7 @@ impl Node {
             exits: parking_lot::Mutex::new(exits),
             exit4: parking_lot::Mutex::new(Default::default()),
             exit6: parking_lot::Mutex::new(Default::default()),
+            kill: parking_lot::Mutex::new((false, false)),
             gateway: parking_lot::Mutex::new(None),
             acl: parking_lot::Mutex::new(None),
             candidates: parking_lot::Mutex::new(HashMap::new()),
@@ -220,9 +227,19 @@ impl Node {
         // the chosen gateways get the internet (private ranges stay local), manual routes on top
         let gw4 = self.exit4.lock().current;
         let gw6 = self.exit6.lock().current;
-        for (gw, spec) in [(gw4, "inetv4"), (gw6, "inetv6")] {
+        let (kill4, kill6) = *self.kill.lock();
+        for (gw, kill, spec) in [(gw4, kill4, "inetv4"), (gw6, kill6, "inetv6")] {
             if let Some(gw) = gw {
                 routes.extend(crate::ckr::parse_spec(spec, gw).expect("valid spec"));
+            } else if kill {
+                // kill switch: the internet stays in the tunnel, where nothing carries it
+                let rs = crate::ckr::parse_spec(spec, me).expect("valid spec");
+                routes.extend(rs.into_iter().map(|mut r| {
+                    if matches!(r.target, crate::ckr::Target::Node(_)) {
+                        r.target = crate::ckr::Target::Blackhole;
+                    }
+                    r
+                }));
             }
         }
         routes.extend(self.group.routes.iter().copied());
@@ -1032,8 +1049,37 @@ impl Node {
                 }
             }
         }
+        let kill = (
+            !p4.is_empty() && exits.kill_switch() && self.exit4.lock().current.is_none(),
+            !p6.is_empty() && exits.kill_switch() && self.exit6.lock().current.is_none(),
+        );
+        {
+            let mut k = self.kill.lock();
+            if *k != kill {
+                if kill.0 || kill.1 {
+                    log::warn!("Exit | kill switch on: no gateway alive, internet blocked");
+                } else if k.0 || k.1 {
+                    log::info!("Exit | kill switch off");
+                }
+                *k = kill;
+                changed = true;
+            }
+        }
         if changed {
             self.rebuild_ckr();
+        }
+        // DNS through the gateway while it carries our IPv4 internet
+        let upstream: Vec<IpAddr> = if self.exit4.lock().current.is_some() { exits.dns.clone() } else { Vec::new() };
+        if **self.group.dns_upstream.load() != upstream {
+            let all = !upstream.is_empty();
+            if all {
+                log::info!("DNS | other names through the gateway to {upstream:?}");
+            }
+            self.group.dns_upstream.store(Arc::new(upstream));
+            if let (Some(tun), Some((domain, _))) = (&self.group.resolved_tun, &self.group.dns) {
+                let (tun, domain) = (tun.clone(), domain.clone());
+                tokio::task::spawn_blocking(move || crate::dns::resolved_route_all(&tun, &domain, all));
+            }
         }
     }
 

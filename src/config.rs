@@ -261,6 +261,18 @@ pub fn check_endpoint(s: &str) -> anyhow::Result<()> {
 pub struct Exits {
     pub v4: Vec<String>,
     pub v6: Vec<String>,
+    /// With gateways configured but none alive, keep the internet in the tunnel (dropped)
+    /// instead of letting it go direct. `None` = on (the default whenever gateways are set).
+    pub kill_switch: Option<bool>,
+    /// DNS servers to use through the gateway while it is active (no DNS leak to the local
+    /// network or the provider).
+    pub dns: Vec<std::net::IpAddr>,
+}
+
+impl Exits {
+    pub fn kill_switch(&self) -> bool {
+        self.kill_switch.unwrap_or(true)
+    }
 }
 
 fn parse_exits(t: &dyn toml_edit::TableLike) -> anyhow::Result<Exits> {
@@ -273,11 +285,19 @@ fn parse_exits(t: &dyn toml_edit::TableLike) -> anyhow::Result<Exits> {
             .collect()
     };
     for (k, _) in t.iter() {
-        if k != "v4" && k != "v6" {
+        if !["v4", "v6", "kill_switch", "dns"].contains(&k) {
             bail!("unknown key {k}");
         }
     }
-    Ok(Exits { v4: list("v4")?, v6: list("v6")? })
+    let kill_switch = match t.get("kill_switch") {
+        Some(v) => Some(v.as_bool().ok_or_else(|| anyhow!("kill_switch: true or false"))?),
+        None => None,
+    };
+    let dns = list("dns")?
+        .iter()
+        .map(|s| s.parse().map_err(|_| anyhow!("dns: {s} is not an IP address")))
+        .collect::<anyhow::Result<_>>()?;
+    Ok(Exits { v4: list("v4")?, v6: list("v6")?, kill_switch, dns })
 }
 
 /// `[gateway]` (PLAN §12): NAT from the tunnel to `wan`, optional NDP proxy for members'
@@ -702,7 +722,7 @@ impl Config {
 
     /// Sets `[exit]` (an empty list removes it).
     pub fn set_exits(&mut self, exits: &Exits) {
-        if exits.v4.is_empty() && exits.v6.is_empty() {
+        if exits.v4.is_empty() && exits.v6.is_empty() && exits.kill_switch.is_none() && exits.dns.is_empty() {
             self.doc.remove("exit");
         } else {
             let mut t = Table::new();
@@ -714,6 +734,16 @@ impl Config {
                     }
                     t[k] = value(arr);
                 }
+            }
+            if let Some(k) = exits.kill_switch {
+                t["kill_switch"] = value(k);
+            }
+            if !exits.dns.is_empty() {
+                let mut arr = toml_edit::Array::new();
+                for d in &exits.dns {
+                    arr.push(d.to_string());
+                }
+                t["dns"] = value(arr);
             }
             t.decor_mut()
                 .set_prefix("\n# gateways to the internet by priority (names or keys); the first alive one is used\n");
@@ -1047,11 +1077,18 @@ mod tests {
     #[test]
     fn exits() {
         let c = with_group("[exit]\nv4 = [\"vps1\", \"vps2\"]\n").unwrap();
-        assert_eq!(c.exits, Exits { v4: vec!["vps1".into(), "vps2".into()], v6: vec![] });
+        assert_eq!(c.exits, Exits { v4: vec!["vps1".into(), "vps2".into()], ..Default::default() });
+        assert!(c.exits.kill_switch(), "on by default");
+        assert!(with_group("[exit]\ndns = [\"one.one\"]\n").is_err());
         assert!(with_group("[exit]\nv5 = []\n").is_err());
         let dir = temp_dir();
         let mut c = Config::load(&dir).unwrap();
-        let e = Exits { v4: vec!["a".into()], v6: vec!["b".into(), "c".into()] };
+        let e = Exits {
+            v4: vec!["a".into()],
+            v6: vec!["b".into(), "c".into()],
+            kill_switch: Some(false),
+            dns: vec!["1.1.1.1".parse().unwrap()],
+        };
         c.set_exits(&e);
         c.save();
         assert_eq!(read_exits(&dir.join(CONFIG_FILE_NAME)).unwrap(), e);

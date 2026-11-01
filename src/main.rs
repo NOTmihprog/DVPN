@@ -78,6 +78,13 @@ enum Command {
         /// No gateway: the internet is reached directly, as without DVPN
         #[arg(long, conflicts_with_all = ["v4", "v6"])]
         none: bool,
+        /// With gateways set but none alive: block the internet (on, the default) or let it go
+        /// direct (off)
+        #[arg(long, value_parser = ["on", "off"])]
+        kill_switch: Option<String>,
+        /// DNS servers to use through the gateway (comma separated IPs; "none" to clear)
+        #[arg(long, value_delimiter = ',')]
+        dns: Option<Vec<String>>,
     },
     /// Start peer discovery server
     Server {
@@ -1003,6 +1010,7 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         .collect();
     let group_id = group.id;
     let dir2 = dir.clone();
+    let upstream: dvpn::dns::Upstream = Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
     let dns = (conf.dns.enable && tun.is_some() && self_addr.is_some())
         .then(|| (conf.dns.domain.clone(), Arc::new(arc_swap::ArcSwap::from_pointee(dvpn::dns::Zone::new()))));
     let ctx = node::GroupCtx {
@@ -1026,6 +1034,12 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         tun_prefix: conf.net.as_ref().map_or(24, |n| n.prefix),
         group_name: group.name.clone(),
         dns: dns.clone(),
+        dns_upstream: upstream.clone(),
+        resolved_tun: conf
+            .net
+            .as_ref()
+            .filter(|_| conf.dns.manage_resolved && dns.is_some())
+            .map(|n| n.tun_name.clone()),
         config_path: conf.path().to_path_buf(),
         on_epoch: Box::new(move |epoch, psk| match Config::load(&dir2) {
             Ok(mut conf) => {
@@ -1042,7 +1056,7 @@ async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
         node.manage_routes(&net.tun_name, connected);
     }
     if let (Some((domain, zone)), Some(addr), Some(net)) = (&dns, self_addr, &conf.net) {
-        tokio::spawn(dvpn::dns::serve(std::net::IpAddr::V4(addr), zone.clone(), domain.clone()));
+        tokio::spawn(dvpn::dns::serve(std::net::IpAddr::V4(addr), zone.clone(), domain.clone(), upstream.clone()));
         dvpn::dns::enable_multicast(&net.tun_name);
         if conf.dns.manage_resolved {
             let (tun, domain) = (net.tun_name.clone(), domain.clone());
@@ -1132,7 +1146,7 @@ fn main() {
         Some(Command::Group(cmd)) => cmd_group(&mut conf, &dir, cmd),
         Some(Command::Node(cmd)) => cmd_node(&mut conf, &dir, cmd),
         Some(Command::Acl(cmd)) => cmd_acl(&conf, &dir, cmd),
-        Some(Command::Exit { v4, v6, none }) => {
+        Some(Command::Exit { v4, v6, none, kill_switch, dns }) => {
             let mut e = conf.exits.clone();
             if none {
                 e = config::Exits::default();
@@ -1143,12 +1157,31 @@ fn main() {
             if let Some(v) = v6 {
                 e.v6 = v.into_iter().filter(|s| !s.is_empty()).collect();
             }
+            if let Some(k) = kill_switch {
+                e.kill_switch = Some(k == "on");
+            }
+            if let Some(d) = dns {
+                e.dns = d
+                    .iter()
+                    .filter(|s| !s.is_empty() && *s != "none")
+                    .map(|s| s.parse().unwrap_or_else(|_| die(format!("--dns {s}: not an IP address"))))
+                    .collect();
+            }
             if e != conf.exits {
                 conf.set_exits(&e);
                 conf.save();
             }
             let show = |l: &[String]| if l.is_empty() { "none".to_owned() } else { l.join(" > ") };
             println!("IPv4 exit: {}\nIPv6 exit: {}", show(&e.v4), show(&e.v6));
+            if !e.v4.is_empty() || !e.v6.is_empty() {
+                println!("kill switch: {}", if e.kill_switch() { "on (no gateway: no internet)" } else { "off" });
+            }
+            if !e.dns.is_empty() {
+                println!(
+                    "DNS through the gateway: {}",
+                    e.dns.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+                );
+            }
         }
         Some(Command::Server { addr, port }) => rt.block_on(run_server(&mut conf, addr, port)),
     }

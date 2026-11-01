@@ -280,6 +280,58 @@ nsx b ping -c3 -i0.2 -W1 203.0.113.1 >/dev/null || fail "b -> internet through a
 nsx b nft delete table inet blockc
 ok "exit failover: c unreachable, b goes through a"
 
+# Kill switch: with both gateways unreachable B's internet is blocked, not sent direct (that
+# works: nat2 is right there, as "kill switch off" shows)
+from=$(($(wc -l < "$W/node-b.log") + 1))
+nsx b nft -f - <<NFT
+table inet blockgw {
+    chain out { type filter hook output priority 0; ip daddr { 203.0.113.11, 203.0.113.13, 203.0.113.20 } drop; }
+    chain in { type filter hook input priority 0; ip saddr { 203.0.113.11, 203.0.113.13, 203.0.113.20 } drop; }
+}
+NFT
+blog() { tail -n +$from "$W/node-b.log" | sed 's/\x1b\[[0-9;]*m//g'; }
+wait_for 60 sh -c "tail -n +$from '$W/node-b.log' | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'kill switch on'" \
+    || fail "b did not turn the kill switch on"
+! nsx b ping -c2 -W1 203.0.113.1 >/dev/null 2>&1 || fail "kill switch: b's internet leaked past the tunnel"
+"$D" --dir "$W/b" exit --kill-switch off >/dev/null
+wait_for 10 nsx b ping -c1 -W1 203.0.113.1 || fail "kill switch off: b's internet did not go direct"
+"$D" --dir "$W/b" exit --kill-switch on >/dev/null
+nsx b nft delete table inet blockgw
+from=$(($(wc -l < "$W/node-b.log") + 1))
+wait_for 60 sh -c "tail -n +$from '$W/node-b.log' | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'Exit | IPv4 via'" \
+    || fail "b found no gateway again"
+ok "kill switch: no gateway, no internet (and direct with it off)"
+
+# DNS through the gateway: B's DNS server forwards other names to [exit] dns, through the
+# tunnel; the upstream (a stub on the "internet") sees the gateway's address, not B's.
+if command -v python3 >/dev/null; then
+    bg dnsup wan python3 -I -u -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("203.0.113.1", 53))
+while True:
+    q, a = s.recvfrom(512)
+    print("from", a[0], flush=True)
+    end = 12
+    while q[end]:
+        end += q[end] + 1
+    end += 5
+    s.sendto(q[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" + q[12:end]
+             + b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x04\x00\x04" + bytes([198, 51, 100, 7]), a)
+'
+    "$D" --dir "$W/b" exit --dns 203.0.113.1 >/dev/null
+    wait_for 15 sh -c "[ \"\$(ip netns exec b python3 -I -c '
+import socket
+q = b\"\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x07example\\x03com\\x00\\x00\\x01\\x00\\x01\"
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(q, (\"10.10.33.2\", 53)); r = s.recv(512)
+print(\".\".join(map(str, r[-4:])))' 2>/dev/null)\" = 198.51.100.7 ]" || fail "b's DNS did not forward example.com"
+    grep -q 'from 203.0.113.20\|from 203.0.113.13\|from 203.0.113.11' "$W/dnsup.log" || fail "DNS did not go through a gateway: $(cat "$W/dnsup.log")"
+    ! grep -q 'from 203.0.113.12' "$W/dnsup.log" || fail "DNS leaked from b's own address"
+    "$D" --dir "$W/b" exit --dns none >/dev/null
+    ok "DNS through the gateway (upstream sees the gateway, not b)"
+fi
+
 # A<->B must be a direct nat1 -> nat2 UDP flow (the tracker never forwards traffic).
 nat2nat() { nsx nat1 nft list counter ip watch nat2nat | awk '/packets/ {print $2}'; }
 before=$(nat2nat)
