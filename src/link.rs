@@ -64,7 +64,7 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(
+    pub(crate) fn new(
         peer: NodeId,
         local_idx: u32,
         remote_idx: u32,
@@ -109,7 +109,7 @@ impl Session {
     }
 
     /// Decrypts an unmasked DATA packet (padding removed) in place; returns the plaintext range.
-    fn open(&self, packet: &mut [u8]) -> Option<Range<usize>> {
+    pub(crate) fn open(&self, packet: &mut [u8]) -> Option<Range<usize>> {
         if packet.len() < DATA_HDR + TAG_LEN {
             return None;
         }
@@ -136,7 +136,7 @@ impl Session {
         self.created.elapsed()
     }
 
-    fn usable(&self) -> bool {
+    pub(crate) fn usable(&self) -> bool {
         self.age() < REJECT_AFTER && self.counter.load(Ordering::Relaxed) < REJECT_AFTER_MESSAGES
     }
 
@@ -147,7 +147,7 @@ impl Session {
 
 /// A Noise message whose leading ephemeral is an Elligator2 representative on the wire, with the
 /// representative replaced by the public key it stands for.
-fn with_decoded_ephemeral(msg: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn with_decoded_ephemeral(msg: &[u8]) -> Option<Vec<u8>> {
     let repr: [u8; 32] = msg.get(..32)?.try_into().unwrap();
     let mut out = msg.to_vec();
     out[..32].copy_from_slice(&elligator::public(&repr));

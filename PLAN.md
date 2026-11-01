@@ -704,14 +704,14 @@ src/
   ckr.rs            LPM, синтаксис ~ ! inetv4/inetv6, проверка источника
   acl.rs            правила доступа внутри группы (§7.4)
   group.rs          ключи группы, invite, сертификаты, отзыв, эпохи psk, backup/restore
-  state/
-    model.rs        NodeInfo, Settings, Body
-    store.rs        подписанные LWW-записи, HLC (учёт часов без RTC), tombstones
-    sync.rs         обмен сводками с соседями и трекером
+  state.rs          (этап 3) записи группы, подписанные её ключом: Revoke, Cert, Epoch/EpochKey; LWW, tombstones,
+                    SyncMsg (сводки с соседями и трекером), state.bin; в этапе 6 станет state/ с NodeInfo, Settings, HLC
+  elligator.rs      Elligator2-представление эфемерных ключей
   plan.rs           состояние → CKR, системные маршруты, адреса, NAT, failover, kill switch
   netcfg/           linux (rtnetlink/ip/nft), windows, macos
   dns.rs            MagicDNS-резолвер по именам из состояния (§14a)
   metrics.rs        счётчики линков/сессий, экспорт (§14a)
+  tunnel.rs         сессия с трекером в том же виде, что между узлами (ключи из ключа трекера), защита от зондирования
   tracker_server.rs / tracker_client.rs
   node.rs           склейка: циклы udp/tun/ping/tracker/apply
   api.rs, config.rs, logger.rs, main.rs

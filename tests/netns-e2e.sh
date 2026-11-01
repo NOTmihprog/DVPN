@@ -115,6 +115,23 @@ TKEY=$(sed -n 's/^public_key = "\(.*\)"/\1/p' trk/config.toml)
 [ -n "$TKEY" ] || fail "tracker key is empty"
 ok "tracker up"
 
+# Active probing: random datagrams of any size get no answer from the tracker.
+if command -v python3 >/dev/null; then
+    nsx c python3 -I -c '
+import os, socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(0.5)
+for n in (1, 32, 64, 128, 200, 600, 1400):
+    s.sendto(os.urandom(n), ("203.0.113.1", 6485))
+try:
+    s.recvfrom(2048)
+    sys.exit("tracker answered a random probe")
+except socket.timeout:
+    pass
+' || fail "tracker answered a probe"
+    ok "tracker silent to random probes"
+fi
+
 # ---- nodes ----------------------------------------------------------------------------
 # A creates the group (its admin) and invites B and C: no keys or peer lists are exchanged by
 # hand, the invite carries the group psk, the tracker and a one-time join key.
@@ -182,10 +199,10 @@ if command -v tcpdump >/dev/null; then
     ! grep -q dvpn-e2e- "$W/wan.pcap" || fail "plaintext overlay payload seen on the wan"
     ok "no plaintext on the wan"
     if command -v python3 >/dev/null; then
-        # peer datagrams only (the tracker on port 6485 is not masked until stage 3)
+        # all UDP: sessions with the tracker are masked like the ones between nodes
         # tcpdump decodes the link layer (it differs between hosts and containers); -x prints the
         # IP packet in hex, the UDP payload starts after the IP and UDP headers.
-        stats=$(tcpdump -Z root -r "$W/wan.pcap" -nn -x 'udp and not port 6485' 2>/dev/null | python3 -I -c '
+        stats=$(tcpdump -Z root -r "$W/wan.pcap" -nn -x 'udp' 2>/dev/null | python3 -I -c '
 import sys
 from collections import Counter
 first, sizes, pkts, cur = Counter(), Counter(), [], None
@@ -204,10 +221,10 @@ n = sum(first.values())
 print(n, first.most_common(1)[0][1] if n else 0, len(sizes))
 ')
         set -- $stats
-        [ "${1:-0}" -ge 40 ] || fail "too few peer datagrams captured ($stats)"
+        [ "${1:-0}" -ge 40 ] || fail "too few datagrams captured ($stats)"
         [ $(( $2 * 100 / $1 )) -lt 15 ] || fail "peer datagrams share a first byte too often ($2 of $1)"
         [ "$3" -ge 10 ] || fail "peer datagram sizes barely vary ($3 distinct sizes in $1 packets)"
-        ok "peer datagrams masked on the wan: $1 packets, top first byte $2x, $3 sizes"
+        ok "datagrams masked on the wan: $1 packets, top first byte $2x, $3 sizes"
     fi
 else
     echo "skip: tcpdump not found (plaintext check)"
@@ -261,5 +278,8 @@ wait_for 10 nsx a ping -c1 -W1 10.10.33.3 || fail "a -> c lost after nat1 change
 grep -q 'at new endpoint 203.0.113.13:' "$W/node-c.log" || fail "c did not roam to a's new endpoint"
 nsx a ping -c3 -i0.2 -W1 10.10.33.3 >/dev/null || fail "a -> c: packet loss after roaming"
 ok "a <-> c survives a NAT address change (roaming)"
+# the tracker session is found by its index, not the address: it follows A too
+wait_for 20 grep -q 'moved 203.0.113.11:.* -> 203.0.113.13:' "$W/tracker.log" || fail "tracker did not follow a's new address"
+ok "tracker session survives the NAT address change"
 
 echo "PASS"

@@ -1,17 +1,24 @@
+//! The client side of a tracker session (PLAN §11): a masked Noise session (`tunnel.rs`),
+//! announces with our certificates, the members the tracker reports, and group record sync.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
 use parking_lot::Mutex;
+use rand::RngExt;
 
-use crate::crypto::{ClientHandshake, TrackerSession};
 use crate::group::{Cert, now_unix};
-use crate::identity::Identity;
+use crate::identity::{Identity, NodeId};
+use crate::link::Session;
 use crate::logger::node;
-use crate::proto::{HELLO_ACK, TRACKER, TrackerMsg};
+use crate::noise::TAG_LEN;
+use crate::obfs::MAX_PAD;
+use crate::proto::{DATA, DATA_HDR, HS_RESP, TrackerMsg};
 use crate::state::{Entry, Membership, StateStore, SyncMsg};
 use crate::storage::{PeerStorage, PeerUpdate};
+use crate::tunnel::{self, ClientHello, TrackerKeys};
 
 /// Each announce also refreshes the members list (and their current addresses) from the server.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(15);
@@ -21,21 +28,49 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(45);
 /// A link that answered within this time is not replaced by a tracker-reported endpoint.
 const LIVE_LINK: Duration = Duration::from_secs(20);
+/// New session keys this often (sessions are dropped after `link::REJECT_AFTER`).
+const REKEY: std::ops::Range<Duration> = Duration::from_secs(100)..Duration::from_secs(120);
+/// Handshake retries while not connected back off from 1 s to this.
+const MAX_RETRY: Duration = Duration::from_secs(16);
+/// A rekey handshake that got no answer is repeated after this.
+const REKEY_RETRY: Duration = Duration::from_secs(5);
 
 fn unix_now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
-#[derive(Default)]
 struct State {
-    handshake: Option<ClientHandshake>,
-    session: Option<TrackerSession>,
+    hello: Option<(ClientHello, Instant)>,
+    retry: Duration,
+    /// The session we send on, and the one before it (packets in flight after a rekey).
+    session: Option<Arc<Session>>,
+    previous: Option<Arc<Session>>,
+    rekey_after: Duration,
+    connected: bool,
     last_announce: Option<Instant>,
     last_sync: Option<Instant>,
     last_response: Option<Instant>,
-    // Wall-clock copies of the above, reported through the API.
+    // Wall-clock copies, reported through the API.
     announce_ts: f64,
     response_ts: f64,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            hello: None,
+            retry: Duration::from_secs(1),
+            session: None,
+            previous: None,
+            rekey_after: REKEY.start,
+            connected: false,
+            last_announce: None,
+            last_sync: None,
+            last_response: None,
+            announce_ts: 0.0,
+            response_ts: 0.0,
+        }
+    }
 }
 
 /// Packets to send to the server, an optional connection status change, and what the node
@@ -51,6 +86,7 @@ pub struct Output {
 pub struct TrackerClient {
     pub addr: SocketAddr,
     pub key: VerifyingKey,
+    keys: TrackerKeys,
     identity: Arc<Identity>,
     /// Our membership certificates, one per group.
     certs: Mutex<Vec<Cert>>,
@@ -61,13 +97,19 @@ pub struct TrackerClient {
 
 impl State {
     fn send(&mut self, out: &mut Output, msg: &TrackerMsg) {
-        if let Some(s) = &mut self.session {
-            out.packets.push(s.seal(&msg.encode()));
+        let Some(s) = self.session.as_ref().filter(|_| self.connected) else { return };
+        let body = msg.encode();
+        let mut buf = vec![0u8; DATA_HDR + body.len() + TAG_LEN + MAX_PAD];
+        buf[DATA_HDR..DATA_HDR + body.len()].copy_from_slice(&body);
+        if let Some(n) = s.seal(&mut buf, body.len()) {
+            buf.truncate(n);
+            out.packets.push(buf);
         }
     }
 
-    fn drop_session(&mut self) {
-        *self = State::default();
+    fn disconnect(&mut self) {
+        let (announce_ts, response_ts) = (self.announce_ts, self.response_ts);
+        *self = State { announce_ts, response_ts, ..State::default() };
     }
 }
 
@@ -85,6 +127,7 @@ impl TrackerClient {
         TrackerClient {
             addr,
             key,
+            keys: TrackerKeys::new(NodeId::from(key)),
             identity,
             certs: Mutex::new(certs),
             store,
@@ -114,7 +157,7 @@ impl TrackerClient {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.state.lock().session.is_some()
+        self.state.lock().connected
     }
 
     /// (last announce, last search, last response) as unix timestamps, 0 = never. Members are
@@ -128,27 +171,35 @@ impl TrackerClient {
     pub fn tick(&self) -> Output {
         let mut out = Output::default();
         let mut s = self.state.lock();
-        if s.session.is_none() {
-            let hs = ClientHandshake::new();
-            out.packets.push(hs.hello());
-            s.handshake = Some(hs);
-            log::debug!("{} Connection status connecting", self.log_prefix);
-            return out;
-        }
 
-        if s.last_response.is_some_and(|t| t.elapsed() >= RESPONSE_TIMEOUT) {
+        if s.connected && s.last_response.is_some_and(|t| t.elapsed() >= RESPONSE_TIMEOUT) {
             log::info!("{} Connection status disconnected", self.log_prefix);
             s.send(&mut out, &TrackerMsg::Close);
-            s.drop_session();
+            s.disconnect();
             out.status = Some(false);
+        }
+
+        let rekey_after = s.rekey_after;
+        let need = s.session.as_ref().is_none_or(|x| x.age() >= rekey_after || !x.usable());
+        let wait = if s.connected { REKEY_RETRY } else { s.retry };
+        if need
+            && s.hello.as_ref().is_none_or(|(_, t)| t.elapsed() >= wait)
+            && let Some((packets, hello)) = tunnel::client_hello(&self.keys, &self.identity, rand::random())
+        {
+            out.packets.extend(packets);
+            s.hello = Some((hello, Instant::now()));
+            if !s.connected {
+                log::debug!("{} Connection status connecting", self.log_prefix);
+                s.retry = (s.retry * 2).min(MAX_RETRY);
+            }
+        }
+        if !s.connected {
             return out;
         }
 
         if s.last_announce.is_none_or(|t| t.elapsed() >= ANNOUNCE_INTERVAL) {
             log::debug!("{} Send announce", self.log_prefix);
-            let sig = self.identity.sign(s.session.as_ref().expect("checked above").announce_msg());
-            let msg = TrackerMsg::Announce { node: self.identity.id(), certs: self.certs.lock().clone(), sig };
-            s.send(&mut out, &msg);
+            s.send(&mut out, &TrackerMsg::Announce { certs: self.certs.lock().clone() });
             s.last_announce = Some(Instant::now());
             s.announce_ts = unix_now();
         }
@@ -167,42 +218,54 @@ impl TrackerClient {
 
     pub fn handle(&self, packet: &[u8], storage: &PeerStorage) -> Output {
         let mut out = Output::default();
+        let mut p = packet.to_vec();
+        let Some(len) = self.keys.obfs.open(&mut p) else { return out };
+        let p = &mut p[..len];
         let mut s = self.state.lock();
-        match packet.first() {
-            Some(&HELLO_ACK) => {
-                let Some(hs) = s.handshake.take() else { return out };
-                let Some(session) = hs.finish(packet, &self.key) else {
-                    log::info!("{} Reg session Invalid Signature", self.log_prefix);
+        match p[0] {
+            HS_RESP => {
+                let Some((hello, _)) = s.hello.as_ref().filter(|(h, _)| tunnel::resp_receiver_idx(p) == Some(h.idx))
+                else {
                     return out;
                 };
-                let was_connected = s.session.is_some();
-                s.session = Some(session);
+                let Some(session) = tunnel::client_finish(&self.keys, hello, p) else {
+                    log::info!("{} handshake reply does not verify", self.log_prefix);
+                    return out;
+                };
+                s.hello = None;
+                s.previous = s.session.replace(Arc::new(session));
+                s.rekey_after = rand::rng().random_range(REKEY);
                 s.last_response = Some(Instant::now());
                 s.response_ts = unix_now();
-                s.last_announce = None;
-                s.last_sync = None;
-                if !was_connected {
+                if !s.connected {
                     log::info!("{} Connection status connected", self.log_prefix);
+                    s.connected = true;
+                    s.retry = Duration::from_secs(1);
+                    s.last_announce = None;
+                    s.last_sync = None;
                     out.status = Some(true);
                 }
+                // confirms the new session to the server (it switches to it on our first packet)
+                s.send(&mut out, &TrackerMsg::Sync(SyncMsg::Records { records: Vec::new() }));
             }
-            Some(&TRACKER) => {
-                let Some(session) = &mut s.session else { return out };
-                let Some(plain) = session.open(packet) else {
-                    log::info!("{} Received packet | Invalid Data", self.log_prefix);
+            DATA => {
+                let Some(idx) = p.get(3..7).map(|b| u32::from_le_bytes(b.try_into().unwrap())) else { return out };
+                let Some(session) =
+                    [&s.session, &s.previous].into_iter().flatten().find(|x| x.local_idx == idx).cloned()
+                else {
                     return out;
                 };
-                match TrackerMsg::decode(&plain) {
+                let Some(plain) = session.open(p) else { return out };
+                s.last_response = Some(Instant::now());
+                s.response_ts = unix_now();
+                match TrackerMsg::decode(&p[plain]) {
                     Some(TrackerMsg::Found { cert, addr }) => {
-                        s.last_response = Some(Instant::now());
-                        s.response_ts = unix_now();
                         drop(s);
                         if self.found(&cert, addr, storage) {
                             out.members.push(*cert);
                         }
                     }
                     Some(TrackerMsg::Sync(msg)) => {
-                        s.last_response = Some(Instant::now());
                         let (replies, changed) = msg.handle(&self.store, |g| self.in_group(g));
                         for r in replies {
                             s.send(&mut out, &TrackerMsg::Sync(r));
@@ -211,10 +274,10 @@ impl TrackerClient {
                     }
                     Some(TrackerMsg::Close) => {
                         log::info!("{} Connection closed from server", self.log_prefix);
-                        s.drop_session();
+                        s.disconnect();
                         out.status = Some(false);
                     }
-                    Some(_) => {}
+                    Some(TrackerMsg::Announce { .. }) => {}
                     None => log::info!("{} Received packet | decode error", self.log_prefix),
                 }
             }
@@ -224,8 +287,7 @@ impl TrackerClient {
     }
 
     /// A member of one of our groups is at `addr`. The certificate is checked here too: the
-    /// tracker is not trusted with membership.
-    /// Returns whether it is a valid member other than us.
+    /// tracker is not trusted with membership. Returns whether it is a valid member other than us.
     fn found(&self, cert: &Cert, addr: SocketAddr, storage: &PeerStorage) -> bool {
         let peer = cert.body.node;
         if !self.in_group(&cert.body.group) {
@@ -276,7 +338,7 @@ impl TrackerClient {
         let mut s = self.state.lock();
         let mut out = Output::default();
         s.send(&mut out, &TrackerMsg::Close);
-        s.drop_session();
+        s.disconnect();
         out.packets.pop()
     }
 }

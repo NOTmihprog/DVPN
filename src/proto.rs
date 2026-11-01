@@ -1,16 +1,6 @@
-//! Wire protocol. Tracker datagrams start with a type byte; peer datagrams are masked (`obfs.rs`).
-//!
-//! Tracker (peer <-> discovery server):
-//! ```text
-//! HELLO      [0x01][client_eph x25519 32][nonce 16][zero padding up to HELLO_LEN]
-//! HELLO_ACK  [0x02][server_eph x25519 32][ed25519 sig 64 over HELLO_SIG_CTX|client_eph|nonce|server_eph]
-//! TRACKER    [0x03][counter u64 LE][chacha20poly1305(postcard(TrackerMsg))][tag 16]
-//! ```
-//! `Announce` carries an Ed25519 signature by the announced node key over
-//! ANNOUNCE_SIG_CTX|client_eph|nonce|server_eph, binding the claim to this session.
-//! HELLO is padded so the server reply is never larger than the request (no amplification).
-//! Session keys: HKDF-SHA256(salt = nonce, ikm = x25519 shared, info = KEYS_CTX|client_eph|server_eph),
-//! 64 bytes split into client->server and server->client keys, counters are replay-checked.
+//! Wire protocol. Every datagram is masked (`obfs.rs`): sessions with trackers look like
+//! sessions between nodes (`tunnel.rs`, keys derived from the tracker's public key), and are
+//! told apart by the sender's address only.
 //!
 //! Peer <-> peer, logical layout (on the wire padded and header-masked by `obfs.rs`):
 //! ```text
@@ -29,16 +19,10 @@
 
 use std::net::SocketAddr;
 
-use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 
 use crate::group::Cert;
-use crate::identity::NodeId;
 use crate::state::SyncMsg;
-
-pub const HELLO: u8 = 0x01;
-pub const HELLO_ACK: u8 = 0x02;
-pub const TRACKER: u8 = 0x03;
 
 pub const HS_INIT: u8 = 0x20;
 pub const HS_RESP: u8 = 0x21;
@@ -46,13 +30,6 @@ pub const DATA: u8 = 0x23;
 pub const HS_INIT_HDR: usize = 1 + 2 + 4;
 pub const HS_RESP_HDR: usize = 1 + 2 + 4 + 4;
 pub const DATA_HDR: usize = 1 + 2 + 4 + 8;
-
-pub const HELLO_LEN: usize = 128;
-pub const HELLO_ACK_LEN: usize = 1 + 32 + 64;
-pub const HELLO_SIG_CTX: &[u8] = b"dvpn/3 hello";
-pub const KEYS_CTX: &[u8] = b"dvpn/3 tracker keys";
-/// Signature context of `Announce` (signed by the node key over the session transcript).
-pub const ANNOUNCE_SIG_CTX: &[u8] = b"dvpn/4 announce";
 
 pub const KIND_CONTROL: u8 = 0;
 pub const KIND_IP: u8 = 1;
@@ -72,14 +49,11 @@ pub const MAX_ANNOUNCE_CERTS: usize = 16;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TrackerMsg {
-    /// Client -> server: "I am `node`, at the address you see this packet from, a member of the
-    /// groups of these certificates". `sig` is made with `node`'s key over this session's
-    /// handshake transcript (`TrackerSession::announce_msg`), so only the key owner can announce
-    /// it; the server checks each certificate against its group id (PLAN §11).
+    /// Client -> server: "I am at the address you see this packet from, a member of the groups
+    /// of these certificates". Who "I" is, the session handshake proved (the client's static key
+    /// is its node key); the server checks each certificate against its group id (PLAN §11).
     Announce {
-        node: NodeId,
         certs: Vec<Cert>,
-        sig: Signature,
     },
     /// Server -> client: the member with this certificate is reachable at `addr`. Sent for every
     /// online member of the client's groups in reply to an announce (the client's own address

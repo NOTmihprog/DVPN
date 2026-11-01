@@ -1,59 +1,95 @@
+//! The tracker (PLAN §11): introduces members of a group to each other and relays the group
+//! records. Sessions are masked like node-to-node sessions (`tunnel.rs`) and found by their
+//! index, not the client's address, so a client whose NAT mapping changed keeps its session.
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{Signature, SigningKey};
 use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 
-use crate::crypto::{TrackerSession, server_accept};
 use crate::group::{Cert, GroupId, now_unix};
-use crate::identity::NodeId;
+use crate::identity::{Identity, NodeId};
+use crate::link::Session;
 use crate::logger::node as show;
-use crate::proto::{HELLO, MAX_ANNOUNCE_CERTS, MAX_DATAGRAM, TRACKER, TrackerMsg};
+use crate::noise::{TAG_LEN, Tai64n};
+use crate::obfs::MAX_PAD;
+use crate::proto::{DATA, DATA_HDR, HS_INIT, MAX_ANNOUNCE_CERTS, MAX_DATAGRAM, TrackerMsg};
 use crate::state::{Entry, Membership, StateStore, SyncMsg, record_key};
+use crate::tunnel::{self, MAX_SKEW, TrackerKeys};
 
+/// A client that sent nothing for this long is dropped.
 const TIMEOUT: Duration = Duration::from_secs(45);
 
-struct Session {
-    crypto: TrackerSession,
-    node: Option<NodeId>,
-    /// Verified certificates of the announced node, by group.
+struct Client {
+    /// Where its last authenticated packet came from.
+    addr: SocketAddr,
+    /// The session we send on, and a newer one waiting for the client's first packet on it.
+    current: Option<Arc<Session>>,
+    next: Option<Arc<Session>>,
+    /// Verified certificates, by group (empty until it announces).
     certs: HashMap<GroupId, Cert>,
-    last_announce: Instant,
+    announced: bool,
+    last_seen: Instant,
 }
 
-struct State {
-    sessions: HashMap<SocketAddr, Session>,
-    by_node: HashMap<NodeId, SocketAddr>,
-    /// Online members of each group (PLAN §11).
+type Out = Vec<(Vec<u8>, SocketAddr)>;
+
+pub struct Server {
+    identity: Identity,
+    keys: TrackerKeys,
+    clients: HashMap<NodeId, Client>,
+    by_idx: HashMap<u32, (NodeId, Arc<Session>)>,
+    /// Newest handshake timestamp per client key; older or equal ones are replays. Kept after a
+    /// client leaves, until it is older than `MAX_SKEW` (then the freshness check covers it).
+    last_ts: HashMap<NodeId, (Tai64n, Instant)>,
+    /// Online members of each group.
     groups: HashMap<GroupId, HashSet<NodeId>>,
-    /// Group records (revocations, issued certificates), replicated from members; memory only,
-    /// members push them again after a restart.
+    /// Group records (revocations, issued certificates, psk epochs), replicated from members;
+    /// memory only, members push them again after a restart.
     store: StateStore,
     /// Join key -> the first node that enrolled with it: an invite works for one node only.
     joins: HashMap<NodeId, NodeId>,
 }
 
-impl Default for State {
-    fn default() -> Self {
-        State {
-            sessions: HashMap::new(),
-            by_node: HashMap::new(),
+impl Server {
+    pub fn new(identity: Identity) -> Self {
+        Server {
+            keys: TrackerKeys::new(identity.id()),
+            identity,
+            clients: HashMap::new(),
+            by_idx: HashMap::new(),
+            last_ts: HashMap::new(),
             groups: HashMap::new(),
             store: StateStore::memory(),
             joins: HashMap::new(),
         }
     }
-}
 
-type Out = Vec<(Vec<u8>, SocketAddr)>;
+    pub fn id(&self) -> NodeId {
+        self.identity.id()
+    }
 
-impl State {
-    fn send(&mut self, out: &mut Out, to: SocketAddr, msg: &TrackerMsg) {
-        if let Some(s) = self.sessions.get_mut(&to) {
-            out.push((s.crypto.seal(&msg.encode()), to));
+    fn fresh_idx(&self) -> u32 {
+        loop {
+            let i = rand::random();
+            if !self.by_idx.contains_key(&i) {
+                return i;
+            }
+        }
+    }
+
+    fn send(&self, out: &mut Out, to: &NodeId, msg: &TrackerMsg) {
+        let Some(c) = self.clients.get(to) else { return };
+        let Some(s) = c.current.as_ref().or(c.next.as_ref()) else { return };
+        let body = msg.encode();
+        let mut buf = vec![0u8; DATA_HDR + body.len() + TAG_LEN + MAX_PAD];
+        buf[DATA_HDR..DATA_HDR + body.len()].copy_from_slice(&body);
+        if let Some(n) = s.seal(&mut buf, body.len()) {
+            buf.truncate(n);
+            out.push((buf, c.addr));
         }
     }
 
@@ -68,81 +104,133 @@ impl State {
         }
     }
 
-    fn drop_session(&mut self, out: &mut Out, addr: SocketAddr, send_close: bool) {
+    fn drop_client(&mut self, out: &mut Out, node: NodeId, send_close: bool) {
         if send_close {
-            self.send(out, addr, &TrackerMsg::Close);
+            self.send(out, &node, &TrackerMsg::Close);
         }
-        let Some(s) = self.sessions.remove(&addr) else { return };
-        if let Some(id) = s.node
-            && self.by_node.get(&id) == Some(&addr)
-        {
-            self.by_node.remove(&id);
-            self.unindex(id, s.certs.into_keys());
+        let Some(c) = self.clients.remove(&node) else { return };
+        for s in [c.current, c.next].into_iter().flatten() {
+            self.by_idx.remove(&s.local_idx);
         }
-        log::info!("Server | {addr} Session dropped");
+        self.unindex(node, c.certs.into_keys());
+        log::info!("Server | node {:#} {} dropped", show(node), c.addr);
     }
 
     /// The online member `node` of `group`: its certificate and address.
     fn member(&self, group: &GroupId, node: &NodeId) -> Option<(Cert, SocketAddr)> {
-        let addr = *self.by_node.get(node)?;
-        Some((self.sessions.get(&addr)?.certs.get(group)?.clone(), addr))
+        let c = self.clients.get(node)?;
+        Some((c.certs.get(group)?.clone(), c.addr))
     }
 
-    fn announce(&mut self, out: &mut Out, addr: SocketAddr, node: NodeId, certs: Vec<Cert>, sig: Signature) {
-        let s = self.sessions.get_mut(&addr).unwrap();
-        // Only the key owner can sign this session's transcript: no announcing someone else's key,
-        // and a signature captured from another session does not verify here.
-        if node.verifying_key().verify_strict(s.crypto.announce_msg(), &sig).is_err() {
-            log::info!("Server | {addr} announce of {:#} with an invalid signature ignored", show(node));
+    /// Tells the other online members of `node`'s groups where it is.
+    fn notify_members(&self, out: &mut Out, node: NodeId) {
+        let Some(c) = self.clients.get(&node) else { return };
+        for (g, cert) in &c.certs {
+            for m in self.groups.get(g).into_iter().flatten().filter(|m| **m != node) {
+                self.send(out, m, &TrackerMsg::Found { cert: Box::new(cert.clone()), addr: c.addr });
+            }
+        }
+    }
+
+    fn handshake(&mut self, out: &mut Out, packet: &[u8], wire_len: usize, from: SocketAddr) {
+        let Some(acc) = tunnel::server_read(&self.identity, packet) else { return };
+        let node = acc.node;
+        // anti-probing: stale or replayed handshakes get no answer at all
+        if !tunnel::fresh(acc.timestamp) || self.last_ts.get(&node).is_some_and(|(t, _)| acc.timestamp <= *t) {
+            log::debug!("Server | stale or replayed handshake from {from} ignored");
             return;
         }
-        if s.node.is_some_and(|prev| prev != node) {
-            self.drop_session(out, addr, true);
+        self.last_ts.insert(node, (acc.timestamp, Instant::now()));
+        let idx = self.fresh_idx();
+        let Some((session, reply)) = acc.reply(&self.keys, idx, wire_len) else { return };
+        let session = Arc::new(session);
+        self.by_idx.insert(idx, (node, session.clone()));
+        let new = !self.clients.contains_key(&node);
+        let c = self.clients.entry(node).or_insert_with(|| Client {
+            addr: from,
+            current: None,
+            next: None,
+            certs: HashMap::new(),
+            announced: false,
+            last_seen: Instant::now(),
+        });
+        if let Some(old) = c.next.replace(session) {
+            self.by_idx.remove(&old.local_idx);
+        }
+        if new {
+            log::info!("Server | New session from {from} node: {:#}", show(node));
+        }
+        out.push((reply, from));
+    }
+
+    fn data(&mut self, out: &mut Out, packet: &mut [u8], from: SocketAddr) {
+        let Some(idx) = packet.get(3..7).map(|b| u32::from_le_bytes(b.try_into().unwrap())) else { return };
+        let Some((node, session)) = self.by_idx.get(&idx).cloned() else { return };
+        if !session.usable() {
             return;
         }
-        s.last_announce = Instant::now();
+        let Some(plain) = session.open(packet) else { return };
+        let Some(c) = self.clients.get_mut(&node) else { return };
+        c.last_seen = Instant::now();
+        if c.next.as_ref().is_some_and(|n| Arc::ptr_eq(n, &session)) {
+            // the client uses its new session: switch to it
+            if let Some(old) = c.current.replace(c.next.take().unwrap()) {
+                self.by_idx.remove(&old.local_idx);
+            }
+        }
+        let moved = c.addr != from;
+        if moved {
+            // authenticated packet from a new address: the client's NAT mapping changed
+            log::info!("Server | node {:#} moved {} -> {from}", show(node), c.addr);
+            c.addr = from;
+        }
+        let announced = c.announced;
+        if moved && announced {
+            self.notify_members(out, node);
+        }
+        match TrackerMsg::decode(&packet[plain]) {
+            Some(TrackerMsg::Announce { certs }) => self.announce(out, node, certs),
+            Some(TrackerMsg::Sync(msg)) => self.sync(out, node, msg),
+            Some(TrackerMsg::Close) => self.drop_client(out, node, false),
+            Some(TrackerMsg::Found { .. }) => {}
+            None => log::info!("Server | {from} decode error"),
+        }
+    }
+
+    fn announce(&mut self, out: &mut Out, node: NodeId, certs: Vec<Cert>) {
         let now = now_unix();
         let mut valid: HashMap<GroupId, Cert> = HashMap::new();
         for c in certs.into_iter().take(MAX_ANNOUNCE_CERTS) {
             let group = c.body.group;
             match c.verify(&group, Some(now)) {
-                Ok(()) if c.body.node != node => log::info!("Server | {addr} certificate of another node ignored"),
+                Ok(()) if c.body.node != node => {
+                    log::info!("Server | {:#}: certificate of another node ignored", show(node))
+                }
                 Ok(()) if !Membership::of(&self.store, &group).admits(&c) => {
-                    log::info!("Server | {addr} {:#}: revoked in group {}", show(node), group.short())
+                    log::info!("Server | {:#}: revoked in group {}", show(node), group.short())
                 }
                 Ok(()) => {
                     if let Some(jk) = c.join_key() {
                         let first = *self.joins.entry(jk).or_insert(node);
                         if first != node {
-                            log::info!("Server | {addr} {:#}: invite already used by {:#}", show(node), show(first));
+                            log::info!("Server | {:#}: invite already used by {:#}", show(node), show(first));
                             continue;
                         }
                     }
                     valid.insert(group, c);
                 }
-                Err(e) => log::info!("Server | {addr} {:#}: {e}", show(node)),
+                Err(e) => log::info!("Server | {:#}: {e}", show(node)),
             }
         }
-        let s = self.sessions.get_mut(&addr).unwrap();
-
-        let first = s.node.is_none();
-        let changed = first || s.certs != valid;
-        let left: Vec<GroupId> = s.certs.keys().filter(|g| !valid.contains_key(g)).copied().collect();
-        s.node = Some(node);
-        s.certs = valid;
-        if first {
-            // The newest address wins: the node probably restarted or its NAT mapping changed.
-            if let Some(old) = self.by_node.insert(node, addr)
-                && old != addr
-            {
-                self.drop_session(out, old, true);
-                self.by_node.insert(node, addr);
-            }
-            log::info!("Server | Session {addr} node: {:#}", show(node));
-        }
+        let Some(c) = self.clients.get_mut(&node) else { return };
+        let changed = !c.announced || c.certs != valid;
+        let left: Vec<GroupId> = c.certs.keys().filter(|g| !valid.contains_key(g)).copied().collect();
+        c.announced = true;
+        c.certs = valid;
+        let addr = c.addr;
         self.unindex(node, left);
 
-        let groups: Vec<GroupId> = self.sessions[&addr].certs.keys().copied().collect();
+        let groups: Vec<GroupId> = self.clients[&node].certs.keys().copied().collect();
         for g in groups {
             let members = self.groups.entry(g).or_default();
             if members.insert(node) {
@@ -154,9 +242,9 @@ impl State {
             // included); the others hear about it when it is new or its certificate changed.
             for m in members {
                 let Some((cert, m_addr)) = self.member(&g, &m) else { continue };
-                self.send(out, addr, &TrackerMsg::Found { cert: Box::new(cert), addr: m_addr });
+                self.send(out, &node, &TrackerMsg::Found { cert: Box::new(cert), addr: m_addr });
                 if changed && m != node {
-                    self.send(out, m_addr, &TrackerMsg::Found { cert: Box::new(mine.clone()), addr });
+                    self.send(out, &m, &TrackerMsg::Found { cert: Box::new(mine.clone()), addr });
                 }
             }
         }
@@ -164,13 +252,13 @@ impl State {
 
     /// Group records from a member: answer, store, pass new ones on to the other online members,
     /// and drop members that the new records revoked.
-    fn sync(&mut self, out: &mut Out, addr: SocketAddr, msg: SyncMsg) {
-        let Some(groups) = self.sessions.get(&addr).map(|s| s.certs.keys().copied().collect::<HashSet<_>>()) else {
+    fn sync(&mut self, out: &mut Out, node: NodeId, msg: SyncMsg) {
+        let Some(groups) = self.clients.get(&node).map(|c| c.certs.keys().copied().collect::<HashSet<_>>()) else {
             return;
         };
         let (replies, changed) = msg.handle(&self.store, |g| groups.contains(g));
         for r in replies {
-            self.send(out, addr, &TrackerMsg::Sync(r));
+            self.send(out, &node, &TrackerMsg::Sync(r));
         }
         let mut by_group: HashMap<GroupId, Vec<Entry>> = HashMap::new();
         for e in changed {
@@ -182,17 +270,17 @@ impl State {
             let membership = Membership::of(&self.store, &g);
             let members: Vec<NodeId> = self.groups.get(&g).map(|m| m.iter().copied().collect()).unwrap_or_default();
             for m in members {
-                let Some((cert, m_addr)) = self.member(&g, &m) else { continue };
+                let Some((cert, _)) = self.member(&g, &m) else { continue };
                 // a revoked member gets the records too, so it knows why nobody answers
-                if m_addr != addr {
+                if m != node {
                     for msg in SyncMsg::records(records.clone()) {
-                        self.send(out, m_addr, &TrackerMsg::Sync(msg));
+                        self.send(out, &m, &TrackerMsg::Sync(msg));
                     }
                 }
                 if !membership.admits(&cert) {
                     log::info!("Server | node {:#} revoked in group {}", show(m), g.short());
-                    if let Some(s) = self.sessions.get_mut(&m_addr) {
-                        s.certs.remove(&g);
+                    if let Some(c) = self.clients.get_mut(&m) {
+                        c.certs.remove(&g);
                     }
                     self.unindex(m, [g]);
                 }
@@ -200,69 +288,57 @@ impl State {
         }
     }
 
-    fn handle(&mut self, identity: &SigningKey, packet: &[u8], from: SocketAddr) -> Out {
+    /// Handles one datagram; returns the datagrams to send. Anything that is not an
+    /// authenticated packet of a session, or a fresh handshake, gets no answer.
+    pub fn handle(&mut self, packet: &[u8], from: SocketAddr) -> Out {
         let mut out = Out::new();
-        match packet.first() {
-            Some(&HELLO) => {
-                let Some((ack, crypto)) = server_accept(packet, identity) else {
-                    log::info!("Server | Invalid hello from {from}");
-                    return out;
-                };
-                if self.sessions.contains_key(&from) {
-                    self.drop_session(&mut out, from, false);
-                }
-                self.sessions
-                    .insert(from, Session { crypto, node: None, certs: HashMap::new(), last_announce: Instant::now() });
-                out.push((ack, from));
-                log::info!("Server | New session from {from}");
-            }
-            Some(&TRACKER) => {
-                let Some(s) = self.sessions.get_mut(&from) else { return out };
-                let Some(plain) = s.crypto.open(packet) else {
-                    log::info!("Server | Packet from {from} Invalid Data");
-                    return out;
-                };
-                match TrackerMsg::decode(&plain) {
-                    Some(TrackerMsg::Announce { node, certs, sig }) => self.announce(&mut out, from, node, certs, sig),
-                    Some(TrackerMsg::Close) => {
-                        self.drop_session(&mut out, from, false);
-                        log::info!("Server | connection close from {from}");
-                    }
-                    Some(TrackerMsg::Sync(msg)) => self.sync(&mut out, from, msg),
-                    Some(TrackerMsg::Found { .. }) => {}
-                    None => {
-                        log::info!("Server | Packet from {from} decode error");
-                        self.drop_session(&mut out, from, true);
-                    }
-                }
-            }
+        let mut p = packet.to_vec();
+        let Some(len) = self.keys.obfs.open(&mut p) else { return out };
+        let p = &mut p[..len];
+        match p[0] {
+            HS_INIT => self.handshake(&mut out, p, packet.len(), from),
+            DATA => self.data(&mut out, p, from),
             _ => {}
         }
         out
     }
 
-    fn collect_garbage(&mut self) -> Out {
+    /// Drops silent clients and expired sessions. Call every few seconds.
+    pub fn collect_garbage(&mut self) -> Out {
         let mut out = Out::new();
-        let expired: Vec<_> =
-            self.sessions.iter().filter(|(_, s)| s.last_announce.elapsed() > TIMEOUT).map(|(a, _)| *a).collect();
-        for addr in expired {
-            self.drop_session(&mut out, addr, true);
+        let silent: Vec<NodeId> =
+            self.clients.iter().filter(|(_, c)| c.last_seen.elapsed() > TIMEOUT).map(|(n, _)| *n).collect();
+        for n in silent {
+            self.drop_client(&mut out, n, true);
         }
+        let dead: Vec<u32> = self.by_idx.iter().filter(|(_, (_, s))| !s.usable()).map(|(i, _)| *i).collect();
+        for i in dead {
+            if let Some((node, s)) = self.by_idx.remove(&i)
+                && let Some(c) = self.clients.get_mut(&node)
+            {
+                for slot in [&mut c.current, &mut c.next] {
+                    if slot.as_ref().is_some_and(|x| Arc::ptr_eq(x, &s)) {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+        self.last_ts.retain(|_, (_, at)| at.elapsed() < MAX_SKEW * 2);
         out
     }
 }
 
-pub async fn run(sock: UdpSocket, identity: SigningKey) {
+pub async fn run(sock: UdpSocket, identity: Identity) {
     let sock = Arc::new(sock);
-    let state = Arc::new(Mutex::new(State::default()));
+    let server = Arc::new(Mutex::new(Server::new(identity)));
 
     let gc = {
-        let (sock, state) = (sock.clone(), state.clone());
+        let (sock, server) = (sock.clone(), server.clone());
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(TIMEOUT / 3);
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
             loop {
                 tick.tick().await;
-                let out = state.lock().collect_garbage();
+                let out = server.lock().collect_garbage();
                 for (p, a) in out {
                     let _ = sock.send_to(&p, a).await;
                 }
@@ -279,7 +355,7 @@ pub async fn run(sock: UdpSocket, identity: SigningKey) {
                 continue;
             }
         };
-        let out = state.lock().handle(&identity, &buf[..n], from);
+        let out = server.lock().handle(&buf[..n], from);
         for (p, a) in out {
             if let Err(e) = sock.send_to(&p, a).await {
                 log::info!("Server | send to {a} error: {e}");
@@ -294,40 +370,60 @@ pub async fn run(sock: UdpSocket, identity: SigningKey) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{ClientHandshake, random_bytes};
     use crate::group::{CertBody, GroupSecret};
-    use crate::identity::Identity;
     use crate::state::Body;
+    use crate::tunnel::{client_finish, client_hello};
 
     struct Client {
+        id: Identity,
         addr: SocketAddr,
-        session: TrackerSession,
+        keys: TrackerKeys,
+        session: Session,
     }
 
-    fn connect(st: &mut State, server: &SigningKey, addr: &str) -> Client {
+    fn unmask(keys: &TrackerKeys, p: &[u8]) -> Vec<u8> {
+        let mut p = p.to_vec();
+        let n = keys.obfs.open(&mut p).unwrap();
+        p.truncate(n);
+        p
+    }
+
+    fn connect_as(st: &mut Server, id: Identity, addr: &str) -> Client {
         let addr = addr.parse().unwrap();
-        let hs = ClientHandshake::new();
-        let out = st.handle(server, &hs.hello(), addr);
-        let session = hs.finish(&out[0].0, &server.verifying_key()).unwrap();
-        Client { addr, session }
+        let keys = TrackerKeys::new(st.id());
+        let (packets, hello) = client_hello(&keys, &id, rand::random()).unwrap();
+        let out = st.handle(packets.last().unwrap(), addr);
+        let session = client_finish(&keys, &hello, &unmask(&keys, &out[0].0)).unwrap();
+        Client { id, addr, keys, session }
+    }
+
+    fn connect(st: &mut Server, addr: &str) -> Client {
+        connect_as(st, Identity::generate(), addr)
+    }
+
+    fn seal(c: &Client, msg: &TrackerMsg) -> Vec<u8> {
+        let body = msg.encode();
+        let mut buf = vec![0u8; DATA_HDR + body.len() + TAG_LEN + MAX_PAD];
+        buf[DATA_HDR..DATA_HDR + body.len()].copy_from_slice(&body);
+        let n = c.session.seal(&mut buf, body.len()).unwrap();
+        buf.truncate(n);
+        buf
+    }
+
+    fn open(c: &Client, p: &[u8]) -> TrackerMsg {
+        let mut p = unmask(&c.keys, p);
+        let r = c.session.open(&mut p).unwrap();
+        TrackerMsg::decode(&p[r]).unwrap()
     }
 
     /// Sends `msg` from `c`, returns the replies addressed to `c`.
-    fn send(st: &mut State, server: &SigningKey, c: &mut Client, msg: &TrackerMsg) -> Vec<TrackerMsg> {
-        let packet = c.session.seal(&msg.encode());
-        st.handle(server, &packet, c.addr)
-            .into_iter()
-            .filter(|(_, to)| *to == c.addr)
-            .map(|(p, _)| TrackerMsg::decode(&c.session.open(&p).unwrap()).unwrap())
-            .collect()
+    fn send(st: &mut Server, c: &Client, msg: &TrackerMsg) -> Vec<TrackerMsg> {
+        let out = st.handle(&seal(c, msg), c.addr);
+        out.into_iter().filter(|(_, to)| *to == c.addr).map(|(p, _)| open(c, &p)).collect()
     }
 
-    fn announce(id: &Identity, certs: Vec<Cert>, signed_in: &TrackerSession) -> TrackerMsg {
-        TrackerMsg::Announce { node: id.id(), certs, sig: id.sign(signed_in.announce_msg()) }
-    }
-
-    fn cert(g: &GroupSecret, id: &Identity) -> Cert {
-        g.issue(CertBody::new(id.id(), "n", vec![]))
+    fn cert(g: &GroupSecret, c: &Client) -> Cert {
+        g.issue(CertBody::new(c.id.id(), "n", vec![]))
     }
 
     fn found(msgs: &[TrackerMsg]) -> Vec<(NodeId, SocketAddr)> {
@@ -342,151 +438,148 @@ mod tests {
         v
     }
 
+    fn server() -> Server {
+        Server::new(Identity::generate())
+    }
+
     #[test]
-    fn own_key_announce_accepted() {
-        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
-        let (me, g) = (Identity::generate(), GroupSecret::generate());
-        let mut c = connect(&mut st, &server, "198.51.100.1:4000");
-        let msg = announce(&me, vec![cert(&g, &me)], &c.session);
-        let replies = send(&mut st, &server, &mut c, &msg);
-        assert_eq!(found(&replies), vec![(me.id(), c.addr)]);
-        assert_eq!(st.by_node.get(&me.id()), Some(&c.addr));
-        assert!(st.groups[&g.id()].contains(&me.id()));
+    fn announce_accepted() {
+        let mut st = server();
+        let g = GroupSecret::generate();
+        let c = connect(&mut st, "198.51.100.1:4000");
+        let replies = send(&mut st, &c, &TrackerMsg::Announce { certs: vec![cert(&g, &c)] });
+        assert_eq!(found(&replies), vec![(c.id.id(), c.addr)]);
+        assert!(st.groups[&g.id()].contains(&c.id.id()));
+    }
+
+    #[test]
+    fn probes_and_replays_get_no_answer() {
+        let mut st = server();
+        let from: SocketAddr = "203.0.113.66:4000".parse().unwrap();
+        for len in [0, 1, 40, 200, 1400] {
+            let junk: Vec<u8> = (0..len).map(|_| rand::random()).collect();
+            assert!(st.handle(&junk, from).is_empty(), "answered {len} random bytes");
+        }
+        let id = Identity::generate();
+        let keys = TrackerKeys::new(st.id());
+        let (packets, _) = client_hello(&keys, &id, 1).unwrap();
+        let init = packets.last().unwrap();
+        for junk in &packets[..packets.len() - 1] {
+            assert!(st.handle(junk, from).is_empty());
+        }
+        let out = st.handle(init, from);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].0.len() <= init.len(), "answer larger than the request");
+        assert!(st.handle(init, from).is_empty(), "replayed handshake answered");
+        assert!(st.handle(init, "198.51.100.9:1".parse().unwrap()).is_empty(), "replay from elsewhere answered");
+        // a handshake for another tracker
+        let other = TrackerKeys::new(Identity::generate().id());
+        let (packets, _) = client_hello(&other, &id, 2).unwrap();
+        assert!(st.handle(packets.last().unwrap(), from).is_empty());
+    }
+
+    #[test]
+    fn session_survives_address_change() {
+        let mut st = server();
+        let g = GroupSecret::generate();
+        let a = connect(&mut st, "198.51.100.1:4000");
+        let mut b = connect(&mut st, "198.51.100.2:4000");
+        send(&mut st, &a, &TrackerMsg::Announce { certs: vec![cert(&g, &a)] });
+        send(&mut st, &b, &TrackerMsg::Announce { certs: vec![cert(&g, &b)] });
+        // b's NAT gives it a new address: the same session goes on, a learns the new address
+        b.addr = "198.51.100.22:5000".parse().unwrap();
+        let out = st.handle(&seal(&b, &TrackerMsg::Announce { certs: vec![cert(&g, &b)] }), b.addr);
+        let to_a: Vec<_> = out.iter().filter(|(_, t)| *t == a.addr).map(|(p, _)| open(&a, p)).collect();
+        assert!(found(&to_a).contains(&(b.id.id(), b.addr)), "a told about b's new address");
+        assert_eq!(st.clients[&b.id.id()].addr, b.addr);
     }
 
     #[test]
     fn members_find_each_other_without_search() {
-        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
+        let mut st = server();
         let (g, other) = (GroupSecret::generate(), GroupSecret::generate());
-        let (a, b, x) = (Identity::generate(), Identity::generate(), Identity::generate());
-        let mut ca = connect(&mut st, &server, "198.51.100.1:4000");
-        let mut cb = connect(&mut st, &server, "198.51.100.2:4000");
-        let mut cx = connect(&mut st, &server, "198.51.100.3:4000");
-        let m = announce(&a, vec![cert(&g, &a)], &ca.session);
-        send(&mut st, &server, &mut ca, &m);
-        let m = announce(&x, vec![cert(&other, &x)], &cx.session);
-        send(&mut st, &server, &mut cx, &m);
+        let a = connect(&mut st, "198.51.100.1:4000");
+        let b = connect(&mut st, "198.51.100.2:4000");
+        let x = connect(&mut st, "198.51.100.3:4000");
+        send(&mut st, &a, &TrackerMsg::Announce { certs: vec![cert(&g, &a)] });
+        send(&mut st, &x, &TrackerMsg::Announce { certs: vec![cert(&other, &x)] });
 
         // b comes online: it learns a (and itself), and a learns b in the same step
         let b_cert = cert(&g, &b);
-        let m = announce(&b, vec![b_cert.clone()], &cb.session);
-        let packet = cb.session.seal(&m.encode());
-        let out = st.handle(&server, &packet, cb.addr);
-        let to = |c: &mut Client| -> Vec<TrackerMsg> {
-            out.iter()
-                .filter(|(_, t)| *t == c.addr)
-                .map(|(p, _)| TrackerMsg::decode(&c.session.open(p).unwrap()).unwrap())
-                .collect()
+        let out = st.handle(&seal(&b, &TrackerMsg::Announce { certs: vec![b_cert.clone()] }), b.addr);
+        let to = |c: &Client| -> Vec<TrackerMsg> {
+            out.iter().filter(|(_, t)| *t == c.addr).map(|(p, _)| open(c, p)).collect()
         };
-        let mut want = vec![(a.id(), ca.addr), (b.id(), cb.addr)];
+        let mut want = vec![(a.id.id(), a.addr), (b.id.id(), b.addr)];
         want.sort();
-        assert_eq!(found(&to(&mut cb)), want);
-        assert_eq!(found(&to(&mut ca)), vec![(b.id(), cb.addr)]);
-        assert!(to(&mut cx).is_empty(), "another group hears nothing");
+        assert_eq!(found(&to(&b)), want);
+        assert_eq!(found(&to(&a)), vec![(b.id.id(), b.addr)]);
+        assert!(to(&x).is_empty(), "another group hears nothing");
 
         // a later announce refreshes b's view but does not notify a again
-        let m = announce(&b, vec![b_cert], &cb.session);
-        let packet = cb.session.seal(&m.encode());
-        let out = st.handle(&server, &packet, cb.addr);
-        assert!(out.iter().all(|(_, t)| *t == cb.addr));
+        let out = st.handle(&seal(&b, &TrackerMsg::Announce { certs: vec![b_cert] }), b.addr);
+        assert!(out.iter().all(|(_, t)| *t == b.addr));
         assert_eq!(out.len(), 2);
 
         // b leaves: it disappears from the group index
-        let m = TrackerMsg::Close;
-        send(&mut st, &server, &mut cb, &m);
+        send(&mut st, &b, &TrackerMsg::Close);
         assert_eq!(st.groups[&g.id()].len(), 1);
     }
 
     #[test]
     fn invalid_certificates_not_indexed() {
-        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
-        let (g, me, other) = (GroupSecret::generate(), Identity::generate(), Identity::generate());
-        let mut expired = CertBody::new(me.id(), "n", vec![]);
+        let mut st = server();
+        let g = GroupSecret::generate();
+        let c = connect(&mut st, "198.51.100.9:4000");
+        let mut expired = CertBody::new(c.id.id(), "n", vec![]);
         expired.not_after = 1;
-        let mut forged = cert(&g, &me);
+        let mut forged = cert(&g, &c);
         forged.body.name = "admin".into();
-        for bad in [g.issue(expired), cert(&g, &other), forged] {
-            let mut c = connect(&mut st, &server, "198.51.100.9:4000");
-            let msg = announce(&me, vec![bad], &c.session);
-            assert!(found(&send(&mut st, &server, &mut c, &msg)).is_empty());
+        let someone_else = g.issue(CertBody::new(Identity::generate().id(), "n", vec![]));
+        for bad in [g.issue(expired), someone_else, forged] {
+            assert!(found(&send(&mut st, &c, &TrackerMsg::Announce { certs: vec![bad] })).is_empty());
             assert!(st.groups.is_empty());
         }
     }
 
     #[test]
     fn invite_works_for_one_node_only() {
-        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
+        let mut st = server();
         let g = GroupSecret::generate();
         let join = g.grant_join(CertBody::new(Identity::generate().id(), "n", vec![]), u64::MAX);
-        let (a, b) = (Identity::generate(), Identity::generate());
-        let mut ca = connect(&mut st, &server, "198.51.100.1:4000");
-        let m = announce(&a, vec![join.enroll(a.id())], &ca.session);
-        assert_eq!(found(&send(&mut st, &server, &mut ca, &m)).len(), 1);
-        let mut cb = connect(&mut st, &server, "198.51.100.2:4000");
-        let m = announce(&b, vec![join.enroll(b.id())], &cb.session);
-        assert!(found(&send(&mut st, &server, &mut cb, &m)).is_empty(), "second use of the invite");
+        let a = connect(&mut st, "198.51.100.1:4000");
+        assert_eq!(found(&send(&mut st, &a, &TrackerMsg::Announce { certs: vec![join.enroll(a.id.id())] })).len(), 1);
+        let b = connect(&mut st, "198.51.100.2:4000");
+        let m = TrackerMsg::Announce { certs: vec![join.enroll(b.id.id())] };
+        assert!(found(&send(&mut st, &b, &m)).is_empty(), "second use of the invite");
         assert_eq!(st.groups[&g.id()].len(), 1);
     }
 
     #[test]
     fn revocation_spreads_and_unindexes() {
-        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
+        let mut st = server();
         let g = GroupSecret::generate();
-        let (a, b) = (Identity::generate(), Identity::generate());
-        let mut ca = connect(&mut st, &server, "198.51.100.1:4000");
-        let mut cb = connect(&mut st, &server, "198.51.100.2:4000");
-        let m = announce(&a, vec![cert(&g, &a)], &ca.session);
-        send(&mut st, &server, &mut ca, &m);
-        let m = announce(&b, vec![cert(&g, &b)], &cb.session);
-        send(&mut st, &server, &mut cb, &m);
+        let a = connect(&mut st, "198.51.100.1:4000");
+        let b = connect(&mut st, "198.51.100.2:4000");
+        send(&mut st, &a, &TrackerMsg::Announce { certs: vec![cert(&g, &a)] });
+        let b_cert = cert(&g, &b);
+        send(&mut st, &b, &TrackerMsg::Announce { certs: vec![b_cert.clone()] });
 
         // a (an admin's node) pushes a revocation of b
         let admin = StateStore::memory();
-        admin.add(&g, Body::Revoke { key: b.id() }, false);
+        admin.add(&g, Body::Revoke { key: b.id.id() }, false);
         let keys: Vec<_> = admin.summary(&g.id()).iter().map(|(k, _)| *k).collect();
-        let msg = TrackerMsg::Sync(SyncMsg::Records { records: admin.get(&g.id(), &keys) });
-        send(&mut st, &server, &mut ca, &msg);
-        assert!(!st.groups[&g.id()].contains(&b.id()), "b left the index");
-        assert!(st.store.revoked(&g.id()).contains(&b.id()));
+        send(&mut st, &a, &TrackerMsg::Sync(SyncMsg::Records { records: admin.get(&g.id(), &keys) }));
+        assert!(!st.groups[&g.id()].contains(&b.id.id()), "b left the index");
+        assert!(st.store.revoked(&g.id()).contains(&b.id.id()));
         // and b cannot come back
-        let m = announce(&b, vec![cert(&g, &b)], &cb.session);
-        assert!(found(&send(&mut st, &server, &mut cb, &m)).is_empty());
+        assert!(found(&send(&mut st, &b, &TrackerMsg::Announce { certs: vec![b_cert] })).is_empty());
 
         // records of a group the sender is not in are refused
         let h = GroupSecret::generate();
-        admin.add(&h, Body::Revoke { key: a.id() }, false);
+        admin.add(&h, Body::Revoke { key: a.id.id() }, false);
         let keys: Vec<_> = admin.summary(&h.id()).iter().map(|(k, _)| *k).collect();
-        let msg = TrackerMsg::Sync(SyncMsg::Records { records: admin.get(&h.id(), &keys) });
-        send(&mut st, &server, &mut ca, &msg);
+        send(&mut st, &a, &TrackerMsg::Sync(SyncMsg::Records { records: admin.get(&h.id(), &keys) }));
         assert!(st.store.revoked(&h.id()).is_empty());
-    }
-
-    #[test]
-    fn foreign_key_announce_rejected() {
-        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
-        let (victim, attacker) = (Identity::generate(), Identity::generate());
-        let mut c = connect(&mut st, &server, "198.51.100.2:4000");
-        // The victim's key, signed with the attacker's own key.
-        let msg =
-            TrackerMsg::Announce { node: victim.id(), certs: vec![], sig: attacker.sign(c.session.announce_msg()) };
-        assert!(send(&mut st, &server, &mut c, &msg).is_empty());
-        assert!(!st.by_node.contains_key(&victim.id()));
-        assert_eq!(st.sessions[&c.addr].node, None);
-    }
-
-    #[test]
-    fn announce_signature_bound_to_session() {
-        let (mut st, server) = (State::default(), SigningKey::from_bytes(&random_bytes()));
-        let (victim, g) = (Identity::generate(), GroupSecret::generate());
-        let mut v = connect(&mut st, &server, "198.51.100.3:4000");
-        let genuine = announce(&victim, vec![cert(&g, &victim)], &v.session);
-        assert_eq!(send(&mut st, &server, &mut v, &genuine).len(), 1);
-
-        // An attacker who captured the victim's (decrypted) announce replays it in its own session
-        // to steal the victim's endpoint.
-        let mut a = connect(&mut st, &server, "203.0.113.66:4000");
-        assert!(send(&mut st, &server, &mut a, &genuine).is_empty());
-        assert_eq!(st.by_node.get(&victim.id()), Some(&v.addr), "endpoint not hijacked");
-        assert_eq!(st.sessions[&a.addr].node, None);
     }
 }

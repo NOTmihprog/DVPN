@@ -61,3 +61,10 @@ path = "fuzz_targets/state_sync.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tracker_packet"
+path = "fuzz_targets/tracker_packet.rs"
+test = false
+doc = false
+bench = false

@@ -560,7 +560,7 @@ async fn run_server(conf: &mut Config, addr: Ipv4Addr, port: u16) {
     log::info!("Public key: {}", encode_b64(&public));
     log::info!("Server started listen: {addr}:{port}");
     tokio::select! {
-        _ = tracker_server::run(sock, key) => {}
+        _ = tracker_server::run(sock, Identity::from_seed(&key.to_bytes())) => {}
         _ = wait_ctrl_c() => {}
     }
     log::info!("Server stopped");
