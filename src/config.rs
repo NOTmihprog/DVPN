@@ -424,6 +424,60 @@ fn parse_dns(t: &Table) -> anyhow::Result<DnsConfig> {
     Ok(d)
 }
 
+/// Writes `exits` as the `[exit]` table of `doc` (none: removes it).
+fn put_exits(doc: &mut DocumentMut, exits: &Exits) {
+    if exits == &Exits::default() {
+        doc.remove("exit");
+    } else {
+        let mut t = Table::new();
+        for (k, v) in [("v4", &exits.v4), ("v6", &exits.v6)] {
+            if !v.is_empty() {
+                let mut arr = toml_edit::Array::new();
+                for e in v {
+                    arr.push(e.as_str());
+                }
+                t[k] = value(arr);
+            }
+        }
+        if let Some(k) = exits.kill_switch {
+            t["kill_switch"] = value(k);
+        }
+        if !exits.dns.is_empty() {
+            let mut arr = toml_edit::Array::new();
+            for d in &exits.dns {
+                arr.push(d.to_string());
+            }
+            t["dns"] = value(arr);
+        }
+        let sources = |v: Vec<String>| {
+            let mut arr = toml_edit::Array::new();
+            v.iter().for_each(|s| arr.push(s.as_str()));
+            value(arr)
+        };
+        if !exits.v4_sources.is_empty() {
+            t["v4_sources"] = sources(exits.v4_sources.iter().map(|n| n.to_string()).collect());
+        }
+        if !exits.v6_sources.is_empty() {
+            t["v6_sources"] = sources(exits.v6_sources.iter().map(|n| n.to_string()).collect());
+        }
+        if let Some(n) = exits.table {
+            t["table"] = value(i64::from(n));
+        }
+        t.decor_mut()
+            .set_prefix("\n# gateways to the internet by priority (names or keys); the first alive one is used\n");
+        doc["exit"] = Item::Table(t);
+    }
+}
+
+/// Replaces `[exit]` in the config file at `path`, leaving the rest as it is: for a running node,
+/// which keeps no `Config` (`dvpn exit` and the API's `set exit` go through here or `set_exits`).
+pub fn write_exits(path: &Path, exits: &Exits) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut doc: DocumentMut = text.parse().with_context(|| format!("parse {}", path.display()))?;
+    put_exits(&mut doc, exits);
+    write_private(path, &doc.to_string()).with_context(|| format!("write {}", path.display()))
+}
+
 /// Reads only `[exit]` from a config file: a running node follows changes to it.
 pub fn read_exits(path: &Path) -> anyhow::Result<Exits> {
     let doc: DocumentMut = std::fs::read_to_string(path)?.parse()?;
@@ -774,47 +828,7 @@ impl Config {
 
     /// Sets `[exit]` (an empty list removes it).
     pub fn set_exits(&mut self, exits: &Exits) {
-        if exits == &Exits::default() {
-            self.doc.remove("exit");
-        } else {
-            let mut t = Table::new();
-            for (k, v) in [("v4", &exits.v4), ("v6", &exits.v6)] {
-                if !v.is_empty() {
-                    let mut arr = toml_edit::Array::new();
-                    for e in v {
-                        arr.push(e.as_str());
-                    }
-                    t[k] = value(arr);
-                }
-            }
-            if let Some(k) = exits.kill_switch {
-                t["kill_switch"] = value(k);
-            }
-            if !exits.dns.is_empty() {
-                let mut arr = toml_edit::Array::new();
-                for d in &exits.dns {
-                    arr.push(d.to_string());
-                }
-                t["dns"] = value(arr);
-            }
-            let sources = |v: Vec<String>| {
-                let mut arr = toml_edit::Array::new();
-                v.iter().for_each(|s| arr.push(s.as_str()));
-                value(arr)
-            };
-            if !exits.v4_sources.is_empty() {
-                t["v4_sources"] = sources(exits.v4_sources.iter().map(|n| n.to_string()).collect());
-            }
-            if !exits.v6_sources.is_empty() {
-                t["v6_sources"] = sources(exits.v6_sources.iter().map(|n| n.to_string()).collect());
-            }
-            if let Some(n) = exits.table {
-                t["table"] = value(i64::from(n));
-            }
-            t.decor_mut()
-                .set_prefix("\n# gateways to the internet by priority (names or keys); the first alive one is used\n");
-            self.doc["exit"] = Item::Table(t);
-        }
+        put_exits(&mut self.doc, exits);
         self.exits = exits.clone();
     }
 

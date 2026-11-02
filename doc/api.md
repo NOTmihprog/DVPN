@@ -64,6 +64,7 @@
 | `name_not_str`, `addr_validate_error`, `endpoint_validate_error`, `sub_args_not_dict`, `force_not_bool` | `set peer`: неверное поле |
 | `peer_not_exist`, `error_delete_self_peer` | `del` |
 | `not_int`, `out_of_range`, `route_exist`, `route_not_exist`, `not_permission` | `route` |
+| `gateway_unknown`, `gateway_self`, `dns_invalid`, `sources_invalid`, `table_invalid`, `config_write` | `set exit` |
 
 Узлы везде обозначаются полем `key` — публичным ключом узла (base64url). В запросах можно передать однозначное
 начало ключа или имя участника.
@@ -151,6 +152,43 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 Исключённый узел, сертификат которого этот узел не видел, приходит с `name`, `not_after`, `days` = nil и пустыми
 списками.
 
+### Выход в интернет и доступ
+
+| `req` | параметры | результат |
+|---|---|---|
+| `exit` | | `[exit]` и выбранные шлюзы, см. [ниже](#exit) |
+| `acl` | | правила доступа группы, см. [ниже](#acl) |
+
+#### exit
+
+```
+{
+  "v4": [{"gateway": "vps",                     # как записано в [exit]: имя или ключ
+          "key": "..." | nil, "name": "vps" | nil,   # кого это значит (nil — неизвестный участник)
+          "alive": true}],                      # есть путь до него
+  "v6": [...],
+  "kill_switch": true,                          # действует ли kill switch (по умолчанию да)
+  "dns": ["1.1.1.1"],                           # DNS через шлюз
+  "sources": ["10.10.33.2/32"],                 # через шлюз только эти источники (v4 и v6 вместе)
+  "table": 100 | nil,                           # своя таблица маршрутизации
+  "active": {"v4": {"key", "name"} | nil, "v6": ...},   # шлюз, через который идёт интернет сейчас
+  "blocked": {"v4": false, "v6": false}         # kill switch блокирует интернет: шлюзы есть, живых нет
+}
+```
+
+#### acl
+
+```
+{
+  "set": true,                                  # админ задал правила (false — все ко всем)
+  "default": "deny",
+  "toml": "default = \"deny\"\n...",            # как dvpn acl show: имена вместо ключей
+  "tags": {"servers": ["vps"]},
+  "rules": [{"from": ["alice"], "to": ["servers"], "proto": "tcp",     # any, tcp, udp, icmp
+             "ports": [[22, 22], [8000, 8080]], "allow": true}]
+}
+```
+
 ### Участники и серверы
 
 | `req` | параметры | результат |
@@ -191,6 +229,26 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 запуска узла.
 
 ## set / del
+
+### set exit
+
+То же, что `dvpn exit`: узел пишет `[exit]` в свой `config.toml` (остальной файл не трогает) и сразу выбирает
+шлюзы заново. Ответ — как у `get exit`.
+
+```
+{"type": "set", "id": 7, "req": "exit",
+ "v4": ["vps", "home"], "v6": [],               # шлюзы по приоритету: имена или ключи; [] или nil — нет
+ "kill_switch": false,                          # nil — по умолчанию (включён)
+ "dns": ["1.1.1.1"], "sources": ["10.10.33.2"], # списки целиком заменяют старые
+ "table": 100,                                  # nil — убрать
+ "clear": true}                                 # сначала убрать весь [exit]
+```
+
+Поля, которых нет, не меняются. Ошибки: `gateway_unknown` (не ключ и не имя ровно одного участника, или
+исключённый), `gateway_self`, `dns_invalid`, `sources_invalid`, `table_invalid` (0, 253–255 и таблица DVPN
+заняты), `bad_param`, `config_write` (не удалось записать `config.toml`). При ошибке ничего не меняется.
+
+### set peer / del
 
 `{"type": "set", "id": 2, "req": "peer", "key": "...", "name": "...", "addr": "10.10.33.5",
 "endpoint": ["1.2.3.4", 5000], "sub_args": {...}, "force": false}` — поля, которых нет, не меняются; с

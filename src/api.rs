@@ -369,6 +369,26 @@ fn error_msg(code: &str, msg: &str, extra: Vec<(&str, Value)>) -> Value {
     map(v)
 }
 
+/// A field as sent, nil included (`field` takes nil for missing).
+fn raw_field<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+    v.as_map()?.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v)
+}
+
+/// A list of strings: None if not given, empty for nil; trimmed, empty ones dropped.
+fn str_list(p: &Value, key: &str) -> Result<Option<Vec<String>>, ApiError> {
+    match raw_field(p, key) {
+        None => Ok(None),
+        Some(Value::Nil) => Ok(Some(Vec::new())),
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|v| v.as_str().map(|s| s.trim().to_owned()).ok_or_else(|| bad_param(key, "expected strings")))
+            .filter(|r| r.as_ref().map_or(true, |s| !s.is_empty()))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(bad_param(key, "expected a list of strings")),
+    }
+}
+
 /// `min..=max` as `[min, max]`.
 fn range<T: Copy + Into<Value>>(r: &std::ops::RangeInclusive<T>) -> Value {
     Value::Array(vec![(*r.start()).into(), (*r.end()).into()])
@@ -710,6 +730,186 @@ impl Api {
         Value::Array(out)
     }
 
+    /// Member names by key, from every certificate we know of.
+    fn names(&self) -> HashMap<NodeId, String> {
+        self.node.member_certs().into_iter().map(|c| (c.body.node, c.body.name)).collect()
+    }
+
+    /// A gateway as `[exit]` names it: a node key, or the name of exactly one member.
+    fn resolve_gateway(names: &HashMap<NodeId, String>, s: &str) -> Option<NodeId> {
+        if let Ok(k) = s.parse() {
+            return Some(k);
+        }
+        let mut hits = names.iter().filter(|(_, n)| n.as_str() == s).map(|(k, _)| *k);
+        match (hits.next(), hits.next()) {
+            (Some(k), None) => Some(k),
+            _ => None,
+        }
+    }
+
+    /// `get exit`: `[exit]`, the gateways in use and the kill switch.
+    fn exit_info(&self) -> Value {
+        let n = &self.node;
+        let (e, gw4, gw6, (block4, block6)) = n.exit_detail();
+        let names = self.names();
+        let list = |l: &[String]| {
+            Value::Array(
+                l.iter()
+                    .map(|g| {
+                        let id = Self::resolve_gateway(&names, g);
+                        map(vec![
+                            ("gateway", g.as_str().into()),
+                            ("key", opt_str(id.map(|i| i.to_string()))),
+                            ("name", opt_str(id.and_then(|i| names.get(&i).cloned()))),
+                            ("alive", id.is_some_and(|i| n.reachable(&i)).into()),
+                        ])
+                    })
+                    .collect(),
+            )
+        };
+        let active = |id: Option<NodeId>| {
+            id.map_or(Value::Nil, |i| {
+                map(vec![("key", i.to_string().into()), ("name", opt_str(names.get(&i).cloned()))])
+            })
+        };
+        let strings = |v: Vec<String>| Value::Array(v.into_iter().map(Value::from).collect());
+        map(vec![
+            ("v4", list(&e.v4)),
+            ("v6", list(&e.v6)),
+            ("kill_switch", e.kill_switch().into()),
+            ("dns", strings(e.dns.iter().map(|d| d.to_string()).collect())),
+            ("sources", strings(e.sources().iter().map(|s| s.to_string()).collect())),
+            ("table", e.table.map_or(Value::Nil, Value::from)),
+            ("active", map(vec![("v4", active(gw4)), ("v6", active(gw6))])),
+            ("blocked", map(vec![("v4", block4.into()), ("v6", block6.into())])),
+        ])
+    }
+
+    /// `set exit`: changes `[exit]` like `dvpn exit`. Fields not given stay; a list given
+    /// replaces the old one (empty or nil: none); `kill_switch` / `table` nil: the default;
+    /// `clear: true` starts from no `[exit]` at all. Answers like `get exit`.
+    fn set_exit(&self, p: &Value) -> Reply {
+        let n = &self.node;
+        let me = n.storage.self_id();
+        let mut e = n.exit_detail().0;
+        match raw_field(p, "clear") {
+            None | Some(Value::Nil) | Some(Value::Boolean(false)) => {}
+            Some(Value::Boolean(true)) => e = crate::config::Exits::default(),
+            Some(_) => return Err(bad_param("clear", "expected true or false")),
+        }
+        let names = self.names();
+        let revoked = n.group_store().revoked(&n.group_id());
+        for (k, list) in [("v4", &mut e.v4), ("v6", &mut e.v6)] {
+            let Some(given) = str_list(p, k)? else { continue };
+            for g in &given {
+                match Self::resolve_gateway(&names, g) {
+                    None => {
+                        return Err(ApiError::new(
+                            "gateway_unknown",
+                            format!("{k}: {g}: not a node key nor the name of one member"),
+                        ));
+                    }
+                    Some(id) if id == me => {
+                        return Err(ApiError::new("gateway_self", format!("{k}: {g} is this node")));
+                    }
+                    Some(id) if revoked.contains(&id) => {
+                        return Err(ApiError::new("gateway_unknown", format!("{k}: {g} is revoked")));
+                    }
+                    Some(_) => {}
+                }
+            }
+            *list = given;
+        }
+        match raw_field(p, "kill_switch") {
+            None => {}
+            Some(Value::Nil) => e.kill_switch = None,
+            Some(Value::Boolean(b)) => e.kill_switch = Some(*b),
+            Some(_) => return Err(bad_param("kill_switch", "expected true, false or nil")),
+        }
+        if let Some(dns) = str_list(p, "dns")? {
+            e.dns = dns
+                .iter()
+                .map(|s| s.parse().map_err(|_| ApiError::new("dns_invalid", format!("dns: {s} is not an IP address"))))
+                .collect::<Result<_, _>>()?;
+        }
+        if let Some(sources) = str_list(p, "sources")? {
+            (e.v4_sources, e.v6_sources) = (Vec::new(), Vec::new());
+            for s in &sources {
+                let net = s
+                    .parse::<ipnet::IpNet>()
+                    .or_else(|_| s.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                    .map_err(|_| ApiError::new("sources_invalid", format!("sources: {s} is not a network")))?;
+                match net {
+                    ipnet::IpNet::V4(n) => e.v4_sources.push(n),
+                    ipnet::IpNet::V6(n) => e.v6_sources.push(n),
+                }
+            }
+        }
+        match raw_field(p, "table") {
+            None => {}
+            Some(Value::Nil) => e.table = None,
+            Some(v) => {
+                let t = v.as_i64().ok_or_else(|| bad_param("table", "expected a table number or nil"))?;
+                e.table =
+                    Some(crate::config::check_table(t).map_err(|err| ApiError::new("table_invalid", err.to_string()))?);
+            }
+        }
+        n.set_exits(&e).map_err(|err| ApiError::new("config_write", format!("{err:#}")))?;
+        Ok(self.exit_info())
+    }
+
+    /// `get acl`: the group's access rules, as TOML (`dvpn acl show`) and taken apart.
+    fn acl_info(&self) -> Value {
+        use crate::acl::{Proto, Who};
+        let n = &self.node;
+        let names = self.names();
+        let name = |id: &NodeId| names.get(id).cloned().unwrap_or_else(|| id.to_string());
+        let acl = n.group_store().acl(&n.group_id());
+        let set = acl.is_some();
+        let acl = acl.unwrap_or_default();
+        let who = |l: &[Who]| {
+            Value::Array(
+                l.iter()
+                    .map(|w| match w {
+                        Who::Anybody => Value::from("*"),
+                        Who::Tag(t) => Value::from(t.as_str()),
+                        Who::Node(id) => Value::from(name(id)),
+                    })
+                    .collect(),
+            )
+        };
+        let rules = acl.rules.iter().map(|r| {
+            let proto = match r.proto {
+                Proto::Any => "any",
+                Proto::Tcp => "tcp",
+                Proto::Udp => "udp",
+                Proto::Icmp => "icmp",
+            };
+            map(vec![
+                ("from", who(&r.from)),
+                ("to", who(&r.to)),
+                ("proto", proto.into()),
+                (
+                    "ports",
+                    Value::Array(r.ports.iter().map(|(a, b)| Value::Array(vec![(*a).into(), (*b).into()])).collect()),
+                ),
+                ("allow", r.allow.into()),
+            ])
+        });
+        let tags = acl
+            .tags
+            .iter()
+            .map(|(t, ids)| (Value::from(t.as_str()), Value::Array(ids.iter().map(|i| Value::from(name(i))).collect())))
+            .collect();
+        map(vec![
+            ("set", set.into()),
+            ("default", if acl.default_deny { "deny" } else { "allow" }.into()),
+            ("toml", acl.to_toml(&name).into()),
+            ("tags", Value::Map(tags)),
+            ("rules", Value::Array(rules.collect())),
+        ])
+    }
+
     /// `key`: a full node key, a unique prefix of a known one or a member name. Errors:
     /// `key_validate_error` (missing, invalid or unknown), `key_ambiguous`.
     fn peer_arg(&self, p: &Value) -> Result<NodeId, ApiError> {
@@ -892,6 +1092,8 @@ impl Api {
             ]),
             "group" => self.group_info(),
             "members" => self.members(),
+            "exit" => self.exit_info(),
+            "acl" => self.acl_info(),
             // nil: no path known now (not an error)
             "path" => match self.node.path(&self.peer_arg(p)?) {
                 Some(hops) => Value::Array(
@@ -907,10 +1109,15 @@ impl Api {
 
     fn handle_set(&self, p: &Value) -> Reply {
         match field(p, "req").and_then(Value::as_str) {
-            Some("peer") => {}
-            Some(other) => return Err(ApiError::new("unknown_request", format!("set {other:?}: no such request"))),
-            None => return Err(bad_param("req", "missing")),
+            Some("peer") => self.set_peer(p),
+            Some("exit") => self.set_exit(p),
+            Some(other) => Err(ApiError::new("unknown_request", format!("set {other:?}: no such request"))),
+            None => Err(bad_param("req", "missing")),
         }
+    }
+
+    /// `set peer`: local data of a known node (its certificate gives name and address).
+    fn set_peer(&self, p: &Value) -> Reply {
         let peer = self.peer_arg(p)?;
         let force = match field(p, "force") {
             None => false,
@@ -1076,10 +1283,37 @@ mod tests {
             resolved_tun: None,
             tun_dns: false,
             exits: Default::default(),
-            config_path: std::env::temp_dir().join("dvpn-api-test-no-config.toml"),
+            config_path: test_config(),
         };
         let node = Node::new(storage, transport, (links, e2e), Vec::new(), None, cert.body.ipv4(), ctx);
         (Api { node, sock: ApiSocket::bind("127.0.0.1:0").await.unwrap(), state: Mutex::new(State::default()) }, secret)
+    }
+
+    /// A config file of its own for each test node (`set exit` writes `[exit]` to it).
+    fn test_config() -> std::path::PathBuf {
+        let tag = encode_b64(&crate::crypto::random_bytes::<9>());
+        let dir = std::env::temp_dir().join(format!("dvpn-api-test-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "# my own comment\n[peer]\nbind_port = 8647\n").unwrap();
+        path
+    }
+
+    /// Members as an admin issues them: bob (relay, a subnet behind it), dave (revoked).
+    fn add_members(api: &Api, secret: &GroupSecret) -> (NodeId, NodeId) {
+        let store = api.node.group_store();
+        let issue = |name: &str, prefixes: &[&str], roles: u8| {
+            let mut b =
+                CertBody::new(Identity::generate().id(), name, prefixes.iter().map(|p| p.parse().unwrap()).collect());
+            b.roles.0 = roles;
+            let c = secret.issue(b);
+            store.add(secret, crate::state::Body::Cert(Box::new(c.clone())), false);
+            c.body.node
+        };
+        let bob = issue("bob", &["10.10.33.2/32", "192.168.1.0/24"], crate::group::Roles::RELAY);
+        let dave = issue("dave", &["10.10.33.4/32"], 0);
+        store.add(secret, crate::state::Body::Revoke { key: dave }, false);
+        (bob, dave)
     }
 
     fn client() -> ApiAddr {
@@ -1280,20 +1514,10 @@ mod tests {
     async fn members_from_records() {
         let (api, secret) = api_with_secret(true).await;
         init(&api, Some(API_VERSION.into())).await;
-        let store = api.node.group_store();
-        let issue = |name: &str, prefixes: &[&str], roles: u8| {
-            let mut b =
-                CertBody::new(Identity::generate().id(), name, prefixes.iter().map(|p| p.parse().unwrap()).collect());
-            b.roles.0 = roles;
-            let c = secret.issue(b);
-            store.add(&secret, crate::state::Body::Cert(Box::new(c.clone())), false);
-            c.body.node
-        };
-        let bob = issue("bob", &["10.10.33.2/32", "192.168.1.0/24"], crate::group::Roles::RELAY);
-        let dave = issue("dave", &["10.10.33.4/32"], 0);
+        let (bob, dave) = add_members(&api, &secret);
+        let _ = dave;
         let carol = Identity::generate().id(); // revoked before anybody saw it
-        store.add(&secret, crate::state::Body::Revoke { key: dave }, false);
-        store.add(&secret, crate::state::Body::Revoke { key: carol }, false);
+        api.node.group_store().add(&secret, crate::state::Body::Revoke { key: carol }, false);
 
         let r = request(&api, "get", vec![("req", "members".into())]).await;
         let list = get_ok(&r).as_array().expect("a list").clone();
@@ -1322,6 +1546,146 @@ mod tests {
         assert_eq!(s(c, "key"), Some(carol.to_string().as_str()));
         assert_eq!(flags(c), [false, false, false, true]);
         assert!(field(c, "days").is_none() && strs(c, "addrs").is_empty());
+    }
+
+    // applying a plan blocks in place: the node runs on a multi-threaded runtime
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exit_get_and_set() {
+        let (api, secret) = api_with_secret(true).await;
+        init(&api, Some(API_VERSION.into())).await;
+        let (bob, dave) = add_members(&api, &secret);
+        let path = test_config_of(&api);
+
+        let r = request(&api, "get", vec![("req", "exit".into())]).await;
+        let e = get_ok(&r);
+        assert_eq!(field(e, "v4"), Some(&Value::Array(Vec::new())));
+        assert_eq!(field(e, "kill_switch").and_then(Value::as_bool), Some(true), "on by default");
+        assert!(field(field(e, "active").unwrap(), "v4").is_none());
+
+        let list = |v: &[&str]| Value::Array(v.iter().map(|s| Value::from(*s)).collect());
+        let r = request(
+            &api,
+            "set",
+            vec![
+                ("req", "exit".into()),
+                ("v4", list(&[&bob.to_string()])),
+                ("v6", list(&["bob"])),
+                ("dns", list(&["1.1.1.1"])),
+                ("sources", list(&["10.10.33.1", "fd00::/64"])),
+                ("table", 100.into()),
+            ],
+        )
+        .await;
+        let e = get_ok(&r);
+        let gw = &field(e, "v4").unwrap().as_array().unwrap()[0];
+        assert_eq!((s(gw, "key"), s(gw, "name")), (Some(bob.to_string().as_str()), Some("bob")));
+        assert_eq!(field(gw, "alive").and_then(Value::as_bool), Some(false));
+        assert_eq!(strs(e, "dns"), vec!["1.1.1.1"]);
+        assert_eq!(strs(e, "sources"), vec!["10.10.33.1/32", "fd00::/64"]);
+        assert_eq!(field(e, "table").and_then(Value::as_u64), Some(100));
+        // a gateway configured, none alive: the kill switch blocks at once (no wait for a tick)
+        let blocked = field(e, "blocked").unwrap();
+        assert_eq!(field(blocked, "v4").and_then(Value::as_bool), Some(true), "{e}");
+        // also for a gateway named, known from the records only (no handshake with it yet)
+        assert_eq!(field(blocked, "v6").and_then(Value::as_bool), Some(true), "{e}");
+        // written to the config, the rest of it kept
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my own comment") && text.contains("bind_port = 8647"), "{text}");
+        let on_disk = crate::config::read_exits(&path).unwrap();
+        assert_eq!((on_disk.v4, on_disk.v6), (vec![bob.to_string()], vec!["bob".to_owned()]));
+        assert_eq!(on_disk.table, Some(100));
+
+        // refused changes leave everything as it was
+        let me = api.node.storage.self_id().to_string();
+        let bad: Vec<(&str, Value, &str)> = vec![
+            ("v4", list(&["nobody"]), "gateway_unknown"),
+            ("v4", list(&["alice"]), "gateway_self"),
+            ("v6", list(&[&me]), "gateway_self"),
+            ("v4", list(&[&dave.to_string()]), "gateway_unknown"),
+            ("v4", "bob".into(), "bad_param"),
+            ("dns", list(&["one.one"]), "dns_invalid"),
+            ("sources", list(&["10.10.33.0/99"]), "sources_invalid"),
+            ("table", 254.into(), "table_invalid"),
+            ("table", "main".into(), "bad_param"),
+            ("kill_switch", "on".into(), "bad_param"),
+        ];
+        for (k, v, code) in bad {
+            let what = format!("{k} = {v}");
+            let r = request(&api, "set", vec![("req", "exit".into()), (k, v)]).await;
+            assert_eq!(s(&r, "err"), Some(code), "{what}: {r}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+
+        // nil: back to the default; an empty list: none
+        let r = request(
+            &api,
+            "set",
+            vec![("req", "exit".into()), ("kill_switch", false.into()), ("v6", Value::Array(Vec::new()))],
+        )
+        .await;
+        let e = get_ok(&r);
+        assert_eq!(field(e, "kill_switch").and_then(Value::as_bool), Some(false));
+        assert_eq!(field(e, "v6"), Some(&Value::Array(Vec::new())));
+        assert_eq!(field(field(e, "blocked").unwrap(), "v4").and_then(Value::as_bool), Some(false));
+        let r = request(&api, "set", vec![("req", "exit".into()), ("kill_switch", Value::Nil), ("table", Value::Nil)])
+            .await;
+        let e = get_ok(&r);
+        assert_eq!(field(e, "kill_switch").and_then(Value::as_bool), Some(true));
+        assert!(field(e, "table").is_none());
+        assert_eq!(crate::config::read_exits(&path).unwrap().kill_switch, None);
+
+        // a name nobody has (a typo, or a member not heard of yet; the API refuses it, an edited
+        // config.toml does not): the kill switch still holds; only this node itself is no gateway
+        let ghost = crate::config::Exits { v4: vec!["ghost".into()], v6: vec!["alice".into()], ..Default::default() };
+        api.node.set_exits(&ghost).unwrap();
+        let r = request(&api, "get", vec![("req", "exit".into())]).await;
+        let blocked = field(get_ok(&r), "blocked").unwrap().clone();
+        assert_eq!(field(&blocked, "v4").and_then(Value::as_bool), Some(true), "{blocked}");
+        assert_eq!(field(&blocked, "v6").and_then(Value::as_bool), Some(false), "{blocked}");
+
+        let r = request(&api, "set", vec![("req", "exit".into()), ("clear", true.into())]).await;
+        assert_eq!(field(get_ok(&r), "v4"), Some(&Value::Array(Vec::new())));
+        assert_eq!(crate::config::read_exits(&path).unwrap(), crate::config::Exits::default());
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("[exit]"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn test_config_of(api: &Api) -> std::path::PathBuf {
+        api.node.config_path().to_owned()
+    }
+
+    #[tokio::test]
+    async fn acl_as_text_and_rules() {
+        let (api, secret) = api_with_secret(true).await;
+        init(&api, Some(API_VERSION.into())).await;
+        let (bob, _) = add_members(&api, &secret);
+        let r = request(&api, "get", vec![("req", "acl".into())]).await;
+        let a = get_ok(&r);
+        assert_eq!((field(a, "set").and_then(Value::as_bool), s(a, "default")), (Some(false), Some("allow")));
+        assert_eq!(field(a, "rules"), Some(&Value::Array(Vec::new())));
+
+        let alice = api.node.storage.self_id();
+        let member = |s: &str| match s {
+            "alice" => Some(alice),
+            "bob" => Some(bob),
+            _ => None,
+        };
+        let text = "default = \"deny\"\n[tags]\nservers = [\"bob\"]\n\n[[rule]]\nfrom = [\"alice\"]\nto = [\"servers\"]\nproto = \"tcp\"\nports = [\"22\", \"8000-8080\"]\naction = \"allow\"\n";
+        let acl = crate::acl::Acl::parse(text, &member).unwrap();
+        api.node.group_store().add(&secret, crate::state::Body::Acl(Box::new(acl)), false);
+
+        let r = request(&api, "get", vec![("req", "acl".into())]).await;
+        let a = get_ok(&r);
+        assert_eq!((field(a, "set").and_then(Value::as_bool), s(a, "default")), (Some(true), Some("deny")));
+        assert!(s(a, "toml").is_some_and(|t| t.contains("\"bob\"") && t.contains("deny")), "{a}");
+        assert_eq!(strs(field(a, "tags").unwrap(), "servers"), vec!["bob"]);
+        let rule = &field(a, "rules").unwrap().as_array().unwrap()[0];
+        assert_eq!((strs(rule, "from"), strs(rule, "to")), (vec!["alice".to_owned()], vec!["servers".to_owned()]));
+        assert_eq!(s(rule, "proto"), Some("tcp"));
+        let ports =
+            Value::Array(vec![Value::Array(vec![22.into(), 22.into()]), Value::Array(vec![8000.into(), 8080.into()])]);
+        assert_eq!(field(rule, "ports"), Some(&ports));
+        assert_eq!(field(rule, "allow").and_then(Value::as_bool), Some(true));
     }
 
     #[test]

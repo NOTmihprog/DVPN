@@ -933,7 +933,8 @@ src/
    "events": ["peer", "neighbor", ...]}` / `unsub`; по умолчанию — как сейчас (совместимость).
 
 **B. get: чего нет** — ✅ `group`, `members`, `version`, поля `status` (2026-11-02); `statics` вошёл в `group`
-(ключ, имя, адреса, есть ли прямая связь), следующая попытка соединения не выводится. Остались `exit`, `acl`.
+(ключ, имя, адреса, есть ли прямая связь), следующая попытка соединения не выводится. ✅ `exit`, `acl`
+(2026-11-02).
 
 | запрос | что вернуть | откуда |
 |---|---|---|
@@ -953,7 +954,7 @@ src/
 
 | запрос | параметры | результат / ошибки |
 |---|---|---|
-| `set exit` | `v4`, `v6` (списки), `kill_switch`, `dns`, `sources`, `table`; отсутствующие поля не меняются | новые настройки; узел пишет `[exit]` через `conf.set_exits` и применяет сразу. `gateway_unknown`, `dns_invalid`, `sources_invalid`, `table_invalid` |
+| `set exit` ✅ (2026-11-02, ещё `clear`) | `v4`, `v6` (списки), `kill_switch`, `dns`, `sources`, `table`; отсутствующие поля не меняются | новые настройки; узел пишет `[exit]` через `conf.set_exits` и применяет сразу. `gateway_unknown`, `dns_invalid`, `sources_invalid`, `table_invalid` |
 | `set invite` | `name`, `addr`?, `ttl_hours`?, `statics`?, `routes`?, `relay`? | `{invite, name, addr, until}`. `addr_taken`, `name_taken`, `endpoint_invalid`, `route_invalid`, `no_servers` (предупреждение, а не ошибка) |
 | `set node` | `key`, `name`?, `addr`?, `add_routes`?, `del_routes`?, `relay`? | новый сертификат участника. `member_not_seen`, `addr_taken`, `key_ambiguous` |
 | `set revoke` | `key`, `rotate` (по умолчанию true), `lead_secs` (120) | `{epoch, at}`. `revoke_self`, `member_unknown` |

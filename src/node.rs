@@ -273,6 +273,11 @@ impl Node {
         &self.group.store
     }
 
+    /// The config file the node follows `[exit]` in.
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.group.config_path
+    }
+
     /// `[[static_peers]]`.
     pub fn statics(&self) -> &[crate::group::StaticRef] {
         &self.group.statics
@@ -1196,17 +1201,42 @@ impl Node {
         (self.exit4.lock().current, self.exit6.lock().current, k.0 || k.1)
     }
 
+    /// `[exit]` as in use, the chosen IPv4 / IPv6 gateways, and whether the kill switch blocks
+    /// each family.
+    pub fn exit_detail(&self) -> (crate::config::Exits, Option<NodeId>, Option<NodeId>, (bool, bool)) {
+        let e = self.exits.lock().0.clone();
+        (e, self.exit4.lock().current, self.exit6.lock().current, *self.kill.lock())
+    }
+
+    /// Writes `[exit]` to the config file and applies it at once: the gateways are picked anew
+    /// and the internet routes follow (without waiting for the file to be noticed).
+    pub fn set_exits(&self, exits: &crate::config::Exits) -> anyhow::Result<()> {
+        crate::config::write_exits(&self.group.config_path, exits)?;
+        // re-read the file now, even if its mtime did not change
+        self.exits.lock().1 = None;
+        self.exit_tick();
+        Ok(())
+    }
+
     /// Our certificate as now in use.
     pub fn own_cert(&self) -> Cert {
         self.cert.read().clone()
     }
 
-    /// A gateway from `[exit]`: a member name or a node key.
+    /// A gateway from `[exit]`: a member name or a node key. Names are looked up in our own
+    /// certificate, those seen in handshakes, then the group records: a gateway not met yet (just
+    /// after start, or while it is down) is still known by its name.
     fn resolve_member(&self, s: &str) -> Option<NodeId> {
         if let Ok(k) = s.parse::<NodeId>() {
             return Some(k);
         }
-        self.peer_certs.lock().values().find(|c| c.body.name == s).map(|c| c.body.node)
+        if self.cert.read().body.name == s {
+            return Some(self.storage.self_id());
+        }
+        if let Some(c) = self.peer_certs.lock().values().find(|c| c.body.name == s) {
+            return Some(c.body.node);
+        }
+        self.group.store.certs(&self.group.id).into_iter().find(|c| c.body.name == s).map(|c| c.body.node)
     }
 
     /// Follows `[exit]` changes in the config, picks the gateways (first alive by priority, see
@@ -1255,9 +1285,12 @@ impl Node {
                 }
             }
         }
+        // gateways configured: any entry but this node, also one we cannot resolve (yet): the kill
+        // switch must not let the internet out just because a gateway's name is not known
+        let configured = |l: &[String]| l.iter().any(|s| self.resolve_member(s) != Some(me));
         let kill = (
-            !p4.is_empty() && exits.kill_switch() && self.exit4.lock().current.is_none(),
-            !p6.is_empty() && exits.kill_switch() && self.exit6.lock().current.is_none(),
+            configured(&exits.v4) && exits.kill_switch() && self.exit4.lock().current.is_none(),
+            configured(&exits.v6) && exits.kill_switch() && self.exit6.lock().current.is_none(),
         );
         {
             let mut k = self.kill.lock();
