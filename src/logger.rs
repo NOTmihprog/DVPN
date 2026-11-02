@@ -21,9 +21,43 @@ pub type Sink = Box<dyn Fn(Level, &str) + Send + Sync>;
 struct Logger {
     storage: OnceLock<Arc<PeerStorage>>,
     sink: OnceLock<Sink>,
+    tap: OnceLock<tokio::sync::broadcast::Sender<Line>>,
 }
 
-static LOGGER: Logger = Logger { storage: OnceLock::new(), sink: OnceLock::new() };
+static LOGGER: Logger = Logger { storage: OnceLock::new(), sink: OnceLock::new(), tap: OnceLock::new() };
+
+/// A log line as the API's `log` events carry it: plain text, no colours.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Line {
+    pub level: Level,
+    /// Unix milliseconds.
+    pub time_ms: u64,
+    pub text: String,
+}
+
+/// The node's log lines from now on (for the API's `log` events). Lines of the API itself are
+/// left out: sending them out must not log more lines to send.
+pub fn tap() -> tokio::sync::broadcast::Receiver<Line> {
+    LOGGER.tap.get_or_init(|| tokio::sync::broadcast::channel(512).0).subscribe()
+}
+
+/// The text without the colour sequences of terminal output.
+fn plain_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\x1b' {
+            for c in it.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
 
 /// Sends log lines to `sink`, without colours, instead of stderr. Once per process.
 pub fn set_sink(sink: Sink) {
@@ -93,6 +127,15 @@ impl Log for Logger {
             return;
         }
         let msg = r.args();
+        if let Some(tap) = LOGGER.tap.get()
+            && tap.receiver_count() > 0
+            && !r.target().starts_with("dvpn::api")
+        {
+            let time_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            let _ = tap.send(Line { level: r.level(), time_ms, text: plain_text(&msg.to_string()) });
+        }
         if let Some(sink) = LOGGER.sink.get() {
             sink(r.level(), &msg.to_string());
             return;
@@ -114,6 +157,12 @@ impl Log for Logger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_text_drops_colours() {
+        assert_eq!(plain_text("\x1b[93mbob\x1b[32m(\x1b[90mDZVS\x1b[32m)\x1b[97m up"), "bob(DZVS) up");
+        assert_eq!(plain_text("no colours"), "no colours");
+    }
     use crate::storage::PeerUpdate;
     use std::net::Ipv4Addr;
     use std::time::Duration;

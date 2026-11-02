@@ -24,6 +24,9 @@ struct Shared {
     /// The answer to our `init`, while we wait for it.
     init: Mutex<Option<oneshot::Sender<Reply>>>,
     events: broadcast::Sender<Value>,
+    typed: broadcast::Sender<Event>,
+    /// The last `sub` sent (with the token), sent again when the node forgot us.
+    sub: Mutex<Option<Vec<u8>>>,
 }
 
 impl Shared {
@@ -55,8 +58,16 @@ impl Client {
         let token = addr.find_token();
         let sock = Socket::open(&addr).await?;
         let (events, _) = broadcast::channel(256);
-        let shared =
-            Arc::new(Shared { sock, name: name.to_owned(), pending: Mutex::default(), init: Mutex::default(), events });
+        let (typed, _) = broadcast::channel(256);
+        let shared = Arc::new(Shared {
+            sock,
+            name: name.to_owned(),
+            pending: Mutex::default(),
+            init: Mutex::default(),
+            events,
+            typed,
+            sub: Mutex::default(),
+        });
         let task = tokio::spawn(recv_loop(shared.clone()));
         let (tx, rx) = oneshot::channel();
         *shared.init.lock().await = Some(tx);
@@ -98,23 +109,59 @@ impl Client {
         &self.info
     }
 
-    /// Everything the node sends besides answers (`event`, `net`), as it comes. Typed events
-    /// come later (PLAN stage 3).
+    /// Everything the node sends besides answers (`event`, `net`), as it comes.
     pub fn raw_events(&self) -> broadcast::Receiver<Value> {
         self.shared.events.subscribe()
     }
 
+    /// The node's events (by default all kinds but `metrics`; see [`Client::subscribe`]). A slow
+    /// receiver loses the oldest ones (`RecvError::Lagged`).
+    pub fn events(&self) -> broadcast::Receiver<Event> {
+        self.shared.typed.subscribe()
+    }
+
+    /// Chooses the events the node sends to this client. Kept when the client introduces itself
+    /// again.
+    pub async fn subscribe(&self, s: &Subscription) -> Result<(), Error> {
+        let mut f = Vec::new();
+        if !s.kinds.is_empty() {
+            f.push(("events", Value::Array(s.kinds.iter().map(|k| Value::from(k.as_str())).collect())));
+        }
+        if let Some(secs) = s.metrics_secs {
+            f.push(("metrics_secs", secs.into()));
+        }
+        if let Some(l) = s.log_level {
+            f.push(("log_level", l.as_str().into()));
+        }
+        let again = self.message("sub", None, 0, f.clone());
+        self.request("sub", None, f).await?;
+        *self.shared.sub.lock().await = Some(again);
+        Ok(())
+    }
+
     /// Any request: `{"type": kind, "req": req, ...fields}`; its `res`, or the node's error.
     pub async fn raw(&self, kind: &str, req: &str, fields: Vec<(&str, Value)>) -> Result<Value, Error> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut m = vec![("type", Value::from(kind)), ("id", Value::from(id)), ("req", Value::from(req))];
+        self.request(kind, Some(req), fields).await
+    }
+
+    fn message(&self, kind: &str, req: Option<&str>, id: u64, fields: Vec<(&str, Value)>) -> Vec<u8> {
+        let mut m = vec![("type", Value::from(kind)), ("id", Value::from(id))];
+        if let Some(r) = req {
+            m.push(("req", r.into()));
+        }
         if let Some(t) = &self.token {
             m.push(("token", t.as_str().into()));
         }
         m.extend(fields);
+        encode(&map(m))
+    }
+
+    async fn request(&self, kind: &str, req: Option<&str>, fields: Vec<(&str, Value)>) -> Result<Value, Error> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let msg = self.message(kind, req, id, fields);
         let (tx, rx) = oneshot::channel();
         self.shared.pending.lock().await.insert(id, tx);
-        if let Err(e) = self.shared.sock.send(&encode(&map(m))).await {
+        if let Err(e) = self.shared.sock.send(&msg).await {
             self.shared.pending.lock().await.remove(&id);
             return Err(e.into());
         }
@@ -141,15 +188,69 @@ impl Client {
     }
 
     pub async fn neighbors(&self) -> Result<Vec<Neighbor>, Error> {
-        self.get("neighbors", Vec::new()).await
+        self.list("neighbors").await
     }
 
     pub async fn routes(&self) -> Result<Routes, Error> {
-        self.get("routes", Vec::new()).await
+        match self.get::<Routes>("routes", Vec::new()).await {
+            Err(e) if e.code() == Some(&ErrorCode::TooLarge) => {
+                let mut all: Option<Routes> = None;
+                let mut offset = 0;
+                loop {
+                    let part: Routes = self.get("routes", page(offset)).await?;
+                    let total = part.mesh_total.max(part.ckr_total).unwrap_or(0) as usize;
+                    let got = part.mesh.len().max(part.ckr.len());
+                    match &mut all {
+                        None => all = Some(part),
+                        Some(a) => {
+                            a.mesh.extend(part.mesh);
+                            a.ckr.extend(part.ckr);
+                        }
+                    }
+                    offset += PAGE;
+                    if got == 0 || offset >= total {
+                        return Ok(all.expect("a page"));
+                    }
+                }
+            }
+            r => r,
+        }
     }
 
     pub async fn metrics(&self) -> Result<Metrics, Error> {
-        self.get("metrics", Vec::new()).await
+        match self.get::<Metrics>("metrics", Vec::new()).await {
+            Err(e) if e.code() == Some(&ErrorCode::TooLarge) => {
+                let mut all: Metrics = self.get("metrics", page(0)).await?;
+                let total = all.peers_total.unwrap_or(0) as usize;
+                while all.peers.len() < total {
+                    let part: Metrics = self.get("metrics", page(all.peers.len())).await?;
+                    if part.peers.is_empty() {
+                        break;
+                    }
+                    all.peers.extend(part.peers);
+                }
+                Ok(all)
+            }
+            r => r,
+        }
+    }
+
+    /// A list request; too large for one datagram, it is fetched in parts.
+    async fn list<T: DeserializeOwned>(&self, req: &str) -> Result<Vec<T>, Error> {
+        match self.get::<Vec<T>>(req, Vec::new()).await {
+            Err(e) if e.code() == Some(&ErrorCode::TooLarge) => {
+                let mut all = Vec::new();
+                loop {
+                    let part: Vec<T> = self.get(req, page(all.len())).await?;
+                    let n = part.len();
+                    all.extend(part);
+                    if n < PAGE {
+                        return Ok(all);
+                    }
+                }
+            }
+            r => r,
+        }
     }
 
     /// The hops to `node` (a key, key prefix or member name); None: no path now.
@@ -168,7 +269,7 @@ impl Client {
 
     /// Everybody in the group, offline and revoked ones included, by name.
     pub async fn members(&self) -> Result<Vec<Member>, Error> {
-        self.get("members", Vec::new()).await
+        self.list("members").await
     }
 
     pub async fn exit(&self) -> Result<Exit, Error> {
@@ -272,6 +373,13 @@ impl Client {
     }
 }
 
+/// Entries per part when an answer is too large for one datagram (a member is ~300 bytes).
+const PAGE: usize = 100;
+
+fn page(offset: usize) -> Vec<(&'static str, Value)> {
+    vec![("offset", (offset as u64).into()), ("limit", (PAGE as u64).into())]
+}
+
 fn strings(l: &[String]) -> Value {
     Value::Array(l.iter().map(|s| Value::from(s.as_str())).collect())
 }
@@ -312,7 +420,21 @@ async fn recv_loop(shared: Arc<Shared>) {
             Some("init") => {
                 if let Some(tx) = shared.init.lock().await.take() {
                     let _ = tx.send(Ok(v));
+                } else if let Some(sub) = shared.sub.lock().await.clone() {
+                    // introduced ourselves again: the node forgot our subscription too
+                    let _ = shared.sock.send(&sub).await;
                 }
+            }
+            Some("event") => {
+                if let Some(e) = field(&v, "event") {
+                    match rmpv::ext::from_value::<Event>(e.clone()) {
+                        Ok(e) => {
+                            let _ = shared.typed.send(e);
+                        }
+                        Err(err) => log::debug!("dvpn-client | event not understood: {err}: {e}"),
+                    }
+                }
+                let _ = shared.events.send(v);
             }
             Some("error") => {
                 let code = field_str(&v, "err").unwrap_or_default();

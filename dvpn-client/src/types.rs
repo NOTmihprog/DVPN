@@ -72,6 +72,9 @@ pub struct Neighbor {
 pub struct Routes {
     pub mesh: Vec<MeshRoute>,
     pub ckr: Vec<CkrRoute>,
+    /// How many there are in all (the lists may be a part: `offset` / `limit`).
+    pub mesh_total: Option<u64>,
+    pub ckr_total: Option<u64>,
 }
 
 /// To `key` through the neighbour `via`.
@@ -124,6 +127,8 @@ pub struct Metrics {
     /// Dropped packets by reason.
     pub drops: BTreeMap<String, u64>,
     pub peers: Vec<PeerMetrics>,
+    /// How many `peers` there are in all (the list may be a part).
+    pub peers_total: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -396,4 +401,123 @@ pub struct Rotated {
     pub epoch: u32,
     pub at: u64,
     pub sealed_to: u64,
+}
+
+/// What the node tells as it happens (`sub`, [`crate::Client::events`]).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Event {
+    /// A local peer record added, updated or deleted (v2-style; prefer `Member` / `Neighbor`).
+    Peer { action: String, key: String, name: Option<String>, addr: Option<String>, endpoint: Option<(String, u16)> },
+    /// A discovery server connected or lost.
+    Server { server: (String, u16), status: bool },
+    /// A new RTT measurement.
+    Ping { key: String, ping: f64 },
+    /// A direct link came up, went down, or moved to another endpoint.
+    Neighbor { key: String, name: Option<String>, state: NeighborState, endpoint: Option<String> },
+    /// The first hop to a member changed; `via` None: no route now.
+    Route { key: String, name: Option<String>, via: Option<String>, via_name: Option<String> },
+    /// The gateways in use or the kill switch changed.
+    Exit { active: PerFamily<Option<ActiveGateway>>, blocked: PerFamily<bool> },
+    /// A member joined, changed (name, addresses, roles) or was revoked.
+    Member { action: MemberAction, key: String, name: Option<String>, prefixes: Vec<String>, revoked: bool },
+    /// A psk change was announced (`next`) or switched to (`epoch`).
+    Epoch { epoch: u32, next: Option<EpochAt> },
+    /// Counters, every `metrics_secs` (only if subscribed).
+    Metrics(Metrics),
+    /// A line of the node's log (only if subscribed), at the subscribed level and above.
+    Log { level: LogLevel, time: f64, text: String },
+    /// A kind this version does not know.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NeighborState {
+    Up,
+    Down,
+    Moved,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberAction {
+    Add,
+    Update,
+    Revoke,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+pub struct EpochAt {
+    pub epoch: u32,
+    pub at: u64,
+}
+
+/// Event kinds for [`crate::Client::subscribe`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EventKind {
+    Peer,
+    Server,
+    Ping,
+    Neighbor,
+    Route,
+    Exit,
+    Member,
+    Epoch,
+    Metrics,
+    Log,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventKind::Peer => "peer",
+            EventKind::Server => "server",
+            EventKind::Ping => "ping",
+            EventKind::Neighbor => "neighbor",
+            EventKind::Route => "route",
+            EventKind::Exit => "exit",
+            EventKind::Member => "member",
+            EventKind::Epoch => "epoch",
+            EventKind::Metrics => "metrics",
+            EventKind::Log => "log",
+        }
+    }
+}
+
+/// Levels of the node's log, most severe first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
+/// What [`crate::Client::subscribe`] asks the node for. The default: all kinds but `metrics`
+/// and `log`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Subscription {
+    /// Event kinds (empty: the default set).
+    pub kinds: Vec<EventKind>,
+    /// `metrics` events this often (1..3600 s); adds `Metrics`.
+    pub metrics_secs: Option<u64>,
+    /// `log` events at this level and above (the node logs only what its `log_level` lets
+    /// through); adds `Log`.
+    pub log_level: Option<LogLevel>,
 }

@@ -132,6 +132,7 @@ codes! {
     RevokeSelf = "revoke_self",
     AclParse = "acl_parse",
     NotPermitted = "not_permitted",
+    TooLarge = "too_large",
 }
 
 impl fmt::Display for ErrorCode {

@@ -923,7 +923,8 @@ src/
    (`status.servers[].addr`, `neighbors[].endpoint`, `local_addr` в `status`); ключ сервера — `bytes` при
    base64url везде остальном. Привести к одному виду (строка `"ip:port"`, ключи base64url), в `doc/api.md` —
    таблица типов.
-4. **Размер ответа.** Ответ — одна датаграмма (`MAX_DATAGRAM` 65507, unix-сокет — ещё меньше по умолчанию):
+4. ✅ (2026-11-03) **Размер ответа.** Сделано: `too_large`, `offset`/`limit` для `members`, `neighbors`, `routes`,
+   `metrics` (`*_total`), `dvpn-client` собирает части сам. Было: Ответ — одна датаграмма (`MAX_DATAGRAM` 65507, unix-сокет — ещё меньше по умолчанию):
    `neighbors`, `metrics`, `members` на большой группе не влезут. Нужно: ответ `{"err": "too_large"}` вместо
    тихой потери и постраничность (`offset`, `limit`, в ответе `total`) для списков.
 5. ✅ (2026-11-03) **Права.** Unix-сокет защищён правами файла: `/run/dvpn` — `0660`, группа `dvpn`; узел от
@@ -976,7 +977,9 @@ src/
 Не через API (узла без группы нет): `group create/join/leave/backup/restore`, `show-key` — клиенты зовут
 `dvpn::ops` напрямую (`ops::join`/`leave` уже есть) или CLI.
 
-**D. События: чего нет**
+**D. События** — ✅ (2026-11-03) `neighbor`, `route`, `exit`, `member`, `epoch`, `metrics` по подписке (`sub`),
+`kind` в каждом событии; находятся сравнением снимков состояния раз в секунду (`api::watch`), а не правками
+всех мест в узле; `log` по подписке с уровнем (`logger::tap`). Было:
 
 Сейчас только `storage::Event`: `Peer` (add/update/del локальной записи), `Server`, `Ping`. Добавить:
 

@@ -34,6 +34,9 @@ use crate::proto::{KIND_API_MAX, KIND_API_MIN, MAX_DATAGRAM};
 use crate::storage::{Event, PeerRecord, PeerUpdate, ResolveError};
 
 const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// The largest message to a client: one UDP datagram on IPv4 loopback, with room to spare (clients
+/// read with 64 KiB buffers, unix sockets included).
+pub const MAX_ANSWER: usize = 65_000;
 const CONN_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// The API protocol version this node speaks, and the oldest one it still serves.
@@ -119,9 +122,25 @@ impl ApiSocket {
         }
     }
 
+    /// Sends `v` to `to`. An answer too large for one datagram becomes a `too_large` error (the
+    /// client asks for it in parts, `offset` / `limit`); anything else that large is dropped.
     async fn send(&self, v: &Value, to: &ApiAddr) {
         let mut data = Vec::new();
         rmpv::encode::write_value(&mut data, v).expect("write to vec");
+        if data.len() > MAX_ANSWER {
+            let kind = field(v, "type").and_then(Value::as_str).unwrap_or("?");
+            if kind != "res" {
+                log::warn!("API | {kind} of {} bytes to {to} dropped: too large for a datagram", data.len());
+                return;
+            }
+            let msg = format!(
+                "the answer ({} bytes) does not fit a datagram ({MAX_ANSWER}): ask for it in parts with offset and limit",
+                data.len()
+            );
+            data.clear();
+            let refusal = res(field(v, "id"), Err(ApiError::new("too_large", msg)));
+            rmpv::encode::write_value(&mut data, &refusal).expect("write to vec");
+        }
         let r = match (self, to) {
             (ApiSocket::Inet(s), ApiAddr::Inet(a)) => s.send_to(&data, a).await,
             #[cfg(unix)]
@@ -140,6 +159,251 @@ impl Drop for ApiSocket {
         #[cfg(unix)]
         if let ApiSocket::Unix(_, p) = self {
             let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+// ---- events from changes ----
+
+/// What the node looks like now, and the events between two looks. Compared once a second
+/// instead of hooking every place that changes it: nothing is missed, whatever made the change.
+mod watch {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+
+    use rmpv::Value;
+
+    use super::{map, opt_str};
+    use crate::identity::NodeId;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct MemberState {
+        pub name: String,
+        pub prefixes: Vec<String>,
+        pub roles: u8,
+        pub revoked: bool,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct Snapshot {
+        /// Direct links: alive, endpoint.
+        pub neighbors: HashMap<NodeId, (bool, Option<SocketAddr>)>,
+        /// Destination -> first hop.
+        pub routes: HashMap<NodeId, NodeId>,
+        /// Gateways in use (IPv4, IPv6), kill switch blocking (IPv4, IPv6).
+        pub exit: (Option<NodeId>, Option<NodeId>, (bool, bool)),
+        pub members: HashMap<NodeId, MemberState>,
+        /// psk epoch in use, and one announced after it (epoch, unix ms).
+        pub epoch: (u32, Option<(u32, u64)>),
+    }
+
+    impl Snapshot {
+        pub fn of(n: &crate::node::Node) -> Snapshot {
+            let revoked = n.group_store().revoked(&n.group_id());
+            let mut members: HashMap<NodeId, MemberState> = n
+                .member_certs()
+                .into_iter()
+                .map(|c| {
+                    let b = c.body;
+                    let state = MemberState {
+                        name: b.name,
+                        prefixes: b.prefixes.iter().map(|p| p.to_string()).collect(),
+                        roles: b.roles.0,
+                        revoked: revoked.contains(&b.node),
+                    };
+                    (b.node, state)
+                })
+                .collect();
+            for k in &revoked {
+                members.entry(*k).or_insert(MemberState {
+                    name: String::new(),
+                    prefixes: Vec::new(),
+                    roles: 0,
+                    revoked: true,
+                });
+            }
+            let (_, gw4, gw6, kill) = n.exit_detail();
+            let epoch = n.psk_epoch().0;
+            Snapshot {
+                neighbors: n.direct_links().into_iter().map(|l| (l.peer, (l.alive, l.endpoint))).collect(),
+                routes: n.mesh_routes().into_iter().map(|(d, via, _)| (d, via)).collect(),
+                exit: (gw4, gw6, kill),
+                members,
+                epoch: (epoch, n.group_store().epoch(&n.group_id()).filter(|(e, _)| *e > epoch)),
+            }
+        }
+    }
+
+    fn who(k: &NodeId, name: &dyn Fn(&NodeId) -> Option<String>) -> Vec<(&'static str, Value)> {
+        vec![("key", k.to_string().into()), ("name", opt_str(name(k)))]
+    }
+
+    fn event(kind: &'static str, mut fields: Vec<(&'static str, Value)>) -> (&'static str, Value) {
+        fields.insert(0, ("kind", kind.into()));
+        (kind, map(fields))
+    }
+
+    /// The events from `old` to `new`, in a stable order (by key within a kind).
+    pub fn diff(
+        old: &Snapshot,
+        new: &Snapshot,
+        name: &dyn Fn(&NodeId) -> Option<String>,
+    ) -> Vec<(&'static str, Value)> {
+        let mut out = Vec::new();
+        let sorted = |ks: Vec<NodeId>| {
+            let mut ks = ks;
+            ks.sort_by_cached_key(|k| k.to_string());
+            ks.dedup();
+            ks
+        };
+        let ep = |e: Option<SocketAddr>| opt_str(e.map(|e| e.to_string()));
+
+        // neighbor: up, down, moved (a new endpoint: roaming)
+        let keys = sorted(old.neighbors.keys().chain(new.neighbors.keys()).copied().collect());
+        for k in keys {
+            let was = old.neighbors.get(&k).filter(|(alive, _)| *alive);
+            let is = new.neighbors.get(&k).filter(|(alive, _)| *alive);
+            let state = match (was, is) {
+                (None, Some(_)) => "up",
+                (Some(_), None) => "down",
+                (Some((_, a)), Some((_, b))) if a != b => "moved",
+                _ => continue,
+            };
+            let mut f = who(&k, name);
+            f.push(("state", state.into()));
+            f.push(("endpoint", ep(is.and_then(|(_, e)| *e))));
+            out.push(event("neighbor", f));
+        }
+
+        // route: a new first hop, or none (unreachable)
+        let keys = sorted(old.routes.keys().chain(new.routes.keys()).copied().collect());
+        for k in keys {
+            let (a, b) = (old.routes.get(&k), new.routes.get(&k));
+            if a == b {
+                continue;
+            }
+            let mut f = who(&k, name);
+            f.push(("via", opt_str(b.map(|v| v.to_string()))));
+            f.push(("via_name", opt_str(b.and_then(name))));
+            out.push(event("route", f));
+        }
+
+        // exit: gateways in use, kill switch
+        if old.exit != new.exit {
+            let (gw4, gw6, (b4, b6)) = &new.exit;
+            let active = |g: &Option<NodeId>| g.as_ref().map_or(Value::Nil, |g| map(who(g, name)));
+            out.push(event(
+                "exit",
+                vec![
+                    ("active", map(vec![("v4", active(gw4)), ("v6", active(gw6))])),
+                    ("blocked", map(vec![("v4", (*b4).into()), ("v6", (*b6).into())])),
+                ],
+            ));
+        }
+
+        // member: add, update (name, addresses, roles), revoke
+        let keys = sorted(new.members.keys().copied().collect());
+        for k in keys {
+            let m = &new.members[&k];
+            let action = match old.members.get(&k) {
+                None if m.revoked => "revoke",
+                None => "add",
+                Some(o) if o == m => continue,
+                Some(o) if m.revoked && !o.revoked => "revoke",
+                Some(_) => "update",
+            };
+            out.push(event(
+                "member",
+                vec![
+                    ("action", action.into()),
+                    ("key", k.to_string().into()),
+                    ("name", opt_str(Some(m.name.clone()).filter(|n| !n.is_empty()))),
+                    ("prefixes", Value::Array(m.prefixes.iter().map(|p| Value::from(p.as_str())).collect())),
+                    ("revoked", m.revoked.into()),
+                ],
+            ));
+        }
+
+        // epoch: a psk change announced, or switched to
+        if old.epoch != new.epoch {
+            let (e, next) = new.epoch;
+            let next = next.map_or(Value::Nil, |(n, at)| map(vec![("epoch", n.into()), ("at", (at / 1000).into())]));
+            out.push(event("epoch", vec![("epoch", e.into()), ("next", next)]));
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::identity::Identity;
+
+        fn kinds(v: &[(&str, Value)]) -> Vec<String> {
+            v.iter()
+                .map(|(k, e)| {
+                    let f = |n: &str| super::super::field(e, n).and_then(Value::as_str).unwrap_or("-").to_owned();
+                    format!("{k}:{}", f(if *k == "neighbor" { "state" } else { "action" }))
+                })
+                .collect()
+        }
+
+        #[test]
+        fn changes_become_events() {
+            let [a, b, c] = [(); 3].map(|_| Identity::generate().id());
+            let name = |k: &NodeId| {
+                Some(
+                    if *k == a {
+                        "a"
+                    } else if *k == b {
+                        "b"
+                    } else {
+                        "c"
+                    }
+                    .to_owned(),
+                )
+            };
+            let ep = |p: u16| Some(SocketAddr::from(([192, 0, 2, 1], p)));
+            let member = |n: &str, revoked| MemberState { name: n.into(), prefixes: vec![], roles: 0, revoked };
+            let mut old = Snapshot::default();
+            old.neighbors.insert(a, (true, ep(1)));
+            old.neighbors.insert(b, (true, ep(2)));
+            old.routes.insert(c, b);
+            old.members.insert(a, member("a", false));
+            old.members.insert(b, member("b", false));
+            assert!(diff(&old, &old, &name).is_empty(), "nothing changed, no events");
+
+            let mut new = old.clone();
+            new.neighbors.insert(a, (true, ep(9))); // roamed
+            new.neighbors.insert(b, (false, ep(2))); // link died
+            new.neighbors.insert(c, (true, ep(3))); // new link
+            new.routes.insert(c, c); // now direct
+            new.routes.insert(a, b);
+            new.exit = (Some(b), None, (false, false));
+            new.members.insert(b, member("b", true));
+            new.members.insert(c, member("c", false));
+            new.epoch = (0, Some((1, 120_000)));
+            let ev = diff(&old, &new, &name);
+            let mut got = kinds(&ev);
+            got.sort();
+            let mut want = vec![
+                "neighbor:moved",
+                "neighbor:down",
+                "neighbor:up",
+                "route:-",
+                "route:-",
+                "exit:-",
+                "member:revoke",
+                "member:add",
+                "epoch:-",
+            ];
+            want.sort();
+            assert_eq!(got, want);
+            let e = ev.iter().find(|(k, _)| *k == "epoch").unwrap();
+            assert_eq!(
+                super::super::field(&e.1, "next").and_then(|n| super::super::field(n, "at")).and_then(Value::as_u64),
+                Some(120)
+            );
+            assert!(ev.iter().all(|(k, e)| super::super::field(e, "kind").and_then(Value::as_str) == Some(k)));
         }
     }
 }
@@ -402,9 +666,19 @@ fn sub_args_value(rec: &PeerRecord) -> Value {
     rec.sub_args.as_ref().map_or(Value::Nil, |m| json_to_mp(&Json::Object(m.clone())))
 }
 
+/// The kind of a storage event (`kind` in `event`, what `sub` selects).
+fn event_kind(e: &Event) -> &'static str {
+    match e {
+        Event::Peer { .. } => "peer",
+        Event::Server { .. } => "server",
+        Event::Ping { .. } => "ping",
+    }
+}
+
 fn event_value(e: &Event) -> Value {
     match e {
         Event::Peer { action, record, endpoint } => map(vec![
+            ("kind", "peer".into()),
             ("action", action.as_str().into()),
             ("key", record.peer_id.to_string().into()),
             ("name", opt_str(record.name.clone())),
@@ -413,9 +687,11 @@ fn event_value(e: &Event) -> Value {
             ("sub_args", sub_args_value(record)),
         ]),
         Event::Server { addr, connected } => {
-            map(vec![("server", addr_value(Some(*addr))), ("status", (*connected).into())])
+            map(vec![("kind", "server".into()), ("server", addr_value(Some(*addr))), ("status", (*connected).into())])
         }
-        Event::Ping { peer_id, ms } => map(vec![("key", peer_id.to_string().into()), ("ping", (*ms).into())]),
+        Event::Ping { peer_id, ms } => {
+            map(vec![("kind", "ping".into()), ("key", peer_id.to_string().into()), ("ping", (*ms).into())])
+        }
     }
 }
 
@@ -427,7 +703,40 @@ struct Conn {
     last_pong: Option<Instant>,
     /// The API version from `init`.
     version: u64,
+    /// Event kinds this client wants (`sub`); None: all but `metrics`.
+    subs: Option<std::collections::HashSet<String>>,
+    /// `metrics` events this often, and when the last one went.
+    metrics_every: Option<Duration>,
+    last_metrics: Option<Instant>,
+    /// `log` events at this level and above.
+    log_level: log::Level,
 }
+
+impl Conn {
+    fn new(version: u64) -> Self {
+        Conn {
+            last_ping: None,
+            pings_sent: 0,
+            last_pong: None,
+            version,
+            subs: None,
+            metrics_every: None,
+            last_metrics: None,
+            log_level: log::Level::Info,
+        }
+    }
+
+    fn wants(&self, kind: &str) -> bool {
+        match &self.subs {
+            Some(s) => s.contains(kind),
+            None => kind != "metrics" && kind != "log",
+        }
+    }
+}
+
+/// Event kinds a client can `sub`scribe to (`doc/api.md`).
+pub const EVENT_KINDS: [&str; 10] =
+    ["peer", "server", "ping", "neighbor", "route", "exit", "member", "epoch", "metrics", "log"];
 
 #[derive(Default)]
 struct State {
@@ -529,6 +838,29 @@ fn epoch_fields(changed: &[crate::state::Entry]) -> Vec<(&'static str, Value)> {
     vec![("epoch", e.map_or(Value::Nil, |(n, _)| n.into())), ("at", e.map_or(Value::Nil, |(_, at)| at.into()))]
 }
 
+/// `offset` / `limit` of a list (`members`, `neighbors`, `metrics` peers, `routes`): None when
+/// neither is given (the whole list).
+fn page_arg(p: &Value) -> Result<Option<(usize, usize)>, ApiError> {
+    let num = |k: &str| match field(p, k) {
+        None => Ok(None),
+        Some(v) => {
+            v.as_u64().map(|n| Some(usize::try_from(n).unwrap_or(usize::MAX))).ok_or_else(|| bad_param(k, "a number"))
+        }
+    };
+    match (num("offset")?, num("limit")?) {
+        (None, None) => Ok(None),
+        (_, Some(0)) => Err(bad_param("limit", "at least 1")),
+        (o, l) => Ok(Some((o.unwrap_or(0), l.unwrap_or(usize::MAX)))),
+    }
+}
+
+fn page_of(list: Vec<Value>, page: Option<(usize, usize)>) -> Vec<Value> {
+    match page {
+        None => list,
+        Some((offset, limit)) => list.into_iter().skip(offset).take(limit).collect(),
+    }
+}
+
 /// A field as sent, nil included (`field` takes nil for missing).
 fn raw_field<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
     v.as_map()?.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v)
@@ -578,15 +910,23 @@ impl Api {
         tokio::spawn(api.clone().recv_loop());
         tokio::spawn(api.clone().ping_loop());
         tokio::spawn(api.clone().event_loop());
+        tokio::spawn(api.clone().watch_loop());
+        tokio::spawn(api.clone().log_loop());
         tokio::spawn(api.clone().net_loop(rx));
         log::info!("API | Full - started");
         api
     }
 
-    async fn broadcast(&self, v: &Value) {
-        let conns: Vec<ApiAddr> = self.state.lock().conns.keys().cloned().collect();
+    /// Sends event `e` (of `kind`) to the clients that want it.
+    async fn broadcast(&self, kind: &str, e: Value) {
+        let conns: Vec<ApiAddr> =
+            self.state.lock().conns.iter().filter(|(_, c)| c.wants(kind)).map(|(a, _)| a.clone()).collect();
+        if conns.is_empty() {
+            return;
+        }
+        let v = map(vec![("type", "event".into()), ("event", e)]);
         for c in conns {
-            self.sock.send(v, &c).await;
+            self.sock.send(&v, &c).await;
         }
     }
 
@@ -594,10 +934,7 @@ impl Api {
         let mut rx = self.node.storage.subscribe();
         loop {
             match rx.recv().await {
-                Ok(e) => {
-                    let v = map(vec![("type", "event".into()), ("event", event_value(&e))]);
-                    self.broadcast(&v).await;
-                }
+                Ok(e) => self.broadcast(event_kind(&e), event_value(&e)).await,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => log::warn!("API | {n} events dropped"),
                 Err(_) => return,
             }
@@ -701,12 +1038,7 @@ impl Api {
                 );
             }
         };
-        self.state
-            .lock()
-            .conns
-            .entry(from.clone())
-            .or_insert(Conn { last_ping: None, pings_sent: 0, last_pong: None, version })
-            .version = version;
+        self.state.lock().conns.entry(from.clone()).or_insert_with(|| Conn::new(version)).version = version;
         log::debug!("API | conn {from} init, name {name:?}, version {version}");
         let n = &self.node;
         let cert = n.own_cert();
@@ -736,8 +1068,8 @@ impl Api {
             return Some(map(vec![("type", "close".into())]));
         }
         let id = field(p, "id");
-        if matches!(kind, "get" | "set" | "del" | "route")
-            && let Err(e) = self.access.check(p, kind)
+        if matches!(kind, "get" | "sub" | "set" | "del" | "route")
+            && let Err(e) = self.access.check(p, if kind == "sub" { "get" } else { kind })
         {
             log::debug!("API | conn {from}: {kind} refused, no token");
             return Some(res(id, Err(e)));
@@ -758,6 +1090,7 @@ impl Api {
                 None
             }
             "get" => Some(res(id, self.handle_get(p))),
+            "sub" => Some(res(id, self.handle_sub(p, from))),
             "set" => Some(res(id, self.handle_set(p).await)),
             "del" => Some(res(id, self.handle_del(p).await)),
             "route" => Some(res(id, self.handle_route(p, from))),
@@ -909,6 +1242,163 @@ impl Api {
             ])
         }));
         Value::Array(out)
+    }
+
+    /// `get metrics` (`page`: a part of `peers`), and the `metrics` events.
+    fn metrics_value(&self, page: Option<(usize, usize)>) -> Value {
+        let m = &self.node.metrics;
+        let pair = |p: &crate::metrics::Pair| {
+            let (packets, bytes) = p.get();
+            map(vec![("packets", packets.into()), ("bytes", bytes.into())])
+        };
+        let peers = m.peers().into_iter().map(|(id, c)| {
+            map(vec![
+                ("key", id.to_string().into()),
+                ("name", opt_str(self.node.storage.name(&id))),
+                ("ip_tx", pair(&c.ip_tx)),
+                ("ip_rx", pair(&c.ip_rx)),
+                ("wire_tx", pair(&c.wire_tx)),
+                ("wire_rx", pair(&c.wire_rx)),
+            ])
+        });
+        let drops = m.drops().into_iter().map(|(d, n)| (Value::from(d.name()), Value::from(n))).collect();
+        map(vec![
+            ("uptime_secs", m.uptime_secs().into()),
+            ("handshakes", m.handshakes.load(std::sync::atomic::Ordering::Relaxed).into()),
+            ("relayed", pair(&m.relayed)),
+            ("drops", Value::Map(drops)),
+            ("peers_total", m.peers().len().into()),
+            ("peers", Value::Array(page_of(peers.collect(), page))),
+        ])
+    }
+
+    /// `sub`: which events this client gets (`events`: kinds, all of them replace the former
+    /// choice; nil: back to all but `metrics`), and `metrics_secs`: a `metrics` event that often.
+    fn handle_sub(&self, p: &Value, from: &ApiAddr) -> Reply {
+        let subs = match str_list(p, "events")? {
+            None => None,
+            Some(kinds) => {
+                if let Some(k) = kinds.iter().find(|k| !EVENT_KINDS.contains(&k.as_str())) {
+                    return Err(bad_param(
+                        "events",
+                        &format!("{k}: no such event (one of {})", EVENT_KINDS.join(", ")),
+                    ));
+                }
+                Some(kinds.into_iter().collect::<std::collections::HashSet<_>>())
+            }
+        };
+        let every = match field(p, "metrics_secs") {
+            None => None,
+            Some(v) => Some(Duration::from_secs(
+                v.as_u64().filter(|s| (1..=3600).contains(s)).ok_or_else(|| bad_param("metrics_secs", "1..3600"))?,
+            )),
+        };
+        let log_level = match field(p, "log_level").map(|v| v.as_str().map(str::to_ascii_lowercase)) {
+            None => None,
+            Some(Some(l)) => Some(match l.as_str() {
+                "error" => log::Level::Error,
+                "warn" | "warning" => log::Level::Warn,
+                "info" => log::Level::Info,
+                "debug" => log::Level::Debug,
+                "trace" => log::Level::Trace,
+                _ => return Err(bad_param("log_level", "error, warn, info, debug or trace")),
+            }),
+            Some(None) => return Err(bad_param("log_level", "error, warn, info, debug or trace")),
+        };
+        let mut st = self.state.lock();
+        let c = st.conns.get_mut(from).ok_or_else(|| ApiError::new("unknown_type", "init first"))?;
+        let mut subs = subs;
+        // asking for metrics or a log level means wanting them
+        for (asked, kind) in [(every.is_some(), "metrics"), (log_level.is_some(), "log")] {
+            if asked {
+                let s = subs.get_or_insert_with(|| {
+                    EVENT_KINDS.iter().filter(|k| !matches!(**k, "metrics" | "log")).map(|k| k.to_string()).collect()
+                });
+                s.insert(kind.into());
+            }
+        }
+        c.subs = subs;
+        c.metrics_every = every;
+        c.last_metrics = None;
+        c.log_level = log_level.unwrap_or(log::Level::Info);
+        Ok(Value::Nil)
+    }
+
+    /// The node's log lines to the clients that subscribed to `log`, at their level.
+    async fn log_loop(self: Arc<Self>) {
+        let mut rx = crate::logger::tap();
+        loop {
+            let line = match rx.recv().await {
+                Ok(l) => l,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return,
+            };
+            let to: Vec<ApiAddr> = self
+                .state
+                .lock()
+                .conns
+                .iter()
+                .filter(|(_, c)| c.wants("log") && line.level <= c.log_level)
+                .map(|(a, _)| a.clone())
+                .collect();
+            if to.is_empty() {
+                continue;
+            }
+            let e = map(vec![
+                ("kind", "log".into()),
+                ("level", line.level.as_str().to_ascii_lowercase().into()),
+                ("time", (line.time_ms as f64 / 1000.0).into()),
+                ("text", line.text.into()),
+            ]);
+            let v = map(vec![("type", "event".into()), ("event", e)]);
+            for a in to {
+                self.sock.send(&v, &a).await;
+            }
+        }
+    }
+
+    /// Once a second: what changed in the node since the last look goes out as events
+    /// (`neighbor`, `route`, `exit`, `member`, `epoch`), and `metrics` to those who asked.
+    async fn watch_loop(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last: Option<watch::Snapshot> = None;
+        loop {
+            tick.tick().await;
+            let now = watch::Snapshot::of(&self.node);
+            if let Some(old) = &last {
+                let names = self.names();
+                for (kind, e) in watch::diff(old, &now, &|k: &NodeId| names.get(k).cloned()) {
+                    self.broadcast(kind, e).await;
+                }
+            }
+            last = Some(now);
+            let due: Vec<ApiAddr> = {
+                let mut st = self.state.lock();
+                st.conns
+                    .iter_mut()
+                    .filter(|(_, c)| c.wants("metrics"))
+                    .filter(|(_, c)| {
+                        let every = c.metrics_every.unwrap_or(Duration::from_secs(5));
+                        c.last_metrics.is_none_or(|t| t.elapsed() + Duration::from_millis(100) >= every)
+                    })
+                    .map(|(a, c)| {
+                        c.last_metrics = Some(Instant::now());
+                        a.clone()
+                    })
+                    .collect()
+            };
+            if !due.is_empty() {
+                let mut m = self.metrics_value(None);
+                if let Value::Map(fields) = &mut m {
+                    fields.insert(0, (Value::from("kind"), Value::from("metrics")));
+                }
+                let v = map(vec![("type", "event".into()), ("event", m)]);
+                for a in due {
+                    self.sock.send(&v, &a).await;
+                }
+            }
+        }
     }
 
     /// Member names by key, from every certificate we know of.
@@ -1343,7 +1833,7 @@ impl Api {
                     ("uptime_secs", n.metrics.uptime_secs().into()),
                 ])
             }
-            "neighbors" => Value::Array(
+            "neighbors" => Value::Array(page_of(
                 self.node
                     .direct_links()
                     .into_iter()
@@ -1365,7 +1855,8 @@ impl Api {
                         ])
                     })
                     .collect(),
-            ),
+                page_arg(p)?,
+            )),
             "routes" => {
                 let mesh = self.node.mesh_routes().into_iter().map(|(d, f, c)| {
                     map(vec![
@@ -1385,33 +1876,16 @@ impl Api {
                     };
                     map(vec![("net", r.net.to_string().into()), ("to", target.into()), ("system", r.system.into())])
                 });
-                map(vec![("mesh", Value::Array(mesh.collect())), ("ckr", Value::Array(ckr.collect()))])
-            }
-            "metrics" => {
-                let m = &self.node.metrics;
-                let pair = |p: &crate::metrics::Pair| {
-                    let (packets, bytes) = p.get();
-                    map(vec![("packets", packets.into()), ("bytes", bytes.into())])
-                };
-                let peers = m.peers().into_iter().map(|(id, c)| {
-                    map(vec![
-                        ("key", id.to_string().into()),
-                        ("name", opt_str(storage.name(&id))),
-                        ("ip_tx", pair(&c.ip_tx)),
-                        ("ip_rx", pair(&c.ip_rx)),
-                        ("wire_tx", pair(&c.wire_tx)),
-                        ("wire_rx", pair(&c.wire_rx)),
-                    ])
-                });
-                let drops = m.drops().into_iter().map(|(d, n)| (Value::from(d.name()), Value::from(n))).collect();
+                let (mesh, ckr): (Vec<Value>, Vec<Value>) = (mesh.collect(), ckr.collect());
+                let page = page_arg(p)?;
                 map(vec![
-                    ("uptime_secs", m.uptime_secs().into()),
-                    ("handshakes", m.handshakes.load(std::sync::atomic::Ordering::Relaxed).into()),
-                    ("relayed", pair(&m.relayed)),
-                    ("drops", Value::Map(drops)),
-                    ("peers", Value::Array(peers.collect())),
+                    ("mesh_total", mesh.len().into()),
+                    ("ckr_total", ckr.len().into()),
+                    ("mesh", Value::Array(page_of(mesh, page))),
+                    ("ckr", Value::Array(page_of(ckr, page))),
                 ])
             }
+            "metrics" => self.metrics_value(page_arg(p)?),
             "version" => map(vec![
                 ("api", API_VERSION.into()),
                 ("api_min", API_VERSION_MIN.into()),
@@ -1419,7 +1893,10 @@ impl Api {
                 ("wire", String::from_utf8_lossy(crate::noise::PROLOGUE).into_owned().into()),
             ]),
             "group" => self.group_info(),
-            "members" => self.members(),
+            "members" => match self.members() {
+                Value::Array(all) => Value::Array(page_of(all, page_arg(p)?)),
+                other => other,
+            },
             "exit" => self.exit_info(),
             "acl" => self.acl_info(),
             // nil: no path known now (not an error)
@@ -2267,6 +2744,143 @@ mod tests {
         let rv = c.revoke(&stranger, None).await.unwrap();
         assert_eq!((rv.name, rv.epoch, rv.at), (None, None, None), "revoked without seeing it, psk kept");
         assert_eq!(code(c.revoke("alice", Some(30)).await), Some(ErrorCode::RevokeSelf));
+        std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
+    }
+
+    /// The next event that `f` picks, within 4 s (the watcher looks once a second).
+    async fn next_event<T>(
+        rx: &mut tokio::sync::broadcast::Receiver<dvpn_client::Event>,
+        f: impl Fn(&dvpn_client::Event) -> Option<T>,
+    ) -> T {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if let Some(t) = f(&rx.recv().await.expect("events")) {
+                    return t;
+                }
+            }
+        })
+        .await
+        .expect("the event came")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn events_of_changes() {
+        use dvpn_client::{ErrorCode, Event, EventKind, ExitUpdate, MemberAction, NodeChange, Subscription};
+        let (c, node, _) = client_for(true).await;
+        let mut rx = c.events();
+        assert_eq!(
+            code(c.raw("sub", "", vec![("events", Value::Array(vec!["nope".into()]))]).await),
+            Some(ErrorCode::BadParam)
+        );
+        let kinds = vec![EventKind::Exit, EventKind::Member, EventKind::Epoch];
+        c.subscribe(&Subscription { kinds, metrics_secs: Some(1), log_level: None }).await.unwrap();
+
+        let m = next_event(&mut rx, |e| match e {
+            Event::Metrics(m) => Some(m.clone()),
+            _ => None,
+        })
+        .await;
+        assert!(m.drops.contains_key("no_route"), "{m:?}");
+
+        c.set_exit(&ExitUpdate { v4: Some(vec!["bob".into()]), ..Default::default() }).await.unwrap();
+        let blocked = next_event(&mut rx, |e| match e {
+            Event::Exit { blocked, active } => Some((blocked.v4, active.v4.clone())),
+            _ => None,
+        })
+        .await;
+        assert_eq!(blocked, (true, None), "a gateway set, none alive: the kill switch blocks");
+
+        c.set_node("bob", &NodeChange { name: Some("robert".into()), ..Default::default() }).await.unwrap();
+        let (action, name) = next_event(&mut rx, |e| match e {
+            Event::Member { action, name, .. } => Some((*action, name.clone())),
+            _ => None,
+        })
+        .await;
+        assert_eq!((action, name.as_deref()), (MemberAction::Update, Some("robert")));
+
+        c.revoke("robert", None).await.unwrap();
+        let action = next_event(&mut rx, |e| match e {
+            Event::Member { action, revoked: true, .. } => Some(*action),
+            _ => None,
+        })
+        .await;
+        assert_eq!(action, MemberAction::Revoke);
+
+        c.rotate(60).await.unwrap();
+        let next = next_event(&mut rx, |e| match e {
+            Event::Epoch { epoch: 0, next: Some(n) } => Some(n.epoch),
+            _ => None,
+        })
+        .await;
+        assert_eq!(next, 1);
+
+        // only what was asked for: no neighbor, route, peer events
+        while let Ok(e) = rx.try_recv() {
+            assert!(
+                matches!(e, Event::Metrics(_) | Event::Exit { .. } | Event::Member { .. } | Event::Epoch { .. }),
+                "{e:?}"
+            );
+        }
+        std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn log_events() {
+        use dvpn_client::{Event, ExitUpdate, LogLevel, Subscription};
+        // the log goes nowhere (not into the test output), the API still gets its lines
+        crate::logger::set_sink(Box::new(|_, _| {}));
+        crate::logger::init(log::LevelFilter::Info);
+        let (c, node, _) = client_for(true).await;
+        let mut rx = c.events();
+        c.subscribe(&Subscription { log_level: Some(LogLevel::Info), ..Default::default() }).await.unwrap();
+        c.set_exit(&ExitUpdate { v4: Some(vec!["bob".into()]), ..Default::default() }).await.unwrap();
+        let (level, text) = next_event(&mut rx, |e| match e {
+            Event::Log { level, text, .. } if text.contains("gateways from config") => Some((*level, text.clone())),
+            _ => None,
+        })
+        .await;
+        assert_eq!(level, LogLevel::Info);
+        assert!(!text.contains('\x1b'), "plain text: {text:?}");
+        // a warning-only subscriber gets no info lines
+        c.subscribe(&Subscription { log_level: Some(LogLevel::Warn), ..Default::default() }).await.unwrap();
+        while rx.try_recv().is_ok() {}
+        c.set_exit(&ExitUpdate { clear: true, ..Default::default() }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        while let Ok(e) = rx.try_recv() {
+            assert!(!matches!(e, Event::Log { level: LogLevel::Info, .. }), "{e:?}");
+        }
+        std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_answers_come_in_parts() {
+        use dvpn_client::ErrorCode;
+        let (c, node, secret) = client_for(true).await;
+        let store = node.group_store();
+        for i in 0..700u32 {
+            let addr = std::net::Ipv4Addr::from(0x0a0b_0000 + i);
+            let b = CertBody::new(
+                Identity::generate().id(),
+                &format!("m{i:03}"),
+                vec![format!("{addr}/32").parse().unwrap()],
+            );
+            store.add(&secret, crate::state::Body::Cert(Box::new(secret.issue(b))), false);
+        }
+        assert_eq!(code(c.raw("get", "members", Vec::new()).await), Some(ErrorCode::TooLarge));
+        let part = c.raw("get", "members", vec![("offset", 10.into()), ("limit", 5.into())]).await.unwrap();
+        let names: Vec<_> = part.as_array().unwrap().iter().map(|m| s(m, "name").unwrap().to_owned()).collect();
+        assert_eq!(names, ["m007", "m008", "m009", "m010", "m011"], "alice, bob, dave first, then by name");
+        assert_eq!(code(c.raw("get", "members", vec![("limit", 0.into())]).await), Some(ErrorCode::BadParam));
+
+        // dvpn-client takes it in parts by itself
+        let all = c.members().await.unwrap();
+        assert_eq!(all.len(), 703);
+        assert_eq!(all.iter().filter(|m| m.name.as_deref().is_some_and(|n| n.starts_with('m'))).count(), 700);
+
+        let r = c.raw("get", "routes", vec![("limit", 1.into())]).await.unwrap();
+        assert_eq!(field(&r, "mesh_total").and_then(Value::as_u64), Some(0));
+        let m = c.metrics().await.unwrap();
+        assert_eq!(m.peers_total, Some(0));
         std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
     }
 

@@ -221,7 +221,12 @@
     вместо UDP (и при `-d`); на UDP изменения по токену из `api-<port>.token`, `[api] token = "all"`;
     `dvpn-client` находит сокет и токен сам; Windows: права через `icacls` — не проверено на живой системе;
     named pipe на Windows — на будущее (2026-11-03)
-  - [ ] события, размер ответов (A.4)
+  - [x] события: `kind` в каждом, `neighbor`/`route`/`exit`/`member`/`epoch` из сравнения состояния раз в
+    секунду, `metrics` по подписке; `sub` (виды и `metrics_secs`); `dvpn-client`: `events()` с типом `Event`,
+    `subscribe`, повтор подписки после повторного `init` (2026-11-03)
+  - [x] размер ответов (A.4): `too_large` вместо потери, `offset`/`limit` для `members`, `neighbors`, `routes`,
+    `metrics` с `*_total`, `dvpn-client` собирает части сам; события `log` по подписке с уровнем, без строк
+    самого API (2026-11-03)
 - [ ] **9.2** DVPNrs (крейт `dvpn-client` в workspace этого репозитория, MIT OR Apache-2.0; план в
   `dvpn-client/PLAN.md`; CLI переходит на него): клиент на Rust по образцу DVPNpy — UDP/unix, автоопределение адреса,
   init/ping/переподключение, типизированные запросы, ответы и ошибки, поток событий, «трубы» маршрутов 32–255;

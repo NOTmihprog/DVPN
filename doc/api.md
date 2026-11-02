@@ -74,13 +74,20 @@ UDP `127.0.0.1:9902`.
 {"type": "res", "id": 1, "err": "key_validate_error", "msg": "bob: no such node key or name"}
 ```
 
-`err` — стабильный код для программ, `msg` — текст для людей (может меняться). `nil` в `res` — это результат
+`err` — стабильный код для программ, `msg` — текст для людей (может меняться).
+
+Ответ должен помещаться в одну датаграмму (до 65 000 байт). Больший приходит ошибкой `too_large`; списки
+`members`, `neighbors`, `routes` (`mesh` и `ckr`) и `peers` в `metrics` можно просить частями: `"offset": 0,
+"limit": 100`. Ответы `routes` и `metrics` содержат `mesh_total`, `ckr_total`, `peers_total`. `dvpn-client`
+собирает части сам. Событие больше датаграммы узел не отправляет (пишет в журнал). `nil` в `res` — это результат
 («нет данных», «нет пути»), а не ошибка. Сообщение неизвестного типа — `{"type": "error", "err":
 "unknown_type", "msg"}`.
 
 | код | когда |
 |---|---|
 | `version_unsupported` | `init` без `version` или с неподдерживаемой |
+| `too_large` | ответ не помещается в датаграмму: просить частями (`offset`, `limit`) |
+| `not_permitted` | UDP: нет или неверный токен (см. [Доступ](#доступ)) |
 | `unknown_type` | неизвестный `type` сообщения |
 | `unknown_request` | неизвестный `req` |
 | `bad_param` | не хватает параметра или он не того типа (`req`, `arg`, `addr`) |
@@ -221,6 +228,9 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 
 ### Участники и серверы
 
+> Устаревшие (как в v3): вместо `peer_*` — `members` и `neighbors`, вместо `server_*` — `group` (`servers`). Они
+> остаются, но новых полей не получат.
+
 | `req` | параметры | результат |
 |---|---|---|
 | `key` | | свой ключ |
@@ -322,11 +332,37 @@ Invite — секрет: кто его знает, может войти в гр
 
 ## События
 
-Узел рассылает всем клиентам `{"type": "event", "event": {...}}`:
+Узел присылает клиентам `{"type": "event", "event": {"kind": "...", ...}}`. По умолчанию — все виды, кроме
+`metrics` и `log`.
 
-* изменения участников: `{"action": "add" | "update" | "del", "key", "name", "addr", "endpoint", "sub_args"}`;
-* статус сервера обнаружения: `{"server": [ip, port], "status": bool}`;
-* новый замер RTT: `{"key": "...", "ping": 12.3}`.
+| `kind` | когда | поля |
+|---|---|---|
+| `neighbor` | прямая связь появилась, пропала, сменила адрес (роуминг) | `key`, `name`, `state`: `up` / `down` / `moved`, `endpoint` |
+| `route` | сменился первый хоп до участника | `key`, `name`, `via`, `via_name` (nil — пути нет) |
+| `exit` | сменился шлюз или kill switch | `active: {v4, v6}` (`{key, name}` или nil), `blocked: {v4, v6}` |
+| `member` | участник вошёл, изменился (имя, адреса, роли) или исключён | `action`: `add` / `update` / `revoke`, `key`, `name`, `prefixes`, `revoked` |
+| `epoch` | объявлена смена psk или узел на неё перешёл | `epoch` (текущая), `next: {epoch, at}` или nil |
+| `metrics` | раз в `metrics_secs` (только по подписке) | как ответ `get metrics` |
+| `log` | строка журнала узла (только по подписке) | `level` (`error` … `trace`), `time` (unix-секунды с долями), `text` |
+| `peer` | изменилась локальная запись узла (устаревшее, как в v3) | `action`: `add` / `update` / `del`, `key`, `name`, `addr`, `endpoint`, `sub_args` |
+| `server` | сервер обнаружения подключился или отключился | `server: [ip, port]`, `status` |
+| `ping` | новый замер RTT | `key`, `ping` (мс) |
+
+`neighbor`, `route`, `exit`, `member`, `epoch` узел находит, сравнивая своё состояние раз в секунду: событие
+приходит не позже чем через секунду после изменения, кто бы его ни сделал (API, CLI, другой админ).
+
+Выбрать виды событий и частоту `metrics`:
+
+```
+{"type": "sub", "id": 8, "events": ["neighbor", "exit", "metrics"], "metrics_secs": 2}   → nil
+{"type": "sub", "id": 9, "log_level": "warn"}   → вдобавок к обычным — строки журнала от warn и серьёзнее
+{"type": "sub", "id": 10, "events": nil}       → снова все, кроме metrics и log
+```
+
+`events` заменяет прошлый выбор; с `metrics_secs` добавляется `metrics`, с `log_level` (`error`, `warn`, `info`,
+`debug`, `trace`; по умолчанию `info`) — `log`. Журнал не подробнее, чем `[app] log_level` узла; строки самого
+API в события не попадают. Неизвестный вид — `bad_param`. После
+повторного `init` узел подписку забывает (`dvpn-client` отправляет её снова сам).
 
 ## Свои данные поверх сети
 
