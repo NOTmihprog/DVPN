@@ -65,6 +65,10 @@
 | `peer_not_exist`, `error_delete_self_peer` | `del` |
 | `not_int`, `out_of_range`, `route_exist`, `route_not_exist`, `not_permission` | `route` |
 | `gateway_unknown`, `gateway_self`, `dns_invalid`, `sources_invalid`, `table_invalid`, `config_write` | `set exit` |
+| `not_admin`, `clock_untrusted` | операции админа: у узла нет секрета группы; часы раньше сборки (нужен NTP) |
+| `member_unknown`, `member_ambiguous`, `member_not_seen` | участник не найден, имя подходит нескольким, сертификата ещё нет |
+| `addr_taken`, `addr_invalid`, `route_invalid`, `endpoint_invalid`, `no_address`, `config_read` | `set invite`, `set node` |
+| `revoke_self`, `acl_parse` | `set revoke`, `set acl` |
 
 Узлы везде обозначаются полем `key` — публичным ключом узла (base64url). В запросах можно передать однозначное
 начало ключа или имя участника.
@@ -247,6 +251,34 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 Поля, которых нет, не меняются. Ошибки: `gateway_unknown` (не ключ и не имя ровно одного участника, или
 исключённый), `gateway_self`, `dns_invalid`, `sources_invalid`, `table_invalid` (0, 253–255 и таблица DVPN
 заняты), `bad_param`, `config_write` (не удалось записать `config.toml`). При ошибке ничего не меняется.
+
+### Операции админа
+
+Только на узле с секретом группы (иначе `not_admin`) — то же, что `dvpn group invite/revoke/rotate`, `dvpn node
+set`, `dvpn acl set/clear`. Узел сразу применяет новые записи группы и рассылает их серверам обнаружения и
+соседям. Участник в `key` — ключ, начало ключа или имя.
+
+```
+{"type": "set", "req": "invite", "name": "carol",          # имя нового узла (обязательно)
+ "addr": "10.10.33.40",                                     # необязательно: иначе свободный в сети группы
+ "ttl_hours": 24, "statics": ["vps.example.org:8647"],      # статические адреса этого узла для новичка
+ "routes": ["192.168.5.0/24"], "relay": false}
+→ {"invite": "...", "name": "carol", "addr": "10.10.33.40", "until": 1793736000,
+   "warnings": ["no [servers] and no statics: ..."]}
+
+{"type": "set", "req": "node", "key": "bob", "name": "bob2", "addr": "10.10.33.9",
+ "add_routes": ["192.168.2.0/24"], "del_routes": [...], "relay": true}
+→ {"key", "name", "prefixes", "relay", "not_after"}           # новый сертификат участника
+
+{"type": "set", "req": "revoke", "key": "bob", "rotate": true, "lead_secs": 120}
+→ {"key", "name", "epoch", "at"}                             # epoch/at — смена psk (nil с "rotate": false)
+
+{"type": "set", "req": "rotate", "lead_secs": 120}   → {"epoch", "at", "sealed_to"}
+{"type": "set", "req": "acl", "toml": "default = \"deny\"\n..."}   → как get acl
+{"type": "del", "req": "acl"}                        → как get acl
+```
+
+Invite — секрет: кто его знает, может войти в группу (один раз, до `until`). Не пишите его в журналы.
 
 ### set peer / del
 

@@ -956,13 +956,14 @@ src/
 | запрос | параметры | результат / ошибки |
 |---|---|---|
 | `set exit` ✅ (2026-11-02, ещё `clear`) | `v4`, `v6` (списки), `kill_switch`, `dns`, `sources`, `table`; отсутствующие поля не меняются | новые настройки; узел пишет `[exit]` через `conf.set_exits` и применяет сразу. `gateway_unknown`, `dns_invalid`, `sources_invalid`, `table_invalid` |
-| `set invite` | `name`, `addr`?, `ttl_hours`?, `statics`?, `routes`?, `relay`? | `{invite, name, addr, until}`. `addr_taken`, `name_taken`, `endpoint_invalid`, `route_invalid`, `no_servers` (предупреждение, а не ошибка) |
-| `set node` | `key`, `name`?, `addr`?, `add_routes`?, `del_routes`?, `relay`? | новый сертификат участника. `member_not_seen`, `addr_taken`, `key_ambiguous` |
-| `set revoke` | `key`, `rotate` (по умолчанию true), `lead_secs` (120) | `{epoch, at}`. `revoke_self`, `member_unknown` |
-| `set rotate` | `lead_secs` | `{epoch, at, sealed_to}` |
-| `set acl` | `toml` (текст) | разобранные правила. `acl_parse` с `msg` (строка и причина) |
-| `del acl` | | снять все правила |
+| `set invite` ✅ | `name`, `addr`?, `ttl_hours`?, `statics`?, `routes`?, `relay`? | `{invite, name, addr, until}`. `addr_taken`, `name_taken`, `endpoint_invalid`, `route_invalid`, `no_servers` (предупреждение, а не ошибка) |
+| `set node` ✅ | `key`, `name`?, `addr`?, `add_routes`?, `del_routes`?, `relay`? | новый сертификат участника. `member_not_seen`, `addr_taken`, `key_ambiguous` |
+| `set revoke` ✅ | `key`, `rotate` (по умолчанию true), `lead_secs` (120) | `{epoch, at}`. `revoke_self`, `member_unknown` |
+| `set rotate` ✅ | `lead_secs` | `{epoch, at, sealed_to}` |
+| `set acl` ✅ | `toml` (текст) | разобранные правила. `acl_parse` с `msg` (строка и причина) |
+| `del acl` ✅ | | снять все правила |
 
+✅ (2026-11-03) Операции админа сделаны; логика — в `ops.rs`, ею пользуются и CLI, и API.
 Логику `invite` / `node set` / `revoke` / `rotate` / `acl set` из `main.rs` (`cmd_group`, `cmd_node`,
 `cmd_acl`) вынести в `ops.rs` как функции над `StateStore` + `GroupSecret` + `Config`, чтобы CLI и API звали
 одно и то же. Заодно CLI при работающем узле может идти через API (§15 п.7), а без узла — как сейчас, через файлы.

@@ -290,6 +290,45 @@ fn error_msg(code: &str, msg: &str, extra: Vec<(&str, Value)>) -> Value {
     map(v)
 }
 
+fn op_error(e: crate::ops::OpError) -> ApiError {
+    ApiError::new(e.code, e.msg)
+}
+
+/// An optional boolean field (nil: not given).
+fn bool_arg(p: &Value, key: &str) -> Result<Option<bool>, ApiError> {
+    match field(p, key) {
+        None => Ok(None),
+        Some(Value::Boolean(b)) => Ok(Some(*b)),
+        Some(_) => Err(bad_param(key, "expected true or false")),
+    }
+}
+
+/// `lead_secs`: seconds until a new psk is used (default 120, as `dvpn group rotate --in`).
+fn lead_arg(p: &Value) -> Result<u64, ApiError> {
+    match field(p, "lead_secs") {
+        None => Ok(120),
+        Some(v) => v.as_u64().filter(|s| *s <= 7 * 86400).ok_or_else(|| bad_param("lead_secs", "0..604800 seconds")),
+    }
+}
+
+/// A list of networks (`routes`, `add_routes`, ...); missing: none.
+fn nets(p: &Value, key: &str) -> Result<Vec<ipnet::IpNet>, ApiError> {
+    str_list(p, key)?
+        .unwrap_or_default()
+        .iter()
+        .map(|s| s.parse().map_err(|_| ApiError::new("route_invalid", format!("{key}: {s} is not a network"))))
+        .collect()
+}
+
+/// `epoch` and `at` (unix seconds) of the psk change in `changed`, nil if none.
+fn epoch_fields(changed: &[crate::state::Entry]) -> Vec<(&'static str, Value)> {
+    let e = changed.iter().find_map(|e| match e.body {
+        crate::state::Body::Epoch { epoch, active_from } => Some((epoch, active_from / 1000)),
+        _ => None,
+    });
+    vec![("epoch", e.map_or(Value::Nil, |(n, _)| n.into())), ("at", e.map_or(Value::Nil, |(_, at)| at.into()))]
+}
+
 /// A field as sent, nil included (`field` takes nil for missing).
 fn raw_field<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
     v.as_map()?.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v)
@@ -498,8 +537,8 @@ impl Api {
                 None
             }
             "get" => Some(res(id, self.handle_get(p))),
-            "set" => Some(res(id, self.handle_set(p))),
-            "del" => Some(res(id, self.handle_del(p))),
+            "set" => Some(res(id, self.handle_set(p).await)),
+            "del" => Some(res(id, self.handle_del(p).await)),
             "route" => Some(res(id, self.handle_route(p, from))),
             "close" => {
                 self.state.lock().close(from);
@@ -831,6 +870,153 @@ impl Api {
         ])
     }
 
+    // ---- admin operations (`ops.rs`, shared with the CLI): records made here are applied and
+    // spread at once ----
+
+    fn secret(&self) -> Result<&crate::group::GroupSecret, ApiError> {
+        self.node
+            .group_secret()
+            .ok_or_else(|| ApiError::new("not_admin", "only an admin node of the group can do this"))
+    }
+
+    /// `set invite`: an invite for one new node.
+    fn set_invite(&self, p: &Value) -> Reply {
+        self.secret()?;
+        let name = field(p, "name").and_then(Value::as_str).ok_or_else(|| bad_param("name", "the new node's name"))?;
+        let addr = match field(p, "addr") {
+            None => None,
+            Some(v) => Some(
+                v.as_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| ApiError::new("addr_invalid", "addr: expected an IPv4 address"))?,
+            ),
+        };
+        let ttl_hours = match field(p, "ttl_hours") {
+            None => crate::group::JOIN_TTL_SECS / 3600,
+            Some(v) => {
+                v.as_u64().filter(|h| (1..=24 * 365).contains(h)).ok_or_else(|| bad_param("ttl_hours", "1..8760"))?
+            }
+        };
+        let relay = bool_arg(p, "relay")?.unwrap_or(false);
+        let req = crate::ops::InviteRequest {
+            name: name.to_owned(),
+            addr,
+            ttl_hours,
+            statics: str_list(p, "statics")?.unwrap_or_default(),
+            routes: nets(p, "routes")?,
+            relay,
+        };
+        // the invite carries the trackers and the masking profile from the config
+        let dir = self.node.config_path().parent().unwrap_or(std::path::Path::new(".")).to_owned();
+        let conf = tokio::task::block_in_place(|| crate::config::Config::load(&dir))
+            .map_err(|e| ApiError::new("config_read", format!("{e:#}")))?;
+        let g = conf
+            .groups
+            .iter()
+            .find(|g| g.id == self.node.group_id())
+            .ok_or_else(|| ApiError::new("config_read", "the group is not in config.toml"))?;
+        let made = crate::ops::invite(&conf, g, &self.node.member_certs(), &req).map_err(op_error)?;
+        log::info!("API | invite for {} ({}) made", made.name, made.addr);
+        Ok(map(vec![
+            ("invite", made.invite.into()),
+            ("name", made.name.into()),
+            ("addr", made.addr.to_string().into()),
+            ("until", made.until.into()),
+            ("warnings", Value::Array(made.warnings.into_iter().map(Value::from).collect())),
+        ]))
+    }
+
+    /// `set node`: a member's new certificate (name, address, subnets, relay).
+    async fn set_node(&self, p: &Value) -> Reply {
+        let secret = self.secret()?;
+        let certs = self.node.member_certs();
+        let key = self.member_arg(p, &certs)?;
+        let addr = match field(p, "addr") {
+            None => None,
+            Some(v) => Some(
+                v.as_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| ApiError::new("addr_invalid", "addr: expected an IPv4 address"))?,
+            ),
+        };
+        let name = match field(p, "name") {
+            None => None,
+            Some(v) => Some(v.as_str().ok_or_else(|| bad_param("name", "expected a string"))?.to_owned()),
+        };
+        let change = crate::ops::NodeChange {
+            name,
+            addr,
+            add_routes: nets(p, "add_routes")?,
+            del_routes: nets(p, "del_routes")?,
+            relay: bool_arg(p, "relay")?,
+        };
+        let (cert, entry) =
+            crate::ops::change_node(secret, self.node.group_store(), &certs, key, &change).map_err(op_error)?;
+        self.node.publish(&[entry]).await;
+        let b = &cert.body;
+        Ok(map(vec![
+            ("key", b.node.to_string().into()),
+            ("name", b.name.clone().into()),
+            ("prefixes", Value::Array(b.prefixes.iter().map(|p| p.to_string().into()).collect())),
+            ("relay", b.roles.has(crate::group::Roles::RELAY).into()),
+            ("not_after", b.not_after.into()),
+        ]))
+    }
+
+    /// `set revoke`: exclude a member, and (unless `rotate: false`) change the psk in `lead_secs`.
+    async fn set_revoke(&self, p: &Value) -> Reply {
+        let secret = self.secret()?;
+        let certs = self.node.member_certs();
+        let key = self.member_arg(p, &certs)?;
+        let lead = lead_arg(p)?;
+        let rotate = bool_arg(p, "rotate")?.unwrap_or(true).then_some(lead);
+        let me = self.node.storage.self_id();
+        let changed = crate::ops::revoke(secret, self.node.group_store(), me, key, self.node.psk_epoch().0, rotate)
+            .map_err(op_error)?;
+        self.node.publish(&changed).await;
+        let name = certs.iter().find(|c| c.body.node == key).map(|c| c.body.name.clone());
+        log::info!("API | {} revoked", name.as_deref().unwrap_or(&key.short()));
+        let mut out = vec![("key", Value::from(key.to_string())), ("name", opt_str(name))];
+        out.extend(epoch_fields(&changed));
+        Ok(map(out))
+    }
+
+    /// `set rotate`: a new psk in `lead_secs` (e.g. an invite may have leaked).
+    async fn set_rotate(&self, p: &Value) -> Reply {
+        let secret = self.secret()?;
+        let lead = lead_arg(p)?;
+        let changed =
+            crate::ops::rotate(secret, self.node.group_store(), self.node.psk_epoch().0, lead).map_err(op_error)?;
+        self.node.publish(&changed).await;
+        let mut out = epoch_fields(&changed);
+        out.push(("sealed_to", (changed.len().saturating_sub(1)).into()));
+        Ok(map(out))
+    }
+
+    /// `set acl`: the group's access rules from TOML (`doc/acl.md`); answers like `get acl`.
+    async fn set_acl(&self, p: &Value) -> Reply {
+        let secret = self.secret()?;
+        let text = field(p, "toml").and_then(Value::as_str).ok_or_else(|| bad_param("toml", "the rules as TOML"))?;
+        let certs = self.node.member_certs();
+        let (_, entry) = crate::ops::set_acl(secret, self.node.group_store(), &certs, text).map_err(op_error)?;
+        self.node.publish(&[entry]).await;
+        Ok(self.acl_info())
+    }
+
+    /// `del acl`: no rules, everybody may reach everybody.
+    async fn del_acl(&self) -> Reply {
+        let secret = self.secret()?;
+        let entry = crate::ops::clear_acl(secret, self.node.group_store()).map_err(op_error)?;
+        self.node.publish(&[entry]).await;
+        Ok(self.acl_info())
+    }
+
+    /// `key` of an admin request: a member key, unique key prefix or name among `certs`.
+    fn member_arg(&self, p: &Value, certs: &[crate::group::Cert]) -> Result<NodeId, ApiError> {
+        let s = field(p, "key").and_then(Value::as_str).ok_or_else(|| bad_param("key", "a member key or name"))?;
+        crate::ops::find_member(certs, s).map_err(op_error)
+    }
+
     /// `key`: a full node key, a unique prefix of a known one or a member name. Errors:
     /// `key_validate_error` (missing, invalid or unknown), `key_ambiguous`.
     fn peer_arg(&self, p: &Value) -> Result<NodeId, ApiError> {
@@ -1028,10 +1214,15 @@ impl Api {
         })
     }
 
-    fn handle_set(&self, p: &Value) -> Reply {
+    async fn handle_set(&self, p: &Value) -> Reply {
         match field(p, "req").and_then(Value::as_str) {
             Some("peer") => self.set_peer(p),
             Some("exit") => self.set_exit(p),
+            Some("invite") => self.set_invite(p),
+            Some("node") => self.set_node(p).await,
+            Some("revoke") => self.set_revoke(p).await,
+            Some("rotate") => self.set_rotate(p).await,
+            Some("acl") => self.set_acl(p).await,
             Some(other) => Err(ApiError::new("unknown_request", format!("set {other:?}: no such request"))),
             None => Err(bad_param("req", "missing")),
         }
@@ -1091,9 +1282,12 @@ impl Api {
         Ok(Value::Nil)
     }
 
-    fn handle_del(&self, p: &Value) -> Reply {
+    async fn handle_del(&self, p: &Value) -> Reply {
         let storage = &self.node.storage;
         let req = field(p, "req").and_then(Value::as_str).ok_or_else(|| bad_param("req", "missing"))?;
+        if req == "acl" {
+            return self.del_acl().await;
+        }
         if !matches!(req, "peer" | "peer_endpoint") {
             return Err(ApiError::new("unknown_request", format!("del {req:?}: no such request")));
         }
@@ -1192,7 +1386,7 @@ mod tests {
             store: Arc::new(StateStore::memory()),
             epoch: 0,
             psk: secret.psk(0),
-            identity,
+            identity: identity.clone(),
             on_cert: Box::new(|_| {}),
             on_epoch: Box::new(|_, _| {}),
             statics: Vec::new(),
@@ -1204,19 +1398,38 @@ mod tests {
             resolved_tun: None,
             tun_dns: false,
             exits: Default::default(),
-            config_path: test_config(),
+            config_path: test_config(&identity, admin.then_some(&secret), &cert),
         };
         let node = Node::new(storage, transport, (links, e2e), Vec::new(), None, cert.body.ipv4(), ctx);
         (Api { node, sock: ApiSocket::bind("127.0.0.1:0").await.unwrap(), state: Mutex::new(State::default()) }, secret)
     }
 
-    /// A config file of its own for each test node (`set exit` writes `[exit]` to it).
-    fn test_config() -> std::path::PathBuf {
+    /// A config of its own for each test node, with its key and group (an invite takes the
+    /// group's psk and masking from it; `set exit` writes `[exit]` to it), and a comment of the
+    /// user's that must survive.
+    fn test_config(identity: &Identity, secret: Option<&GroupSecret>, cert: &crate::group::Cert) -> std::path::PathBuf {
         let tag = encode_b64(&crate::crypto::random_bytes::<9>());
         let dir = std::env::temp_dir().join(format!("dvpn-api-test-{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(&path, "# my own comment\n[peer]\nbind_port = 8647\n").unwrap();
+        let mut conf = crate::config::Config::load(&dir).unwrap();
+        conf.set_private_key(identity.clone());
+        let id = cert.body.group;
+        let psk = crate::group::GroupSecret::psk;
+        conf.add_group(crate::config::GroupConfig {
+            name: "home".into(),
+            id,
+            secret: secret.cloned(),
+            epoch: 0,
+            psk: secret.map_or([7; 32], |s| psk(s, 0)),
+            cert: Some(cert.clone()),
+            obfs: Default::default(),
+            obfs_entries: Vec::new(),
+        });
+        conf.save();
+        let path = conf.path().to_owned();
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("\n# my own comment\n");
+        std::fs::write(&path, text).unwrap();
         path
     }
 
@@ -1511,7 +1724,7 @@ mod tests {
         assert_eq!(field(blocked, "v6").and_then(Value::as_bool), Some(true), "{e}");
         // written to the config, the rest of it kept
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("# my own comment") && text.contains("bind_port = 8647"), "{text}");
+        assert!(text.contains("# my own comment") && text.contains("[[groups]]"), "{text}");
         let on_disk = crate::config::read_exits(&path).unwrap();
         assert_eq!((on_disk.v4, on_disk.v6), (vec![bob.to_string()], vec!["bob".to_owned()]));
         assert_eq!(on_disk.table, Some(100));
@@ -1677,6 +1890,128 @@ mod tests {
         let tag = encode_b64(&crate::crypto::random_bytes::<9>());
         let path = std::env::temp_dir().join(format!("dvpn-api-test-{tag}.sock"));
         client_session(path.to_str().unwrap()).await;
+    }
+
+    /// The API started on UDP with `dvpn-client` connected to it.
+    async fn client_for(admin: bool) -> (dvpn_client::Client, Arc<Node>, GroupSecret) {
+        let (api, secret) = api_with_secret(admin).await;
+        add_members(&api, &secret);
+        let node = api.node.clone();
+        let sock = ApiSocket::bind("127.0.0.1:0").await.unwrap();
+        let at: dvpn_client::ApiAddr = sock.describe().parse().unwrap();
+        Api::start(node.clone(), sock);
+        (dvpn_client::Client::connect(at, "test").await.unwrap(), node, secret)
+    }
+
+    fn code<T>(r: Result<T, dvpn_client::Error>) -> Option<dvpn_client::ErrorCode> {
+        r.err().and_then(|e| e.code().cloned())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admin_operations_need_the_secret() {
+        use dvpn_client::{ErrorCode, InviteRequest, NodeChange};
+        let (c, node, _) = client_for(false).await;
+        assert!(!c.info().admin);
+        let invite = InviteRequest { name: "carol".into(), ..Default::default() };
+        assert_eq!(code(c.invite(&invite).await), Some(ErrorCode::NotAdmin));
+        assert_eq!(code(c.set_node("bob", &NodeChange::default()).await), Some(ErrorCode::NotAdmin));
+        assert_eq!(code(c.revoke("bob", Some(120)).await), Some(ErrorCode::NotAdmin));
+        assert_eq!(code(c.rotate(120).await), Some(ErrorCode::NotAdmin));
+        assert_eq!(code(c.set_acl("default = \"deny\"\n").await), Some(ErrorCode::NotAdmin));
+        assert_eq!(code(c.clear_acl().await), Some(ErrorCode::NotAdmin));
+        std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admin_operations() {
+        use dvpn_client::{ErrorCode, InviteRequest, NodeChange};
+        let (c, node, _) = client_for(true).await;
+        let now = crate::clock::now_unix();
+
+        // an invite, and a new node joining by it
+        let req = InviteRequest {
+            name: "carol".into(),
+            routes: vec!["192.168.5.0/24".into()],
+            relay: true,
+            ..Default::default()
+        };
+        let made = c.invite(&req).await.unwrap();
+        assert_eq!(made.name, "carol");
+        let addr: std::net::Ipv4Addr = made.addr.parse().unwrap();
+        assert!(addr.octets()[..3] == [10, 10, 33] && ![1, 2, 4].contains(&addr.octets()[3]), "{addr}: a free one");
+        assert!(made.until > now + 23 * 3600 && made.until <= now + 24 * 3600 + 1);
+        assert!(made.warnings.iter().any(|w| w.contains("no [servers]")), "{:?}", made.warnings);
+        let dir =
+            std::env::temp_dir().join(format!("dvpn-api-test-{}", encode_b64(&crate::crypto::random_bytes::<9>())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut newcomer = crate::config::Config::load(&dir).unwrap();
+        let joined = crate::ops::join(&mut newcomer, &made.invite).unwrap();
+        assert_eq!((joined.group.as_str(), joined.name.as_str(), joined.addr), ("home", "carol", Some(addr)));
+        assert_eq!(joined.id, node.group_id());
+        let cert = newcomer.groups[0].cert.clone().unwrap();
+        assert!(cert.body.roles.has(crate::group::Roles::RELAY));
+        assert!(cert.body.prefixes.contains(&"192.168.5.0/24".parse().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let cr = &c;
+        let bad = |r: InviteRequest| async move { code(cr.invite(&r).await) };
+        let named = |name: &str| InviteRequest { name: name.into(), ..Default::default() };
+        let with = |f: fn(&mut InviteRequest)| {
+            let mut r = named("x");
+            f(&mut r);
+            r
+        };
+        assert_eq!(bad(named("")).await, Some(ErrorCode::BadParam));
+        assert_eq!(bad(with(|r| r.addr = Some("10.10.33.2".into()))).await, Some(ErrorCode::AddrTaken));
+        assert_eq!(bad(with(|r| r.addr = Some("192.0.2.1".into()))).await, Some(ErrorCode::AddrInvalid));
+        assert_eq!(bad(with(|r| r.addr = Some("nope".into()))).await, Some(ErrorCode::AddrInvalid));
+        assert_eq!(bad(with(|r| r.routes = vec!["10.0.0.0/99".into()])).await, Some(ErrorCode::RouteInvalid));
+        assert_eq!(bad(with(|r| r.statics = vec!["no-port".into()])).await, Some(ErrorCode::EndpointInvalid));
+        assert_eq!(bad(with(|r| r.ttl_hours = Some(0))).await, Some(ErrorCode::BadParam));
+
+        // a member changed: a new certificate in the records, at once
+        let ch = NodeChange {
+            addr: Some("10.10.33.9".into()),
+            add_routes: vec!["192.168.2.0/24".into()],
+            relay: Some(false),
+            ..Default::default()
+        };
+        let nc = c.set_node("bob", &ch).await.unwrap();
+        assert_eq!(nc.prefixes, vec!["10.10.33.9/32", "192.168.1.0/24", "192.168.2.0/24"]);
+        assert!(!nc.relay && nc.not_after >= now + crate::group::CERT_TTL_SECS);
+        let bob = c.members().await.unwrap().into_iter().find(|m| m.name.as_deref() == Some("bob")).unwrap();
+        assert_eq!((bob.addrs, bob.roles), (vec!["10.10.33.9".to_owned()], Vec::<String>::new()));
+        let taken = NodeChange { addr: Some("10.10.33.4".into()), ..Default::default() };
+        assert_eq!(code(c.set_node("alice", &taken).await), Some(ErrorCode::AddrTaken), "dave's, revoked or not");
+        assert_eq!(code(c.set_node("nobody", &NodeChange::default()).await), Some(ErrorCode::MemberUnknown));
+        let stranger = Identity::generate().id().to_string();
+        assert_eq!(code(c.set_node(&stranger, &NodeChange::default()).await), Some(ErrorCode::MemberNotSeen));
+
+        // access rules
+        let acl = c.set_acl("default = \"deny\"\n[[rule]]\nfrom = [\"alice\"]\nto = [\"bob\"]\naction = \"allow\"\n");
+        let acl = acl.await.unwrap();
+        assert!(acl.set && acl.default == "deny");
+        assert_eq!((acl.rules[0].from.clone(), acl.rules[0].to.clone()), (vec!["alice".into()], vec!["bob".into()]));
+        assert_eq!(code(c.set_acl("default = ").await), Some(ErrorCode::AclParse));
+        assert_eq!(code(c.set_acl("[[rule]]\nfrom = [\"nobody\"]\n").await), Some(ErrorCode::AclParse));
+        assert!(c.acl().await.unwrap().set, "a refused change leaves the rules");
+        assert!(!c.clear_acl().await.unwrap().set);
+
+        // psk changes
+        let r = c.rotate(60).await.unwrap();
+        assert_eq!((r.epoch, r.sealed_to), (1, 1), "sealed to bob (dave is revoked)");
+        assert!(r.at >= now + 59 && r.at <= now + 61, "{}", r.at);
+        let next = c.group().await.unwrap().next_epoch.unwrap();
+        assert_eq!((next.epoch, next.started, next.has_key), (1, false, true));
+
+        let rv = c.revoke("bob", Some(30)).await.unwrap();
+        assert_eq!((rv.name.as_deref(), rv.epoch), (Some("bob"), Some(2)));
+        let members = c.members().await.unwrap();
+        assert!(members.iter().find(|m| m.name.as_deref() == Some("bob")).unwrap().revoked);
+        let rv = c.revoke(&stranger, None).await.unwrap();
+        assert_eq!((rv.name, rv.epoch, rv.at), (None, None, None), "revoked without seeing it, psk kept");
+        assert_eq!(code(c.revoke("alice", Some(30)).await), Some(ErrorCode::RevokeSelf));
+        std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
     }
 
     #[test]

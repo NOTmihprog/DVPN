@@ -189,10 +189,73 @@ impl Client {
         self.get("acl", Vec::new()).await
     }
 
+    // ---- admin operations (the node must hold the group secret, else `ErrorCode::NotAdmin`) ----
+
+    /// An invite for one new node.
+    pub async fn invite(&self, r: &InviteRequest) -> Result<InviteMade, Error> {
+        let mut f = vec![("name", Value::from(r.name.as_str())), ("relay", Value::from(r.relay))];
+        if let Some(a) = &r.addr {
+            f.push(("addr", a.as_str().into()));
+        }
+        if let Some(h) = r.ttl_hours {
+            f.push(("ttl_hours", h.into()));
+        }
+        f.push(("statics", strings(&r.statics)));
+        f.push(("routes", strings(&r.routes)));
+        from_value(self.raw("set", "invite", f).await?)
+    }
+
+    /// Issues member `node` (key, key prefix or name) a new certificate with `ch` applied.
+    pub async fn set_node(&self, node: &str, ch: &NodeChange) -> Result<NodeCert, Error> {
+        let mut f = vec![("key", Value::from(node))];
+        if let Some(n) = &ch.name {
+            f.push(("name", n.as_str().into()));
+        }
+        if let Some(a) = &ch.addr {
+            f.push(("addr", a.as_str().into()));
+        }
+        f.push(("add_routes", strings(&ch.add_routes)));
+        f.push(("del_routes", strings(&ch.del_routes)));
+        if let Some(r) = ch.relay {
+            f.push(("relay", r.into()));
+        }
+        from_value(self.raw("set", "node", f).await?)
+    }
+
+    /// Excludes member `node` from the group; with `rotate_in` also changes the psk that many
+    /// seconds later (so the revoked node cannot unmask headers any more; 120 is the CLI's
+    /// default).
+    pub async fn revoke(&self, node: &str, rotate_in: Option<u64>) -> Result<Revoked, Error> {
+        let mut f = vec![("key", Value::from(node)), ("rotate", Value::from(rotate_in.is_some()))];
+        if let Some(s) = rotate_in {
+            f.push(("lead_secs", s.into()));
+        }
+        from_value(self.raw("set", "revoke", f).await?)
+    }
+
+    /// A new group psk in `lead_secs` seconds.
+    pub async fn rotate(&self, lead_secs: u64) -> Result<Rotated, Error> {
+        from_value(self.raw("set", "rotate", vec![("lead_secs", lead_secs.into())]).await?)
+    }
+
+    /// Makes `toml` (`doc/acl.md`) the group's access rules.
+    pub async fn set_acl(&self, toml: &str) -> Result<Acl, Error> {
+        from_value(self.raw("set", "acl", vec![("toml", toml.into())]).await?)
+    }
+
+    /// Removes the group's access rules.
+    pub async fn clear_acl(&self) -> Result<Acl, Error> {
+        from_value(self.raw("del", "acl", Vec::new()).await?)
+    }
+
     /// Drops the current connection to `node`: it is made again from scratch.
     pub async fn reset_endpoint(&self, node: &str) -> Result<(), Error> {
         self.raw("del", "peer_endpoint", vec![("key", node.into())]).await.map(|_| ())
     }
+}
+
+fn strings(l: &[String]) -> Value {
+    Value::Array(l.iter().map(|s| Value::from(s.as_str())).collect())
 }
 
 impl Drop for Client {

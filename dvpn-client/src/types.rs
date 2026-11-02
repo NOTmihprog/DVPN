@@ -332,3 +332,68 @@ pub struct AclRule {
     pub ports: Vec<(u16, u16)>,
     pub allow: bool,
 }
+
+/// What an invite is for (`set invite`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InviteRequest {
+    /// The new node's name.
+    pub name: String,
+    /// Its IPv4 address (None: a free one in the group network).
+    pub addr: Option<String>,
+    /// How long the invite can be used (None: the node's default, 24 h).
+    pub ttl_hours: Option<u64>,
+    /// The admin node's fixed addresses (`host:port`) the new node connects to directly.
+    pub statics: Vec<String>,
+    /// Subnets behind the new node.
+    pub routes: Vec<String>,
+    pub relay: bool,
+}
+
+/// A made invite.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct InviteMade {
+    /// For the new node (`dvpn group join`): a secret, pass it on privately.
+    pub invite: String,
+    pub name: String,
+    pub addr: String,
+    /// Usable until (unix seconds).
+    pub until: u64,
+    pub warnings: Vec<String>,
+}
+
+/// Changes to a member (`set node`); `None` / empty: unchanged.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeChange {
+    pub name: Option<String>,
+    pub addr: Option<String>,
+    pub add_routes: Vec<String>,
+    pub del_routes: Vec<String>,
+    pub relay: Option<bool>,
+}
+
+/// A member's new certificate.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct NodeCert {
+    pub key: String,
+    pub name: String,
+    pub prefixes: Vec<String>,
+    pub relay: bool,
+    pub not_after: u64,
+}
+
+/// A revoked member, and the psk change that came with it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct Revoked {
+    pub key: String,
+    pub name: Option<String>,
+    pub epoch: Option<u32>,
+    pub at: Option<u64>,
+}
+
+/// A psk change: epoch `epoch` from `at`, sealed to `sealed_to` members.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct Rotated {
+    pub epoch: u32,
+    pub at: u64,
+    pub sealed_to: u64,
+}

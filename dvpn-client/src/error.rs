@@ -118,6 +118,19 @@ codes! {
     SourcesInvalid = "sources_invalid",
     TableInvalid = "table_invalid",
     ConfigWrite = "config_write",
+    ConfigRead = "config_read",
+    NotAdmin = "not_admin",
+    ClockUntrusted = "clock_untrusted",
+    MemberUnknown = "member_unknown",
+    MemberAmbiguous = "member_ambiguous",
+    MemberNotSeen = "member_not_seen",
+    AddrTaken = "addr_taken",
+    AddrInvalid = "addr_invalid",
+    EndpointInvalid = "endpoint_invalid",
+    RouteInvalid = "route_invalid",
+    NoAddress = "no_address",
+    RevokeSelf = "revoke_self",
+    AclParse = "acl_parse",
 }
 
 impl fmt::Display for ErrorCode {

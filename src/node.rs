@@ -273,6 +273,19 @@ impl Node {
         &self.group.store
     }
 
+    /// The group secret, on an admin node (for the API's admin operations).
+    pub(crate) fn group_secret(&self) -> Option<&GroupSecret> {
+        self.group.secret.as_ref()
+    }
+
+    /// Group records this node just made (an admin's change through the API): applied here and
+    /// sent to the trackers and neighbours at once, without waiting for the records file to be
+    /// noticed (the store in memory already has them).
+    pub async fn publish(&self, changed: &[Entry]) {
+        self.apply(changed);
+        self.spread(changed).await;
+    }
+
     /// The config file the node follows `[exit]` in.
     pub fn config_path(&self) -> &std::path::Path {
         &self.group.config_path

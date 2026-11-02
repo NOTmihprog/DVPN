@@ -134,7 +134,7 @@ let (from, data) = pipe.recv().await?;
 `members`, `exit`/`set_exit`, `acl`, `reset_endpoint`. Вместо `MockNode` пока тесты против настоящего узла:
 `api::tests::client_over_udp` / `client_over_a_unix_socket` в `dvpn`. Не сделано: `peer_*`/`server_*` (устаревшие
 — только через `raw`), типизированные события, `MockNode`.
-Этап 7 для CLI начат: диагностика (`status`, `neighbors`, `routes`, `metrics`, `path`, `ping`) идёт через клиент,
+Этап 6 частично (2026-11-03): `invite`, `set_node`, `revoke`, `rotate`, `set_acl`, `clear_acl`. Этап 7 для CLI начат: диагностика (`status`, `neighbors`, `routes`, `metrics`, `path`, `ping`) идёт через клиент,
 `api::query` удалён.
 
 | # | Что | Готово, когда |

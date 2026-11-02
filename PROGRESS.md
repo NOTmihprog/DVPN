@@ -213,7 +213,11 @@
   - [x] `get exit` (настройки, шлюзы с `alive`, активный шлюз и блокировка kill switch по семействам), `get acl`
     (TOML и разобранные правила), `set exit` (пишет только `[exit]` через `config::write_exits` и применяет сразу)
     (2026-11-02)
-  - [ ] админские `set invite/node/revoke/rotate/acl`, события, права (A.5), размер ответов (A.4)
+  - [x] админские `set invite/node/revoke/rotate/acl`, `del acl` (`not_admin` без секрета); логика — в `ops.rs`,
+    CLI (`group invite/revoke/rotate`, `node set`, `acl set/clear`) и API выполняют одно и то же, узел применяет и
+    рассылает записи сразу (`Node::publish`); invite проверяет адрес (занят, вне сети); тесты через `dvpn-client`,
+    invite — до входа нового узла (`ops::join`) (2026-11-03)
+  - [ ] события, права (A.5), размер ответов (A.4)
 - [ ] **9.2** DVPNrs (крейт `dvpn-client` в workspace этого репозитория, MIT OR Apache-2.0; план в
   `dvpn-client/PLAN.md`; CLI переходит на него): клиент на Rust по образцу DVPNpy — UDP/unix, автоопределение адреса,
   init/ping/переподключение, типизированные запросы, ответы и ошибки, поток событий, «трубы» маршрутов 32–255;
