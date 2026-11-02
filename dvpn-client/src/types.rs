@@ -111,11 +111,30 @@ pub struct Ping {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(try_from = "String")]
 pub enum Via {
     Direct,
     Relays,
 }
+
+/// Enums that come as strings. rmpv takes enums apart as msgpack encodes them (an index or a
+/// map), not as strings, so these go through a `String`.
+macro_rules! from_string {
+    ($t:ty { $($s:literal => $v:expr,)* }) => {
+        impl TryFrom<String> for $t {
+            type Error = String;
+
+            fn try_from(s: String) -> Result<Self, String> {
+                match s.as_str() {
+                    $($s => Ok($v),)*
+                    other => Err(format!("{other:?}: not a {}", stringify!($t))),
+                }
+            }
+        }
+    };
+}
+
+from_string!(Via { "direct" => Via::Direct, "relays" => Via::Relays, });
 
 /// `get metrics`: counters since the node started.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -433,20 +452,24 @@ pub enum Event {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(try_from = "String")]
 pub enum NeighborState {
     Up,
     Down,
     Moved,
 }
 
+from_string!(NeighborState { "up" => NeighborState::Up, "down" => NeighborState::Down, "moved" => NeighborState::Moved, });
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(try_from = "String")]
 pub enum MemberAction {
     Add,
     Update,
     Revoke,
 }
+
+from_string!(MemberAction { "add" => MemberAction::Add, "update" => MemberAction::Update, "revoke" => MemberAction::Revoke, });
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub struct EpochAt {
@@ -488,7 +511,7 @@ impl EventKind {
 
 /// Levels of the node's log, most severe first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(try_from = "String")]
 pub enum LogLevel {
     Error,
     Warn,
@@ -496,6 +519,14 @@ pub enum LogLevel {
     Debug,
     Trace,
 }
+
+from_string!(LogLevel {
+    "error" => LogLevel::Error,
+    "warn" => LogLevel::Warn,
+    "info" => LogLevel::Info,
+    "debug" => LogLevel::Debug,
+    "trace" => LogLevel::Trace,
+});
 
 impl LogLevel {
     pub fn as_str(self) -> &'static str {
@@ -520,4 +551,46 @@ pub struct Subscription {
     /// `log` events at this level and above (the node logs only what its `log_level` lets
     /// through); adds `Log`.
     pub log_level: Option<LogLevel>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::{from_value, map};
+    use rmpv::Value;
+
+    /// Every string enum, straight in an answer and inside an event: the two ways rmpv sees them.
+    #[test]
+    fn string_enums() {
+        let ping: Option<Ping> = from_value(map(vec![("rtt_ms", 2.15.into()), ("via", "relays".into())])).unwrap();
+        assert_eq!(ping, Some(Ping { rtt_ms: 2.15, via: Via::Relays }));
+        let direct: Ping = from_value(map(vec![("rtt_ms", 1.0.into()), ("via", "direct".into())])).unwrap();
+        assert_eq!(direct.via, Via::Direct);
+        assert!(from_value::<Ping>(map(vec![("rtt_ms", 1.0.into()), ("via", "pigeon".into())])).is_err());
+
+        let e: Event = from_value(map(vec![
+            ("kind", "neighbor".into()),
+            ("key", "k".into()),
+            ("name", Value::Nil),
+            ("state", "moved".into()),
+            ("endpoint", "192.0.2.1:5".into()),
+        ]))
+        .unwrap();
+        assert!(matches!(e, Event::Neighbor { state: NeighborState::Moved, .. }));
+        let e: Event = from_value(map(vec![
+            ("kind", "member".into()),
+            ("action", "revoke".into()),
+            ("key", "k".into()),
+            ("name", "bob".into()),
+            ("prefixes", Value::Array(vec![])),
+            ("revoked", true.into()),
+        ]))
+        .unwrap();
+        assert!(matches!(e, Event::Member { action: MemberAction::Revoke, .. }));
+        let log =
+            map(vec![("kind", "log".into()), ("level", "warn".into()), ("time", 1.5.into()), ("text", "x".into())]);
+        assert!(matches!(from_value::<Event>(log).unwrap(), Event::Log { level: LogLevel::Warn, .. }));
+        let e: Event = from_value(map(vec![("kind", "brand_new".into()), ("x", 1.into())])).unwrap();
+        assert_eq!(e, Event::Other);
+    }
 }
