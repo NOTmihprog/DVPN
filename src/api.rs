@@ -1688,6 +1688,76 @@ mod tests {
         assert_eq!(field(rule, "allow").and_then(Value::as_bool), Some(true));
     }
 
+    /// The API started on a real socket, and `dvpn-client` (as the CLI, TUI and apps use it)
+    /// talking to it: every answer is taken apart into the client's types, so a field renamed or
+    /// retyped on either side fails here.
+    async fn client_session(addr: &str) {
+        use dvpn_client::{Client, ErrorCode, ExitUpdate};
+        let (api, secret) = api_with_secret(true).await;
+        add_members(&api, &secret);
+        let node = api.node.clone();
+        let sock = ApiSocket::bind(addr).await.unwrap();
+        let at: dvpn_client::ApiAddr = sock.describe().parse().unwrap();
+        let _api = Api::start(node.clone(), sock);
+        let c = Client::connect(at.clone(), "test").await.unwrap_or_else(|e| panic!("{at}: {e}"));
+        fn code<T>(r: Result<T, dvpn_client::Error>) -> Option<dvpn_client::ErrorCode> {
+            r.err().and_then(|e| e.code().cloned())
+        }
+
+        let info = c.info();
+        assert_eq!((info.name.as_str(), info.group_name.as_str(), info.admin), ("alice", "home", true));
+        assert_eq!(info.version, dvpn_client::API_VERSION);
+        assert_eq!(info.key, node.storage.self_id().to_string());
+
+        let st = c.status().await.unwrap();
+        assert_eq!((st.group_name.as_str(), st.prefixes.as_slice()), ("home", &["10.10.33.1/32".to_owned()][..]));
+        assert_eq!(c.version().await.unwrap().wire, "dvpn/4");
+        assert!(c.neighbors().await.unwrap().is_empty());
+        assert!(c.routes().await.unwrap().mesh.is_empty());
+        assert!(c.metrics().await.unwrap().peers.is_empty());
+        assert_eq!(c.path("alice").await.unwrap(), None);
+        assert_eq!(code(c.path("nobody").await), Some(ErrorCode::KeyValidate));
+        assert_eq!(code(c.ping("nobody").await), Some(ErrorCode::KeyValidate));
+        assert_eq!(code(c.reset_endpoint("nobody").await), Some(ErrorCode::KeyValidate));
+        assert_eq!(code(c.raw("get", "nope", Vec::new()).await), Some(ErrorCode::UnknownRequest));
+
+        let g = c.group().await.unwrap();
+        assert_eq!((g.name.as_str(), g.admin, g.epoch, g.next_epoch), ("home", true, 0, None));
+        let m = c.members().await.unwrap();
+        let names: Vec<_> = m.iter().map(|m| m.name.as_deref()).collect();
+        assert_eq!(names, vec![Some("alice"), Some("bob"), Some("dave")]);
+        assert!(m[0].is_self && m[0].has_role("admin") && m[1].has_role("relay") && m[2].revoked);
+        assert_eq!(m[1].routes, vec!["192.168.1.0/24"]);
+
+        let e = c.exit().await.unwrap();
+        assert!(e.v4.is_empty() && e.active.v4.is_none() && !e.blocked.v4 && e.kill_switch);
+        let e = c.set_exit(&ExitUpdate { v4: Some(vec!["bob".into()]), ..Default::default() }).await.unwrap();
+        assert_eq!((e.v4[0].name.as_deref(), e.v4[0].alive, e.blocked.v4), (Some("bob"), false, true));
+        let e = c.set_exit(&ExitUpdate { kill_switch: Some(Some(false)), ..Default::default() }).await.unwrap();
+        assert!(!e.kill_switch && !e.blocked.v4);
+        let bad = ExitUpdate { v4: Some(vec!["nobody".into()]), ..Default::default() };
+        assert_eq!(code(c.set_exit(&bad).await), Some(ErrorCode::GatewayUnknown));
+        let e = c.set_exit(&ExitUpdate { clear: true, ..Default::default() }).await.unwrap();
+        assert!(e.v4.is_empty() && e.kill_switch);
+        let acl = c.acl().await.unwrap();
+        assert!(!acl.set && acl.default == "allow" && acl.rules.is_empty());
+        drop(c);
+        std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_over_udp() {
+        client_session("127.0.0.1:0").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_over_a_unix_socket() {
+        let tag = encode_b64(&crate::crypto::random_bytes::<9>());
+        let path = std::env::temp_dir().join(format!("dvpn-api-test-{tag}.sock"));
+        client_session(path.to_str().unwrap()).await;
+    }
+
     #[test]
     fn res_shapes() {
         let ok = res(Some(&Value::from(1)), Ok(Value::from(5)));

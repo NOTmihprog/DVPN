@@ -7,6 +7,10 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+# not a member of the node's workspace (it builds with its own flags)
+[workspace]
+members = ["."]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 

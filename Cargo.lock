@@ -682,6 +682,7 @@ dependencies = [
  "chrono",
  "clap",
  "curve25519-elligator2",
+ "dvpn-client",
  "ed25519-dalek",
  "enable-ansi-support",
  "hkdf",
@@ -704,6 +705,16 @@ dependencies = [
  "toml_edit",
  "tun-rs",
  "x25519-dalek",
+]
+
+[[package]]
+name = "dvpn-client"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rmpv",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -1569,6 +1580,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a4e1d4b9b938a26d2996af33229f0ca0956c652c1375067f0b45291c1df8417"
 dependencies = [
  "rmp",
+ "serde",
+ "serde_bytes",
 ]
 
 [[package]]
@@ -1666,6 +1679,16 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

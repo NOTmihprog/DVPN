@@ -554,6 +554,7 @@ dependencies = [
  "chrono",
  "clap",
  "curve25519-elligator2",
+ "dvpn-client",
  "ed25519-dalek",
  "enable-ansi-support",
  "hkdf",
@@ -575,6 +576,10 @@ dependencies = [
  "tun-rs",
  "x25519-dalek",
 ]
+
+[[package]]
+name = "dvpn-client"
+version = "0.1.0"
 
 [[package]]
 name = "dvpn-fuzz"

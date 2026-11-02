@@ -6,7 +6,12 @@ authors = ["mihprog <mih@mihprog.com>"]
 license = "GPL-3.0"
 description = "Decentralized P2P VPN for building LAN networks between peers behind NAT"
 
+[workspace]
+# the node (this package) and the client of its API; fuzz/ is a workspace of its own
+members = [".", "dvpn-client"]
+
 [dependencies]
+dvpn-client = { path = "dvpn-client" }
 anyhow = "1"
 arc-swap = "1.9"
 base64 = "0.23"
