@@ -15,11 +15,20 @@ const WHITE: &str = "\x1b[97m";
 const GREY: &str = "\x1b[90m";
 const DARK_GREEN: &str = "\x1b[32m";
 
+/// Where log lines go instead of stderr (the Android app: logcat and its own log view).
+pub type Sink = Box<dyn Fn(Level, &str) + Send + Sync>;
+
 struct Logger {
     storage: OnceLock<Arc<PeerStorage>>,
+    sink: OnceLock<Sink>,
 }
 
-static LOGGER: Logger = Logger { storage: OnceLock::new() };
+static LOGGER: Logger = Logger { storage: OnceLock::new(), sink: OnceLock::new() };
+
+/// Sends log lines to `sink`, without colours, instead of stderr. Once per process.
+pub fn set_sink(sink: Sink) {
+    let _ = LOGGER.sink.set(sink);
+}
 
 pub fn init(level: LevelFilter) {
     #[cfg(windows)]
@@ -60,7 +69,14 @@ impl fmt::Display for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let key = if f.alternate() { self.0.to_string() } else { self.0.short() };
         // Never block here: storage methods log while holding the storage lock.
-        match LOGGER.storage.get().and_then(|s| s.name_if_unlocked(&self.0)) {
+        let name = LOGGER.storage.get().and_then(|s| s.name_if_unlocked(&self.0));
+        if LOGGER.sink.get().is_some() {
+            return match name {
+                Some(name) => write!(f, "{name}({key})"),
+                None => write!(f, "{key}"),
+            };
+        }
+        match name {
             Some(name) => write!(f, "{YELLOW}{name}{DARK_GREEN}({GREY}{key}{DARK_GREEN}){WHITE}"),
             None => write!(f, "{GREY}{key}{WHITE}"),
         }
@@ -76,8 +92,12 @@ impl Log for Logger {
         if !self.enabled(r.metadata()) || !r.target().starts_with("dvpn") {
             return;
         }
-        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S,%3f");
         let msg = r.args();
+        if let Some(sink) = LOGGER.sink.get() {
+            sink(r.level(), &msg.to_string());
+            return;
+        }
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S,%3f");
         let mut out = std::io::stderr().lock();
         let _ = writeln!(
             out,

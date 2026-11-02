@@ -169,7 +169,7 @@ pub fn mdns_answer(query: &[u8], zone: &Zone, domain: &str) -> Option<(Vec<u8>, 
 pub type Upstream = Arc<ArcSwap<Vec<IpAddr>>>;
 
 /// Whether a query asks for a name in our zone.
-fn in_zone(query: &[u8], domain: &str) -> bool {
+pub fn in_zone(query: &[u8], domain: &str) -> bool {
     question(query).is_some_and(|(name, _, _)| name == domain || name.ends_with(&format!(".{domain}")))
 }
 
@@ -191,6 +191,37 @@ async fn forward(query: Vec<u8>, from: SocketAddr, upstream: Vec<IpAddr>, sock: 
             return;
         }
     }
+}
+
+/// Asks the upstream servers in turn for `query`; the first answer. `protect` keeps the socket
+/// out of the VPN (the system's own DNS servers on Android).
+pub async fn forward_once(
+    query: &[u8],
+    upstream: &[IpAddr],
+    protect: Option<&crate::transport::Protect>,
+) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+    for server in upstream {
+        let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+        let Ok(up) = UdpSocket::bind(bind).await else { continue };
+        if crate::transport::protect_socket(&up, protect).is_err() {
+            continue;
+        }
+        if up.send_to(query, SocketAddr::new(*server, 53)).await.is_err() {
+            continue;
+        }
+        let mut buf = vec![0u8; 4096];
+        if let Ok(Ok((n, _))) = tokio::time::timeout(std::time::Duration::from_secs(2), up.recv_from(&mut buf)).await
+            && n >= 2
+            && buf[..2] == query[..2]
+        {
+            buf.truncate(n);
+            return Some(buf);
+        }
+    }
+    None
 }
 
 /// Serves `zone` on `addr:53` until the process ends; other names go to `upstream` if set.

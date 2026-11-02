@@ -34,8 +34,13 @@ const PUNCH_INTERVAL: Duration = Duration::from_secs(1);
 const REKEY_RETRY: Duration = Duration::from_secs(5);
 /// Keepalive pings go out at a random point of this range, so they have no fixed period (§4.4).
 const KEEPALIVE: std::ops::Range<Duration> = Duration::from_secs(12)..Duration::from_secs(18);
+/// In power-save mode (a phone with the screen off, PLAN 7.3) keepalives are rarer: every radio
+/// wake-up costs battery. Still well within `LINK_TIMEOUT` and the usual 30 s UDP NAT timeout
+/// counted from the peer's own keepalives, which we answer.
+const KEEPALIVE_SAVE: std::ops::Range<Duration> = Duration::from_secs(22)..Duration::from_secs(28);
 /// The link loop runs at random intervals around a second, for the same reason.
 const LINK_TICK: std::ops::Range<Duration> = Duration::from_millis(700)..Duration::from_millis(1300);
+const LINK_TICK_SAVE: std::ops::Range<Duration> = Duration::from_millis(1700)..Duration::from_millis(2300);
 const LINK_TIMEOUT: Duration = Duration::from_secs(45);
 /// The largest IP packet a direct session carries within `obfs::MAX_WIRE`: DATA header, kind
 /// and tag; through relays the end-to-end layer and the FORWARD header come on top.
@@ -95,12 +100,25 @@ pub struct GroupCtx {
     pub dns_upstream: crate::dns::Upstream,
     /// Change systemd-resolved (split DNS, all names through the gateway): the TUN name.
     pub resolved_tun: Option<String>,
+    /// Serve DNS inside the TUN at `tun_dns_addr` (a VPN service's TUN, `[dns] enable`).
+    pub tun_dns: bool,
     /// `[exit]` as at start; the node follows later changes in `config_path`.
     pub exits: crate::config::Exits,
     pub config_path: std::path::PathBuf,
 }
 
 type EpochPsk = (u32, [u8; 32]);
+
+/// Called with every new plan (Android: rebuild the VPN interface when its part changed).
+pub type PlanListener = Box<dyn Fn(&crate::plan::Plan) + Send + Sync>;
+
+/// The DNS server address a VPN service gives the system (Android, PLAN 7): inside the group
+/// ULA, so its queries come into the TUN, where the node answers them (`tun_dns`).
+pub fn tun_dns_addr(group: &GroupId) -> std::net::Ipv6Addr {
+    let mut o = crate::ckr::ula_prefix(group).addr().octets();
+    o[15] = 0x53;
+    std::net::Ipv6Addr::from(o)
+}
 
 /// A packet for an API client: (route, from peer, payload).
 pub type ApiPacket = (u8, NodeId, Vec<u8>);
@@ -111,7 +129,17 @@ pub struct Node {
     pub links: Links,
     pub clients: Vec<Arc<TrackerClient>>,
     clients_by_addr: HashMap<SocketAddr, Arc<TrackerClient>>,
-    tun: Option<Arc<AsyncDevice>>,
+    /// The TUN: created with the node, or handed in (and replaced) by a VPN service (`set_tun`).
+    tun: arc_swap::ArcSwapOption<AsyncDevice>,
+    /// Bumped by `set_tun`: the running TUN loop of an older device stops.
+    tun_gen: std::sync::atomic::AtomicU64,
+    tun_changed: tokio::sync::Notify,
+    started: std::sync::atomic::AtomicBool,
+    plan_listener: OnceLock<PlanListener>,
+    /// Answer DNS queries to `tun_dns_addr` that arrive in the TUN (no TUN of our own to serve
+    /// DNS on), forwarding other names to these servers when no gateway's DNS is in use.
+    tun_dns: Option<arc_swap::ArcSwap<Vec<IpAddr>>>,
+    power_save: std::sync::atomic::AtomicBool,
     /// Our IPv4 address in the group (it follows our certificate).
     self_addr: parking_lot::RwLock<Option<Ipv4Addr>>,
     api_tx: OnceLock<mpsc::Sender<ApiPacket>>,
@@ -175,6 +203,7 @@ impl Node {
         let clients: Vec<_> = clients.into_iter().map(Arc::new).collect();
         let clients_by_addr = clients.iter().flat_map(|c| c.addrs().iter().map(move |a| (*a, c.clone()))).collect();
         let tun = tun.map(Arc::new);
+        let tun_dns = group.tun_dns.then(|| arc_swap::ArcSwap::from_pointee(Vec::new()));
         let mut system = crate::apply::System::new(tun.clone());
         if let (Some(_), Some((domain, _))) = (&group.resolved_tun, &group.dns) {
             system.manage_resolved(domain);
@@ -190,7 +219,13 @@ impl Node {
             links,
             clients,
             clients_by_addr,
-            tun,
+            tun: arc_swap::ArcSwapOption::new(tun),
+            tun_gen: std::sync::atomic::AtomicU64::new(0),
+            tun_changed: tokio::sync::Notify::new(),
+            started: std::sync::atomic::AtomicBool::new(false),
+            plan_listener: OnceLock::new(),
+            tun_dns,
+            power_save: std::sync::atomic::AtomicBool::new(false),
             self_addr: parking_lot::RwLock::new(self_addr),
             api_tx: OnceLock::new(),
             epoch: Instant::now(),
@@ -289,7 +324,53 @@ impl Node {
             self.group.dns_upstream.store(Arc::new(plan.dns_upstream.clone()));
         }
         tokio::task::block_in_place(|| self.system.lock().apply(&me, &current, &plan));
+        if let Some(l) = self.plan_listener.get() {
+            l(&plan);
+        }
         *current = plan;
+    }
+
+    /// Calls `f` with the plan in place now and with every new one: a VPN service builds its
+    /// interface from it (addresses, routes, DNS). Once; call before `start`.
+    pub fn set_plan_listener(&self, f: PlanListener) {
+        let current = self.plan.lock();
+        if self.started.load(std::sync::atomic::Ordering::Relaxed) {
+            f(&current);
+        }
+        let _ = self.plan_listener.set(f);
+    }
+
+    /// The plan in place now.
+    pub fn plan(&self) -> crate::plan::Plan {
+        self.plan.lock().clone()
+    }
+
+    /// Hands in the TUN (a VPN service's, `tun_rs::AsyncDevice::from_fd`) or replaces it after
+    /// the service rebuilt its interface; `None` detaches it. The old device is dropped (closed)
+    /// once its loop has stopped.
+    pub fn set_tun(self: &Arc<Self>, dev: Option<AsyncDevice>) {
+        let tun_gen = self.tun_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let has = dev.is_some();
+        self.tun.store(dev.map(Arc::new));
+        self.tun_changed.notify_waiters();
+        if has && self.started.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::spawn(self.clone().tun_loop(tun_gen));
+        }
+    }
+
+    /// Fewer keepalives and a slower link loop (a phone with the screen off).
+    pub fn set_power_save(&self, on: bool) {
+        if self.power_save.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+            log::info!("Link | power save {}", if on { "on" } else { "off" });
+        }
+    }
+
+    /// The DNS servers of the network underneath the VPN: names outside the group go there
+    /// (through the protected socket path) when no gateway's DNS is in use.
+    pub fn set_system_dns(&self, servers: Vec<IpAddr>) {
+        if let Some(d) = &self.tun_dns {
+            d.store(Arc::new(servers));
+        }
     }
 
     /// An mDNS query the system sent into the TUN (`<member>.local`): the response, from the
@@ -530,6 +611,11 @@ impl Node {
     }
 
     pub fn start(self: &Arc<Self>) {
+        self.started.store(true, std::sync::atomic::Ordering::SeqCst);
+        // the listener sees the first plan even if it equals the initial one
+        if let Some(l) = self.plan_listener.get() {
+            l(&self.plan.lock());
+        }
         self.replan();
         self.links.set_membership(Membership::of(&self.group.store, &self.group.id));
         self.e2e.set_membership(Membership::of(&self.group.store, &self.group.id));
@@ -545,8 +631,9 @@ impl Node {
         tokio::spawn(self.clone().udp_loop());
         tokio::spawn(self.clone().link_loop());
         tokio::spawn(self.clone().tracker_loop());
-        if self.tun.is_some() {
-            tokio::spawn(self.clone().tun_loop());
+        if self.tun.load().is_some() {
+            let tun_gen = self.tun_gen.load(std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(self.clone().tun_loop(tun_gen));
         }
         if !self.group.statics.is_empty() {
             tokio::spawn(self.clone().static_loop());
@@ -693,7 +780,9 @@ impl Node {
     /// keepalive pings that also measure RTT.
     async fn link_loop(self: Arc<Self>) {
         loop {
-            let tick = rand::rng().random_range(LINK_TICK); // ThreadRng must not live across .await
+            let save = self.power_save.load(std::sync::atomic::Ordering::Relaxed);
+            // ThreadRng must not live across .await
+            let tick = rand::rng().random_range(if save { LINK_TICK_SAVE } else { LINK_TICK });
             tokio::time::sleep(tick).await;
             self.links.expire();
             self.e2e.expire();
@@ -716,7 +805,7 @@ impl Node {
                 if self.links.needs_handshake(&id) && !static_pending {
                     self.handshake(id, if has_session { REKEY_RETRY } else { PUNCH_INTERVAL }).await;
                 }
-                let keepalive = rand::rng().random_range(KEEPALIVE);
+                let keepalive = rand::rng().random_range(if save { KEEPALIVE_SAVE } else { KEEPALIVE });
                 if has_session && link.last_ping.is_none_or(|t| t.elapsed() >= keepalive) {
                     self.send_ping(id).await;
                 }
@@ -921,7 +1010,7 @@ impl Node {
     /// (PLAN §7.2): the source must route back to the sender, so a peer injects only from its own
     /// addresses and subnets (its certificate), or from the internet if it is our exit.
     async fn deliver_ip(&self, peer: NodeId, body: &[u8]) {
-        let Some(tun) = &self.tun else { return };
+        let Some(tun) = self.tun.load_full() else { return };
         let own = packet::parse(body).is_some_and(|i| self.ckr.load().lookup(i.src) == Some(peer));
         if !own {
             self.metrics.dropped(crate::metrics::Drop::ForeignSource);
@@ -1308,7 +1397,7 @@ impl Node {
             Some(4) => self.peer_certs.lock().get(&reporter).and_then(|c| c.body.ipv4()).map(IpAddr::V4),
             _ => Some(IpAddr::V6(crate::ckr::ula_addr(&self.group.id, &reporter))),
         };
-        let (Some(addr), Some(tun)) = (addr, &self.tun) else { return };
+        let (Some(addr), Some(tun)) = (addr, self.tun.load_full()) else { return };
         let kind = if body[42] == 1 { packet::IcmpError::HostUnreachable } else { packet::IcmpError::TimeExceeded };
         if let Some(icmp) = packet::icmp_error(kind, addr, &quoted) {
             let _ = tun.send(&icmp).await;
@@ -1430,7 +1519,7 @@ impl Node {
 
     /// Like `icmp_back`, from `from` if given.
     async fn icmp_from(&self, kind: packet::IcmpError, ip: &[u8], from: Option<IpAddr>) {
-        let (Some(tun), Some(info)) = (&self.tun, packet::parse(ip)) else { return };
+        let (Some(tun), Some(info)) = (self.tun.load_full(), packet::parse(ip)) else { return };
         if let Some(icmp) = packet::icmp_error(kind, from.unwrap_or(info.dst), &packet::quote(ip)) {
             let _ = tun.send(&icmp).await;
         }
@@ -1445,21 +1534,74 @@ impl Node {
         }
     }
 
-    async fn tun_loop(self: Arc<Self>) {
-        let tun = self.tun.clone().unwrap();
+    /// A DNS query to `tun_dns_addr` from the TUN: names of members answered here, others
+    /// forwarded (to the gateway's DNS through the tunnel, else to the system's DNS servers).
+    /// Returns false if the packet is not such a query.
+    fn tun_dns_query(self: &Arc<Self>, ip: &[u8]) -> bool {
+        let Some(servers) = &self.tun_dns else { return false };
+        let Some(info) = packet::parse(ip) else { return false };
+        if info.dst != IpAddr::V6(tun_dns_addr(&self.group.id)) {
+            return false;
+        }
+        let Some((sport, 53, query)) = packet::udp(ip) else { return true };
+        let (Some((domain, zone)), src, dst) = (&self.group.dns, info.src, info.dst) else { return true };
+        let reply_ip = |data: &[u8]| packet::udp_packet(dst, src, 53, sport, data, 64);
+        let upstream = {
+            let via_gateway = self.group.dns_upstream.load_full();
+            if via_gateway.is_empty() { servers.load_full() } else { via_gateway }
+        };
+        if upstream.is_empty() || crate::dns::in_zone(query, domain) {
+            if let (Some(r), Some(tun)) = (crate::dns::answer(query, &zone.load(), domain), self.tun.load_full())
+                && let Some(p) = reply_ip(&r)
+            {
+                tokio::spawn(async move {
+                    let _ = tun.send(&p).await;
+                });
+            }
+            return true;
+        }
+        // the gateway's DNS is reached through the tunnel; the system's past it (protected)
+        let protect =
+            if self.group.dns_upstream.load().is_empty() { self.transport.protector().cloned() } else { None };
+        let (me, query) = (self.clone(), query.to_vec());
+        tokio::spawn(async move {
+            if let Some(r) = crate::dns::forward_once(&query, &upstream, protect.as_ref()).await
+                && let (Some(p), Some(tun)) = (packet::udp_packet(dst, src, 53, sport, &r, 64), me.tun.load_full())
+            {
+                let _ = tun.send(&p).await;
+            }
+        });
+        true
+    }
+
+    async fn tun_loop(self: Arc<Self>, tun_gen: u64) {
+        let Some(tun) = self.tun.load_full() else { return };
+        let current = || self.tun_gen.load(std::sync::atomic::Ordering::SeqCst) == tun_gen;
         // Layout: [DATA header][KIND_IP][ip packet][tag]; the IP packet is read in place.
         const OFF: usize = DATA_HDR + 1;
         let mut buf = vec![0u8; OFF + MAX_DATAGRAM + TAG_LEN + MAX_PAD];
         log::info!("TUN | Thread receiver - started");
         loop {
-            let n = match tun.recv(&mut buf[OFF..OFF + MAX_DATAGRAM - 64]).await {
-                Ok(n) => n,
-                Err(e) => {
-                    log::error!("TUN | read error: {e}");
-                    break;
-                }
+            let changed = self.tun_changed.notified();
+            if !current() {
+                break;
+            }
+            let n = tokio::select! {
+                r = tun.recv(&mut buf[OFF..OFF + MAX_DATAGRAM - 64]) => match r {
+                    Ok(n) => n,
+                    Err(e) => {
+                        if current() {
+                            log::error!("TUN | read error: {e}");
+                        }
+                        break;
+                    }
+                },
+                _ = changed => continue,
             };
             let Some(IpInfo { dst, ttl, .. }) = packet::parse(&buf[OFF..OFF + n]) else { continue };
+            if self.tun_dns.is_some() && self.tun_dns_query(&buf[OFF..OFF + n]) {
+                continue;
+            }
             if dst == IpAddr::V4(crate::dns::MDNS_V4) || dst == IpAddr::V6(crate::dns::MDNS_V6) {
                 // names of members as <name>.local, answered right here
                 if let Some(r) = self.mdns_reply(&buf[OFF..OFF + n]) {

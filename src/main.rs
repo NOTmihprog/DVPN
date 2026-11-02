@@ -2,22 +2,19 @@ use std::io::{BufRead, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use ipnet::{IpNet, Ipv4Net};
 use log::LevelFilter;
 
-use dvpn::{api, config, logger, node, tracker_server, transport};
+use dvpn::{api, config, logger, tracker_server};
 
 use dvpn::config::{Config, GroupConfig, SOCKET_DEFAULT_ADDR, STATE_FILE_NAME, parse_obfs};
 use dvpn::crypto::{encode_b64, random_bytes};
 use dvpn::group::{CertBody, GroupSecret, Invite, JOIN_TTL_SECS, StaticRef, now_unix};
 use dvpn::identity::{Identity, NodeId};
 use dvpn::state::{Body, Membership, StateStore};
-use dvpn::storage::{PeerStorage, PeerUpdate};
-use dvpn::tracker_client::TrackerClient;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const AUTHOR: &str = "mihprog";
@@ -717,42 +714,11 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
                     s
                 }
             };
-            let inv = Invite::decode(&text, Some(now_unix())).unwrap_or_else(|e| die(e));
-            if conf.groups.iter().any(|g| g.id == inv.group()) {
-                die(format!("already in group {}", inv.group()));
-            }
-            if !conf.groups.is_empty() {
-                die("this node is already in a group; several groups per node come later (PLAN stage 3.5)");
-            }
-            let obfs = parse_obfs(&inv.obfs).unwrap_or_else(|e| die(format!("invite obfuscation profile: {e:#}")));
-            let cert = inv.join.enroll(conf.identity.id());
-            let body = cert.body.clone();
-            let mut name = inv.name.clone();
-            while conf.group(&name).is_some() {
-                name.push('_');
-            }
-            let mut added: Vec<String> =
-                inv.trackers.iter().filter(|t| conf.add_server(t)).map(|t| format!("{}:{}", t.host, t.port)).collect();
-            for sp in &inv.statics {
-                if conf.add_static_peer(sp) {
-                    added.push(format!("static {}", sp.endpoints.join(", ")));
-                }
-            }
-            conf.add_group(GroupConfig {
-                name: name.clone(),
-                id: inv.group(),
-                secret: None,
-                epoch: inv.epoch,
-                psk: inv.psk,
-                cert: Some(cert),
-                obfs,
-                obfs_entries: inv.obfs.clone(),
-            });
-            conf.save();
-            let addr = body.ipv4().map_or_else(|| "no address".into(), |a| a.to_string());
-            println!("Joined group {name} ({}) as {}, {addr}", inv.group(), body.name);
-            if !added.is_empty() {
-                println!("Added: {}", added.join(", "));
+            let j = dvpn::ops::join(conf, &text).unwrap_or_else(|e| die(format!("{e:#}")));
+            let addr = j.addr.map_or_else(|| "no address".into(), |a| a.to_string());
+            println!("Joined group {} ({}) as {}, {addr}", j.group, j.id, j.name);
+            if !j.added.is_empty() {
+                println!("Added: {}", j.added.join(", "));
             }
         }
         GroupCommand::List => {
@@ -963,17 +929,6 @@ fn api_addr_default(conf: &Config) -> String {
     SOCKET_DEFAULT_ADDR.to_owned()
 }
 
-/// The TUN device with the IPv4 address from the certificate and the group's IPv6 ULA.
-fn build_tun(net: &config::NetConfig, addr: Ipv4Addr, ula: std::net::Ipv6Addr) -> anyhow::Result<tun_rs::AsyncDevice> {
-    let dev = tun_rs::DeviceBuilder::new()
-        .name(&net.tun_name)
-        .ipv4(addr, net.prefix, None)
-        .ipv6(ula, 48u8)
-        .mtu(net.mtu)
-        .build_async()?;
-    Ok(dev)
-}
-
 /// Ctrl+C, or SIGTERM (systemd, kill): both shut down cleanly (routes, tracker goodbye).
 async fn wait_ctrl_c() {
     #[cfg(unix)]
@@ -992,178 +947,12 @@ async fn wait_ctrl_c() {
     }
 }
 
-async fn run_node(mut conf: Config, dir: PathBuf, api_addr: Option<String>) {
-    let group = match conf.groups.as_slice() {
-        [] => die("not in any group: create one (dvpn group create) or join one (dvpn group join)"),
-        [g] => g.clone(),
-        _ => die("several groups per node come later (PLAN stage 3.5): leave all but one"),
-    };
-    let Some(mut cert) = group.cert.clone() else { die(format!("no certificate for group {}", group.name)) };
-    let store = Arc::new(StateStore::open(dir.join(STATE_FILE_NAME)));
-    // a renewed certificate may have arrived while the config was not updated
-    if let Some(c) = store.cert(&group.id, &conf.identity.id())
-        && c.body.not_after > cert.body.not_after
-    {
-        conf.set_group_cert(&group.id, &c);
-        conf.save();
-        cert = c;
-    }
-    if conf.too_open() {
-        log::warn!("{} is readable by other users, but holds secrets: chmod 600 it", conf.path().display());
-    }
-    if !dvpn::clock::trusted() {
-        log::warn!("The clock is earlier than this build: certificate expiry is not checked until it is set (NTP)");
-    }
-    if let Err(e) = cert.verify(&group.id, dvpn::clock::trusted_unix()) {
-        die(format!("own certificate in group {}: {e}; ask an admin for a new invite", group.name));
-    }
-    let self_addr = cert.body.ipv4();
-    let storage = Arc::new(PeerStorage::new(conf.identity.id()));
-    storage.set_peer(conf.identity.id(), PeerUpdate::from_cert(&cert));
-
+async fn run_node(conf: Config, dir: PathBuf, api_addr: Option<String>) {
     let api_addr = api_addr.unwrap_or_else(|| api_addr_default(&conf));
-    let api_sock = api::ApiSocket::bind(&api_addr)
-        .await
-        .unwrap_or_else(|e| die(format!("Failed start api on address {api_addr}: {e}")));
-
-    logger::attach_storage(storage.clone());
-    if conf.net.is_none() {
-        log::info!("Network disabled");
-    }
-    if conf.servers.is_empty() {
-        if conf.static_peers.is_empty() {
-            log::warn!("No [servers] and no [[static_peers]]: only nodes that connect to this one are reachable");
-        } else {
-            log::info!("No [servers]: connecting to {} static peers only", conf.static_peers.len());
-        }
-    }
-
-    let transport = transport::Transport::new(conf.peer.bind_addr, conf.peer.port_range)
-        .await
-        .unwrap_or_else(|e| die(format!("Peer socket bind error: {e}")));
-    if let Ok(a) = transport.local_addr() {
-        log::info!("Peer | Listen address: {a}");
-    }
-
-    let tun = conf.net.as_ref().map(|net| {
-        let addr = self_addr.unwrap_or_else(|| die("the group certificate has no IPv4 address for the TUN interface"));
-        if net.mtu < 1280 {
-            die(format!("[net] mtu {} is below 1280, the minimum for IPv6", net.mtu));
-        }
-        let ula = dvpn::ckr::ula_addr(&group.id, &conf.identity.id());
-        match build_tun(net, addr, ula) {
-            Ok(dev) => {
-                log::info!("TUN | {} {addr}/{} {ula}/48 mtu {} - started", net.tun_name, net.prefix, net.mtu);
-                // public IPv6 addresses an admin gave this node (served by a gateway's NDP proxy)
-                #[cfg(unix)]
-                for p in &cert.body.prefixes {
-                    if let IpNet::V6(n) = p
-                        && n.prefix_len() == 128
-                    {
-                        match dev.add_address_v6(n.addr(), 128u8) {
-                            Ok(()) => log::info!("TUN | {} {}/128", net.tun_name, n.addr()),
-                            Err(e) => log::warn!("TUN | add {}: {e}", n.addr()),
-                        }
-                    }
-                }
-                dev
-            }
-            Err(e) => die(format!("TUN | Tun init error: {e}")),
-        }
-    });
-
-    log::info!("Group {} ({}) as {}", group.name, group.id.short(), cert.body.name);
-    let identity = Arc::new(conf.identity.clone());
-    let links = dvpn::link::Links::new(
-        identity.clone(),
-        dvpn::link::Group { id: group.id, psk: group.psk, obfs: group.obfs.clone(), cert: cert.clone() },
-    );
-    // end-to-end sessions through relays: carried inside link sessions, no masking of their own
-    let e2e = dvpn::link::Links::new(
-        identity.clone(),
-        dvpn::link::Group { id: group.id, psk: group.psk, obfs: dvpn::obfs::Profile::none(), cert: cert.clone() },
-    );
-    let clients = conf
-        .servers
-        .iter()
-        .map(|s| {
-            TrackerClient::new(
-                s.name.clone(),
-                s.addrs.clone(),
-                s.key,
-                identity.clone(),
-                vec![cert.clone()],
-                store.clone(),
-            )
-        })
-        .collect();
-    let group_id = group.id;
-    let dir2 = dir.clone();
-    let upstream: dvpn::dns::Upstream = Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
-    let dns = (conf.dns.enable && tun.is_some() && self_addr.is_some())
-        .then(|| (conf.dns.domain.clone(), Arc::new(arc_swap::ArcSwap::from_pointee(dvpn::dns::Zone::new()))));
-    let ctx = node::GroupCtx {
-        id: group.id,
-        secret: group.secret.clone(),
-        cert: cert.clone(),
-        store,
-        epoch: group.epoch,
-        psk: group.psk,
-        identity: identity.clone(),
-        on_cert: Box::new(move |c| match Config::load(&dir) {
-            Ok(mut conf) => {
-                conf.set_group_cert(&group_id, c);
-                conf.save();
-            }
-            Err(e) => log::warn!("Config | renewed certificate not saved: {e:#}"),
-        }),
-        statics: conf.static_peers.clone(),
-        routes: conf.remote_subnets.clone(),
-        exits: conf.exits.clone(),
-        tun_prefix: conf.net.as_ref().map_or(24, |n| n.prefix),
-        group_name: group.name.clone(),
-        dns: dns.clone(),
-        dns_upstream: upstream.clone(),
-        resolved_tun: conf
-            .net
-            .as_ref()
-            .filter(|_| conf.dns.manage_resolved && dns.is_some())
-            .map(|n| n.tun_name.clone()),
-        config_path: conf.path().to_path_buf(),
-        on_epoch: Box::new(move |epoch, psk| match Config::load(&dir2) {
-            Ok(mut conf) => {
-                conf.set_group_epoch(&group_id, epoch, &psk);
-                conf.save();
-            }
-            Err(e) => log::warn!("Config | new psk epoch not saved: {e:#}"),
-        }),
-    };
-    let node = node::Node::new(storage.clone(), transport, (links, e2e), clients, tun, self_addr, ctx);
-    if conf.net.as_ref().is_some_and(|n| n.manage_routes) {
-        node.manage_routes();
-    }
-    if let (Some((domain, zone)), Some(addr), Some(net)) = (&dns, self_addr, &conf.net) {
-        tokio::spawn(dvpn::dns::serve(std::net::IpAddr::V4(addr), zone.clone(), domain.clone(), upstream.clone()));
-        dvpn::dns::enable_multicast(&net.tun_name);
-        if conf.dns.manage_resolved {
-            let (tun, domain) = (net.tun_name.clone(), domain.clone());
-            tokio::task::spawn_blocking(move || {
-                dvpn::dns::configure_resolved(&tun, std::net::IpAddr::V4(addr), &domain)
-            });
-        }
-    }
-    if let (Some(gw), Some(net)) = (&conf.gateway, &conf.net) {
-        let ula = dvpn::ckr::ula_prefix(&group.id);
-        let g = tokio::task::block_in_place(|| {
-            dvpn::gateway::Gateway::start(&net.tun_name, &gw.wan, gw.ndp_proxy.clone(), ula, gw.manage_sysctl)
-        });
-        node.set_gateway(g);
-    }
-    node.start();
-    let _api = api::Api::start(node.clone(), api_sock);
-
+    let opts = dvpn::run::Options { api_addr, tun: dvpn::run::Tun::FromConfig, protect: None, on_plan: None };
+    let running = dvpn::run::start(conf, &dir, opts).await.unwrap_or_else(|e| die(format!("{e:#}")));
     wait_ctrl_c().await;
-    node.shutdown().await;
+    running.shutdown().await;
 }
 
 async fn run_server(conf: &mut Config, addr: std::net::IpAddr, port: u16) {

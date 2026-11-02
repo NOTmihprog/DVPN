@@ -75,12 +75,37 @@ pub fn wire_addr(families: Families, a: SocketAddr) -> Option<SocketAddr> {
     }
 }
 
+/// Keeps a socket out of the overlay: on Android `VpnService.protect(fd)`, without which the
+/// node's own packets would be routed into its own tunnel (PLAN 7.1). Returns false on failure.
+#[cfg(unix)]
+pub type Protect = Arc<dyn Fn(std::os::fd::RawFd) -> bool + Send + Sync>;
+#[cfg(not(unix))]
+pub type Protect = Arc<dyn Fn(usize) -> bool + Send + Sync>;
+
+/// Calls `protect` on `sock`; a socket that could not be protected is an error, since its
+/// traffic would loop into the tunnel.
+pub fn protect_socket(sock: &UdpSocket, protect: Option<&Protect>) -> io::Result<()> {
+    let Some(protect) = protect else { return Ok(()) };
+    #[cfg(unix)]
+    let ok = {
+        use std::os::fd::AsRawFd;
+        protect(sock.as_raw_fd())
+    };
+    #[cfg(not(unix))]
+    let ok = {
+        use std::os::windows::io::AsRawSocket;
+        protect(sock.as_raw_socket() as usize)
+    };
+    if ok { Ok(()) } else { Err(io::Error::other("the socket could not be protected from the VPN")) }
+}
+
 pub struct Transport {
     sock: ArcSwap<UdpSocket>,
     families: Families,
     rebound: Notify,
     bind_addr: IpAddr,
     port_range: (u16, u16),
+    protect: Option<Protect>,
 }
 
 fn random_port(range: (u16, u16)) -> u16 {
@@ -91,17 +116,28 @@ impl Transport {
     /// Binds a random port of `port_range`. If a dual-stack socket is asked for but the system
     /// has no IPv6, falls back to IPv4 only.
     pub async fn new(bind_addr: IpAddr, port_range: (u16, u16)) -> io::Result<Arc<Self>> {
+        Self::new_protected(bind_addr, port_range, None).await
+    }
+
+    /// Like `new`, with every socket (also after `change_port`) passed through `protect`.
+    pub async fn new_protected(
+        bind_addr: IpAddr,
+        port_range: (u16, u16),
+        protect: Option<Protect>,
+    ) -> io::Result<Arc<Self>> {
         let mut bind_addr = bind_addr;
         let mut last_err = None;
         for attempt in 0..16 {
             match bind_udp(bind_addr, random_port(port_range)) {
                 Ok((sock, families)) => {
+                    protect_socket(&sock, protect.as_ref())?;
                     return Ok(Arc::new(Transport {
                         sock: ArcSwap::from_pointee(sock),
                         families,
                         rebound: Notify::new(),
                         bind_addr,
                         port_range,
+                        protect,
                     }));
                 }
                 Err(e) if attempt == 0 && bind_addr == IpAddr::V6(Ipv6Addr::UNSPECIFIED) => {
@@ -112,6 +148,11 @@ impl Transport {
             }
         }
         Err(last_err.unwrap())
+    }
+
+    /// What keeps this transport's sockets out of the VPN, for other sockets of the node.
+    pub fn protector(&self) -> Option<&Protect> {
+        self.protect.as_ref()
     }
 
     pub fn families(&self) -> Families {
@@ -157,7 +198,9 @@ impl Transport {
     pub async fn change_port(&self) {
         loop {
             let port = random_port(self.port_range);
-            match bind_udp(self.bind_addr, port) {
+            match bind_udp(self.bind_addr, port)
+                .and_then(|(s, f)| protect_socket(&s, self.protect.as_ref()).map(|()| (s, f)))
+            {
                 Ok((sock, _)) => {
                     self.sock.store(Arc::new(sock));
                     self.rebound.notify_waiters();

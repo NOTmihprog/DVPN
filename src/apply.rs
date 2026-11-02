@@ -28,7 +28,14 @@ pub struct System {
 
 impl System {
     pub fn new(tun: Option<Arc<AsyncDevice>>) -> Self {
+        // on Android and iOS the VPN service owns the interface: no name, addresses or routes here
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let tun_name = tun.as_ref().and_then(|t| t.name().ok()).unwrap_or_default();
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let (tun, tun_name) = {
+            drop(tun);
+            (None, String::new())
+        };
         System { tun, tun_name, ..Default::default() }
     }
 
@@ -78,7 +85,11 @@ impl System {
         }
     }
 
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    fn addresses(&self, _: &[IpNet], _: &[IpNet]) {}
+
     /// Our addresses on the TUN follow our certificate (`dvpn node set --addr`, public IPv6).
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn addresses(&self, old: &[IpNet], new: &[IpNet]) {
         let Some(tun) = &self.tun else { return };
         for a in new.iter().filter(|a| !old.contains(a)) {
