@@ -248,6 +248,6 @@ pub async fn start(mut conf: Config, dir: &Path, opts: Options) -> anyhow::Resul
         node.set_plan_listener(f);
     }
     node.start();
-    let api = crate::api::Api::start(node.clone(), api_sock);
+    let api = crate::api::Api::start(node.clone(), api_sock, conf.api_token_all);
     Ok(Running { node, _api: api })
 }

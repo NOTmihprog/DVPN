@@ -11,6 +11,8 @@ pub const SOCKET_DIR: &str = "/run/dvpn";
 pub const DEFAULT_TUN: &str = "dnet";
 /// Environment variable with the API address, checked first by [`ApiAddr::detect`].
 pub const ENV: &str = "DVPN_API";
+/// Environment variable with the token of a UDP API, checked before the node's token file.
+pub const TOKEN_ENV: &str = "DVPN_API_TOKEN";
 
 /// Where a node's API listens.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -22,19 +24,52 @@ pub enum ApiAddr {
 
 impl ApiAddr {
     /// The address the `dvpn` CLI would use: `DVPN_API`, else the unix socket of TUN `tun`
-    /// (`dnet` by default) if it exists, else UDP `127.0.0.1:9902`.
+    /// (`dnet` by default) in `/run/dvpn` (a node of root or a service) or in
+    /// `$XDG_RUNTIME_DIR/dvpn` (the user's own node), if there is one, else UDP `127.0.0.1:9902`.
     pub fn detect(tun: Option<&str>) -> ApiAddr {
         if let Some(a) = std::env::var(ENV).ok().and_then(|s| s.parse().ok()) {
             return a;
         }
         if cfg!(unix) {
-            let p = PathBuf::from(SOCKET_DIR).join(format!("{}.sock", tun.unwrap_or(DEFAULT_TUN)));
-            if p.exists() {
-                return ApiAddr::Unix(p);
+            let mut dirs = vec![PathBuf::from(SOCKET_DIR)];
+            dirs.extend(std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("dvpn")));
+            for dir in dirs {
+                let p = dir.join(format!("{}.sock", tun.unwrap_or(DEFAULT_TUN)));
+                if p.exists() {
+                    return ApiAddr::Unix(p);
+                }
             }
         }
         ApiAddr::Udp(DEFAULT_UDP.parse().expect("valid address"))
     }
+
+    /// The token of a UDP API (changes need it, `doc/api.md`): `DVPN_API_TOKEN`, else the file the
+    /// node wrote for its port, if this user may read it. None for a unix socket (its file's
+    /// permissions decide).
+    pub fn find_token(&self) -> Option<String> {
+        let ApiAddr::Udp(a) = self else { return None };
+        if let Ok(t) = std::env::var(TOKEN_ENV) {
+            return Some(t.trim().to_owned());
+        }
+        token_dirs().into_iter().find_map(|d| {
+            let t = std::fs::read_to_string(d.join(format!("api-{}.token", a.port()))).ok()?;
+            Some(t.trim().to_owned()).filter(|t| !t.is_empty())
+        })
+    }
+}
+
+/// Where a node writes the token of its UDP API (the same list as the node's).
+fn token_dirs() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if cfg!(unix) {
+        v.push(PathBuf::from(SOCKET_DIR));
+        v.extend(std::env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("dvpn")));
+    } else {
+        for var in ["ProgramData", "LOCALAPPDATA"] {
+            v.extend(std::env::var_os(var).map(|d| PathBuf::from(d).join("dvpn")));
+        }
+    }
+    v
 }
 
 /// `ip:port` is UDP, anything else a unix socket path (as for `dvpn -a`).

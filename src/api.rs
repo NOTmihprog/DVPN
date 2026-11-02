@@ -93,7 +93,9 @@ impl ApiSocket {
             if path.exists() {
                 std::fs::remove_file(&path)?;
             }
-            Ok(ApiSocket::Unix(UnixDatagram::bind(&path)?, path))
+            let sock = UnixDatagram::bind(&path)?;
+            access::secure_socket(&path)?;
+            Ok(ApiSocket::Unix(sock, path))
         }
         #[cfg(not(unix))]
         anyhow::bail!("{addr} is not an ip:port address (unix sockets are unsupported on this platform)")
@@ -138,6 +140,203 @@ impl Drop for ApiSocket {
         #[cfg(unix)]
         if let ApiSocket::Unix(_, p) = self {
             let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+// ---- access ----
+
+/// Who may use the API (`doc/api.md`, «Доступ»). A unix socket is guarded by its file: `0660`
+/// with group `dvpn` in `/run/dvpn` (a node of root or a service), `0600` elsewhere (a user's own
+/// node in `$XDG_RUNTIME_DIR/dvpn`). UDP on 127.0.0.1 (Windows, or `-a ip:port`) is open to every
+/// local user, so changes there need a token the node writes to a file only its user (and group
+/// `dvpn`) can read; with `[api] token = "all"`, reading too.
+pub mod access {
+    use std::path::{Path, PathBuf};
+
+    use rmpv::Value;
+
+    use super::{ApiError, field};
+
+    pub enum Access {
+        /// A unix socket: whoever can open it may do anything.
+        Open,
+        /// UDP: `token` (None: none could be written, so no changes at all) for changes, or for
+        /// everything with `all`.
+        Token { token: Option<String>, all: bool, file: Option<PathBuf> },
+    }
+
+    impl Access {
+        /// Makes a token for the UDP API on `port` and writes it where clients look for it.
+        pub fn udp(port: u16, all: bool) -> Access {
+            let token = crate::crypto::encode_b64(&crate::crypto::random_bytes::<32>());
+            for dir in token_dirs() {
+                match write_token(&dir, port, &token) {
+                    Ok(file) => {
+                        log::info!("API | UDP: changes need the token in {}", file.display());
+                        return Access::Token { token: Some(token), all, file: Some(file) };
+                    }
+                    Err(e) => log::debug!("API | token in {}: {e}", dir.display()),
+                }
+            }
+            log::warn!("API | UDP: no place for the API token, the API is read-only");
+            Access::Token { token: None, all, file: None }
+        }
+
+        /// Whether request `p` of `kind` may go on.
+        pub fn check(&self, p: &Value, kind: &str) -> Result<(), ApiError> {
+            let Access::Token { token, all, file } = self else { return Ok(()) };
+            if kind == "get" && !all {
+                return Ok(());
+            }
+            let given = field(p, "token").and_then(Value::as_str);
+            if let (Some(t), Some(g)) = (token, given)
+                && same(t.as_bytes(), g.as_bytes())
+            {
+                return Ok(());
+            }
+            let place =
+                file.as_ref().map_or_else(|| "nowhere (the API is read-only)".to_owned(), |f| f.display().to_string());
+            Err(ApiError::new(
+                "not_permitted",
+                format!("this API is on UDP, open to every local user: {kind} needs its token, from {place}"),
+            ))
+        }
+    }
+
+    /// Constant time, so that the token cannot be guessed byte by byte from answer times.
+    fn same(a: &[u8], b: &[u8]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+
+    /// Where the token of a UDP API goes, the first usable first (`dvpn-client` looks in the
+    /// same places): a node of root or a service, then a user's own node.
+    pub fn token_dirs() -> Vec<PathBuf> {
+        let mut v = Vec::new();
+        #[cfg(unix)]
+        {
+            v.push(PathBuf::from(crate::config::SOCKET_DEFAULT_DIR));
+            if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {
+                v.push(PathBuf::from(d).join("dvpn"));
+            }
+        }
+        #[cfg(windows)]
+        for var in ["ProgramData", "LOCALAPPDATA"] {
+            if let Some(d) = std::env::var_os(var) {
+                v.push(PathBuf::from(d).join("dvpn"));
+            }
+        }
+        v
+    }
+
+    pub fn token_file(dir: &Path, port: u16) -> PathBuf {
+        dir.join(format!("api-{port}.token"))
+    }
+
+    fn write_token(dir: &Path, port: u16, token: &str) -> std::io::Result<PathBuf> {
+        std::fs::create_dir_all(dir)?;
+        secure_dir(dir)?;
+        let file = token_file(dir, port);
+        let _ = std::fs::remove_file(&file);
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let shared = dir == Path::new(crate::config::SOCKET_DEFAULT_DIR);
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(if shared { 0o640 } else { 0o600 })
+                .open(&file)?;
+            f.write_all(token.as_bytes())?;
+            if shared {
+                share_with_group(&file)?;
+            }
+        }
+        #[cfg(not(unix))]
+        std::fs::write(&file, token)?;
+        Ok(file)
+    }
+
+    /// A user's own directory is for the user alone; on Windows the machine-wide one only for
+    /// SYSTEM and administrators (files in %ProgramData% are readable by all users otherwise).
+    fn secure_dir(dir: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if dir != Path::new(crate::config::SOCKET_DEFAULT_DIR) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        #[cfg(windows)]
+        if std::env::var_os("ProgramData").is_some_and(|d| dir.starts_with(d)) {
+            // SYSTEM and Administrators, inherited by the files; nobody else (not verified on Windows yet)
+            let ok = std::process::Command::new("icacls")
+                .arg(dir)
+                .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if !ok {
+                return Err(std::io::Error::other("icacls could not restrict the directory"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The unix socket's file: group `dvpn` may use the node's socket in `/run/dvpn`, elsewhere
+    /// only its owner.
+    #[cfg(unix)]
+    pub fn secure_socket(path: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let shared = path.parent() == Some(Path::new(crate::config::SOCKET_DEFAULT_DIR));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(if shared { 0o660 } else { 0o600 }))?;
+        if shared {
+            share_with_group(path)?;
+        }
+        Ok(())
+    }
+
+    /// Gives the file to group `dvpn`, if there is one (`groupadd dvpn`, `usermod -aG dvpn <user>`).
+    #[cfg(unix)]
+    fn share_with_group(path: &Path) -> std::io::Result<()> {
+        match dvpn_gid() {
+            Some(gid) => std::os::unix::fs::chown(path, None, Some(gid)),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn dvpn_gid() -> Option<u32> {
+        let groups = std::fs::read_to_string("/etc/group").ok()?;
+        groups.lines().find_map(|l| {
+            let mut f = l.split(':');
+            (f.next()? == "dvpn").then(|| f.nth(1)?.parse().ok())?
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn token_check() {
+            let token = Access::Token { token: Some("secret".into()), all: false, file: None };
+            let with = |t: Option<&str>| {
+                let mut m = vec![(Value::from("type"), Value::from("set"))];
+                if let Some(t) = t {
+                    m.push((Value::from("token"), Value::from(t)));
+                }
+                Value::Map(m)
+            };
+            assert!(token.check(&with(None), "get").is_ok(), "reading is open");
+            assert_eq!(token.check(&with(None), "set").unwrap_err().code, "not_permitted");
+            assert_eq!(token.check(&with(Some("secreT")), "del").unwrap_err().code, "not_permitted");
+            assert_eq!(token.check(&with(Some("secret!")), "route").unwrap_err().code, "not_permitted");
+            assert!(token.check(&with(Some("secret")), "set").is_ok());
+            let all = Access::Token { token: Some("secret".into()), all: true, file: None };
+            assert_eq!(all.check(&with(None), "get").unwrap_err().code, "not_permitted");
+            assert!(all.check(&with(Some("secret")), "get").is_ok());
+            let none = Access::Token { token: None, all: false, file: None };
+            assert_eq!(none.check(&with(Some("")), "set").unwrap_err().code, "not_permitted", "read-only");
+            assert!(Access::Open.check(&with(None), "set").is_ok());
         }
     }
 }
@@ -272,6 +471,7 @@ pub struct Api {
     node: Arc<Node>,
     sock: ApiSocket,
     state: Mutex<State>,
+    access: access::Access,
 }
 
 /// The answer to request `id`: `res`, or `err` (code) and `msg` when it failed.
@@ -359,9 +559,20 @@ fn bad_param(name: &str, what: &str) -> ApiError {
 }
 
 impl Api {
-    pub fn start(node: Arc<Node>, sock: ApiSocket) -> Arc<Self> {
+    /// Starts the API on `sock`. On UDP, which every local user can reach, changes need a token
+    /// (`token_all`: every request does) that the node writes to a file only its user can read.
+    pub fn start(node: Arc<Node>, sock: ApiSocket, token_all: bool) -> Arc<Self> {
         log::info!("API | Listen address: {}", sock.describe());
-        let api = Arc::new(Api { node: node.clone(), sock, state: Mutex::new(State::default()) });
+        let access = match &sock {
+            ApiSocket::Inet(s) => access::Access::udp(s.local_addr().map_or(0, |a| a.port()), token_all),
+            #[cfg(unix)]
+            ApiSocket::Unix(..) => access::Access::Open,
+        };
+        Self::start_with(node, sock, access)
+    }
+
+    fn start_with(node: Arc<Node>, sock: ApiSocket, access: access::Access) -> Arc<Self> {
+        let api = Arc::new(Api { node: node.clone(), sock, state: Mutex::new(State::default()), access });
         let (tx, rx) = mpsc::channel(1024);
         node.set_api_sink(tx);
         tokio::spawn(api.clone().recv_loop());
@@ -455,6 +666,10 @@ impl Api {
 
     /// `get ping`: the round trip to a member over our session with it, or nil without answer.
     async fn ping_req(self: Arc<Self>, p: Value, from: ApiAddr) {
+        if let Err(e) = self.access.check(&p, "get") {
+            self.sock.send(&res(field(&p, "id"), Err(e)), &from).await;
+            return;
+        }
         let result = match self.peer_arg(&p) {
             Ok(peer) => Ok(match self.node.ping(peer).await {
                 Some((ms, mesh)) => {
@@ -521,6 +736,12 @@ impl Api {
             return Some(map(vec![("type", "close".into())]));
         }
         let id = field(p, "id");
+        if matches!(kind, "get" | "set" | "del" | "route")
+            && let Err(e) = self.access.check(p, kind)
+        {
+            log::debug!("API | conn {from}: {kind} refused, no token");
+            return Some(res(id, Err(e)));
+        }
         match kind {
             "pong" => {
                 let mut st = self.state.lock();
@@ -1401,7 +1622,8 @@ mod tests {
             config_path: test_config(&identity, admin.then_some(&secret), &cert),
         };
         let node = Node::new(storage, transport, (links, e2e), Vec::new(), None, cert.body.ipv4(), ctx);
-        (Api { node, sock: ApiSocket::bind("127.0.0.1:0").await.unwrap(), state: Mutex::new(State::default()) }, secret)
+        let sock = ApiSocket::bind("127.0.0.1:0").await.unwrap();
+        (Api { node, sock, state: Mutex::new(State::default()), access: access::Access::Open }, secret)
     }
 
     /// A config of its own for each test node, with its key and group (an invite takes the
@@ -1832,8 +2054,9 @@ mod tests {
         let node = api.node.clone();
         let sock = ApiSocket::bind(addr).await.unwrap();
         let at: dvpn_client::ApiAddr = sock.describe().parse().unwrap();
-        let _api = Api::start(node.clone(), sock);
-        let c = Client::connect(at.clone(), "test").await.unwrap_or_else(|e| panic!("{at}: {e}"));
+        let _api = Api::start_with(node.clone(), sock, test_access(&at));
+        let c =
+            Client::connect(at.clone(), "test").await.unwrap_or_else(|e| panic!("{at}: {e}")).with_token(TEST_TOKEN);
         fn code<T>(r: Result<T, dvpn_client::Error>) -> Option<dvpn_client::ErrorCode> {
             r.err().and_then(|e| e.code().cloned())
         }
@@ -1892,6 +2115,39 @@ mod tests {
         client_session(path.to_str().unwrap()).await;
     }
 
+    const TEST_TOKEN: &str = "test-token";
+
+    /// UDP needs a token for changes (a known one here: no token files in tests); a unix
+    /// socket none.
+    fn test_access(at: &dvpn_client::ApiAddr) -> access::Access {
+        match at {
+            dvpn_client::ApiAddr::Udp(_) => {
+                access::Access::Token { token: Some(TEST_TOKEN.into()), all: false, file: None }
+            }
+            dvpn_client::ApiAddr::Unix(_) => access::Access::Open,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn udp_changes_need_the_token() {
+        use dvpn_client::{Client, ErrorCode, ExitUpdate};
+        let (api, _) = api_with_secret(true).await;
+        let node = api.node.clone();
+        let sock = ApiSocket::bind("127.0.0.1:0").await.unwrap();
+        let at: dvpn_client::ApiAddr = sock.describe().parse().unwrap();
+        Api::start_with(node.clone(), sock, test_access(&at));
+        let c = Client::connect(at.clone(), "test").await.unwrap().with_token("wrong");
+        assert!(c.status().await.is_ok(), "reading needs no token");
+        let off = ExitUpdate { kill_switch: Some(Some(false)), ..Default::default() };
+        assert_eq!(code(c.set_exit(&off).await), Some(ErrorCode::NotPermitted));
+        assert_eq!(code(c.rotate(60).await), Some(ErrorCode::NotPermitted));
+        assert_eq!(code(c.raw("route", "reg", vec![("route", 40.into())]).await), Some(ErrorCode::NotPermitted));
+        assert!(c.exit().await.unwrap().kill_switch, "nothing changed");
+        let c = c.with_token(TEST_TOKEN);
+        assert!(!c.set_exit(&off).await.unwrap().kill_switch);
+        std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
+    }
+
     /// The API started on UDP with `dvpn-client` connected to it.
     async fn client_for(admin: bool) -> (dvpn_client::Client, Arc<Node>, GroupSecret) {
         let (api, secret) = api_with_secret(admin).await;
@@ -1899,8 +2155,8 @@ mod tests {
         let node = api.node.clone();
         let sock = ApiSocket::bind("127.0.0.1:0").await.unwrap();
         let at: dvpn_client::ApiAddr = sock.describe().parse().unwrap();
-        Api::start(node.clone(), sock);
-        (dvpn_client::Client::connect(at, "test").await.unwrap(), node, secret)
+        Api::start_with(node.clone(), sock, test_access(&at));
+        (dvpn_client::Client::connect(at, "test").await.unwrap().with_token(TEST_TOKEN), node, secret)
     }
 
     fn code<T>(r: Result<T, dvpn_client::Error>) -> Option<dvpn_client::ErrorCode> {

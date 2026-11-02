@@ -369,14 +369,30 @@ fn api_target(conf: &Config, cli_addr: Option<String>) -> String {
         return a;
     }
     #[cfg(unix)]
-    if let Some(net) = &conf.net {
-        let p = Path::new(config::SOCKET_DEFAULT_DIR).join(format!("{}.sock", net.tun_name));
+    for dir in api_socket_dirs() {
+        let p = dir.join(format!("{}.sock", tun_name(conf)));
         if p.exists() {
             return p.display().to_string();
         }
     }
     let _ = conf;
     SOCKET_DEFAULT_ADDR.to_owned()
+}
+
+/// The name the API socket is named after: the TUN's, also without a TUN (`-d`, no `[net]`).
+fn tun_name(conf: &Config) -> &str {
+    conf.net.as_ref().map_or("dnet", |n| n.tun_name.as_str())
+}
+
+/// Where the API's unix socket goes: `/run/dvpn` for a node of root or a service (group `dvpn`
+/// may use it), else the user's own `$XDG_RUNTIME_DIR/dvpn`. UDP only without both, or by `-a`.
+#[cfg(unix)]
+fn api_socket_dirs() -> Vec<PathBuf> {
+    let mut v = vec![PathBuf::from(config::SOCKET_DEFAULT_DIR)];
+    if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {
+        v.push(PathBuf::from(d).join("dvpn"));
+    }
+    v
 }
 
 /// The running node's API (`--dir` / `-a`), or die.
@@ -795,16 +811,20 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
 
 fn api_addr_default(conf: &Config) -> String {
     #[cfg(unix)]
-    if let Some(net) = &conf.net {
-        let dir = Path::new(config::SOCKET_DEFAULT_DIR);
-        match std::fs::create_dir_all(dir) {
-            Ok(()) => return dir.join(format!("{}.sock", net.tun_name)).display().to_string(),
-            Err(e) => {
-                log::info!("Failed create directory: {}: {e}, use net socket: {SOCKET_DEFAULT_ADDR}", dir.display())
-            }
+    for dir in api_socket_dirs() {
+        let shared = dir == Path::new(config::SOCKET_DEFAULT_DIR);
+        let made = std::fs::create_dir_all(&dir).and_then(|()| {
+            use std::os::unix::fs::PermissionsExt;
+            // /run/dvpn must be passable for group dvpn; the user's own one is for the user alone
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(if shared { 0o755 } else { 0o700 }))
+        });
+        match made {
+            Ok(()) => return dir.join(format!("{}.sock", tun_name(conf))).display().to_string(),
+            Err(e) => log::debug!("API socket in {}: {e}", dir.display()),
         }
     }
     let _ = conf;
+    log::info!("API on UDP {SOCKET_DEFAULT_ADDR}: changes need its token (see doc/api.md)");
     SOCKET_DEFAULT_ADDR.to_owned()
 }
 

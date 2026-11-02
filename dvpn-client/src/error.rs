@@ -131,6 +131,7 @@ codes! {
     NoAddress = "no_address",
     RevokeSelf = "revoke_self",
     AclParse = "acl_parse",
+    NotPermitted = "not_permitted",
 }
 
 impl fmt::Display for ErrorCode {

@@ -42,13 +42,17 @@ pub struct Client {
     shared: Arc<Shared>,
     next_id: AtomicU64,
     timeout: Duration,
+    /// Sent with every request to a UDP API (`ApiAddr::find_token`).
+    token: Option<String>,
     info: InitInfo,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Client {
-    /// Connects to the node at `addr` as `name` (shown in the node's log).
+    /// Connects to the node at `addr` as `name` (shown in the node's log). For a UDP API it
+    /// finds the token itself ([`ApiAddr::find_token`]); without it only reading works.
     pub async fn connect(addr: ApiAddr, name: &str) -> Result<Client, Error> {
+        let token = addr.find_token();
         let sock = Socket::open(&addr).await?;
         let (events, _) = broadcast::channel(256);
         let shared =
@@ -69,7 +73,18 @@ impl Client {
                 return Err(e);
             }
         };
-        Ok(Client { shared, next_id: AtomicU64::new(1), timeout: DEFAULT_TIMEOUT, info, task })
+        Ok(Client { shared, next_id: AtomicU64::new(1), timeout: DEFAULT_TIMEOUT, token, info, task })
+    }
+
+    /// Uses `token` for a UDP API instead of the one found.
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
+    /// Whether a token for changes is at hand (always false on a unix socket, which needs none).
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
     }
 
     /// How long requests wait for their answers.
@@ -93,6 +108,9 @@ impl Client {
     pub async fn raw(&self, kind: &str, req: &str, fields: Vec<(&str, Value)>) -> Result<Value, Error> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut m = vec![("type", Value::from(kind)), ("id", Value::from(id)), ("req", Value::from(req))];
+        if let Some(t) = &self.token {
+            m.push(("token", t.as_str().into()));
+        }
         m.extend(fields);
         let (tx, rx) = oneshot::channel();
         self.shared.pending.lock().await.insert(id, tx);

@@ -173,7 +173,11 @@ sudo dvpn node set phone --relay
 ### Без TUN
 
 Узел-ретранслятор или узел только для записей группы может работать без TUN-интерфейса:
-`ExecStart=/opt/dvpn/dvpn --dir /opt/dvpn -d` (или без секции `[net]`). Тогда API слушает UDP `127.0.0.1:9902`.
+`ExecStart=/opt/dvpn/dvpn --dir /opt/dvpn -d` (или без секции `[net]`). API — тот же unix-сокет, `/run/dvpn/dnet.sock`
+(имя по `[net] tun_name`, если секция есть).
+
+Команды `dvpn status` и т.п. без `sudo` работают у членов группы `dvpn`: `sudo groupadd dvpn && sudo usermod -aG
+dvpn $USER`, перезайти, перезапустить узел (сокет получает группу при создании). Подробно — [api.md](api.md#доступ).
 
 ### OpenRC и другие системы
 
@@ -314,4 +318,6 @@ priority 7348` (то же с `ip -6`), `ip route flush table all proto 73` (и `
 2. Запускайте из консоли **от имени администратора**.
 3. Разрешите `dvpn.exe` в брандмауэре Windows (входящий UDP).
 
-API на Windows всегда UDP `127.0.0.1:9902`. Запуск службой Windows пока не поддерживается.
+API на Windows — UDP `127.0.0.1:9902`: читать может любой пользователь, менять — только с токеном из
+`%ProgramData%\dvpn\api-9902.token`, который могут прочесть SYSTEM и администраторы ([api.md](api.md#доступ)).
+Запуск службой Windows пока не поддерживается.

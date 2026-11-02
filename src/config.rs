@@ -134,6 +134,8 @@ pub struct Config {
     pub servers: Vec<ServerConfig>,
     pub log_level: LevelFilter,
     pub local_server_key: Option<[u8; 32]>,
+    /// `[api] token = "all"`: on a UDP API, reading needs the token too (not only changes).
+    pub api_token_all: bool,
 }
 
 /// Writes a file that holds private keys: created as 0600 on unix, and an existing file is
@@ -402,6 +404,24 @@ impl Default for DnsConfig {
     fn default() -> Self {
         DnsConfig { enable: true, domain: "dvpn".into(), manage_resolved: true }
     }
+}
+
+/// `[api]`: `token = "write"` (default: on a UDP API only changes need the token) or `"all"`.
+fn parse_api(t: &Table) -> anyhow::Result<bool> {
+    let mut all = false;
+    for (k, v) in t.iter() {
+        match k {
+            "token" => {
+                all = match v.as_str() {
+                    Some("write") => false,
+                    Some("all") => true,
+                    _ => bail!("token: \"write\" or \"all\""),
+                }
+            }
+            _ => bail!("unknown key {k}"),
+        }
+    }
+    Ok(all)
 }
 
 fn parse_dns(t: &Table) -> anyhow::Result<DnsConfig> {
@@ -749,6 +769,10 @@ impl Config {
         if section(&doc, "group").is_some() {
             log::warn!("[group] psk in {file} is ignored: create or join a group (dvpn group --help)");
         }
+        let api_token_all = match section(&doc, "api") {
+            Some(t) => parse_api(t).map_err(|e| anyhow!("[api] {e:#} in {file}"))?,
+            None => false,
+        };
 
         Ok(Config {
             path,
@@ -765,6 +789,7 @@ impl Config {
             servers,
             log_level,
             local_server_key,
+            api_token_all,
         })
     }
 
