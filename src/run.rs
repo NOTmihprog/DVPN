@@ -1,7 +1,7 @@
 //! Running a node (PLAN 6.4, 7): everything `dvpn` does between reading the config and Ctrl+C,
 //! as a library, so that the CLI and the mobile apps start the same node. The CLI builds the
 //! TUN itself from `[net]`; on Android the TUN is the VpnService's and comes later
-//! (`Node::set_tun`), built from the node's plan (`Node::on_plan`), and the socket is kept out
+//! (`Node::set_tun`), built from the node's plan (`Node::set_plan_listener`), and the socket is kept out
 //! of it by `protect`.
 
 use std::net::Ipv4Addr;

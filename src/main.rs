@@ -903,12 +903,10 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             }
         }
         GroupCommand::Leave { group } => {
-            let id = conf.group(&group).unwrap_or_else(|| die(format!("no group {group}"))).id;
-            if conf.groups.iter().any(|g| g.id == id && g.secret.is_some()) {
-                log::warn!("Leaving a group this node administers: its secret is removed from config.toml");
+            let admin = dvpn::ops::leave(conf, &group).unwrap_or_else(|e| die(format!("{e:#}")));
+            if admin {
+                log::warn!("Left a group this node administered: its secret is removed from config.toml");
             }
-            conf.remove_group(&id);
-            conf.save();
             println!("Left group {group}");
         }
     }

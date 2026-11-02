@@ -196,6 +196,7 @@ impl Transport {
     }
 
     pub async fn change_port(&self) {
+        let mut failures: u32 = 0;
         loop {
             let port = random_port(self.port_range);
             match bind_udp(self.bind_addr, port)
@@ -208,12 +209,22 @@ impl Transport {
                     return;
                 }
                 Err(e) => {
-                    log::warn!("Transport | Change port to {port} error: {e}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // a busy port clears at the next one; a protect that keeps failing (the VPN
+                    // service is gone) does not: back off instead of waking every 100 ms
+                    if failures < 4 || failures.is_power_of_two() {
+                        log::warn!("Transport | Change port to {port} error: {e}");
+                    }
+                    tokio::time::sleep(change_port_backoff(failures)).await;
+                    failures = failures.saturating_add(1);
                 }
             }
         }
     }
+}
+
+/// The pause after `failures` failed attempts of `change_port`: 100 ms doubling up to 30 s.
+fn change_port_backoff(failures: u32) -> Duration {
+    Duration::from_millis(100u64.saturating_mul(1 << failures.min(9))).min(Duration::from_secs(30))
 }
 
 /// Addresses of this host's interfaces worth telling peers about (PLAN §9.1): not loopback,
@@ -238,6 +249,37 @@ pub fn local_candidates(port: u16, families: Families, tun_name: Option<&str>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn change_port_backs_off() {
+        assert_eq!(change_port_backoff(0), Duration::from_millis(100));
+        assert_eq!(change_port_backoff(3), Duration::from_millis(800));
+        assert_eq!(change_port_backoff(9), Duration::from_secs(30));
+        assert_eq!(change_port_backoff(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn protect_sees_every_socket_and_a_refusal_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let protect: Protect = {
+            let calls = calls.clone();
+            Arc::new(move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+        };
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let t = Transport::new_protected(lo, (0, 0), Some(protect)).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        t.change_port().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the new socket after a port change too");
+        assert!(t.protector().is_some());
+
+        let refuse: Protect = Arc::new(|_| false);
+        assert!(Transport::new_protected(lo, (0, 0), Some(refuse)).await.is_err());
+        assert!(Transport::new(lo, (0, 0)).await.unwrap().protector().is_none());
+    }
 
     #[test]
     fn mapped_addresses_normalized() {

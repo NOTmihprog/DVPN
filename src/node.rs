@@ -131,8 +131,7 @@ pub struct Node {
     clients_by_addr: HashMap<SocketAddr, Arc<TrackerClient>>,
     /// The TUN: created with the node, or handed in (and replaced) by a VPN service (`set_tun`).
     tun: arc_swap::ArcSwapOption<AsyncDevice>,
-    /// Bumped by `set_tun`: the running TUN loop of an older device stops.
-    tun_gen: std::sync::atomic::AtomicU64,
+    /// Told by `set_tun`: the one TUN loop moves to the new device (or waits for one).
     tun_changed: tokio::sync::Notify,
     started: std::sync::atomic::AtomicBool,
     plan_listener: OnceLock<PlanListener>,
@@ -220,7 +219,6 @@ impl Node {
             clients,
             clients_by_addr,
             tun: arc_swap::ArcSwapOption::new(tun),
-            tun_gen: std::sync::atomic::AtomicU64::new(0),
             tun_changed: tokio::sync::Notify::new(),
             started: std::sync::atomic::AtomicBool::new(false),
             plan_listener: OnceLock::new(),
@@ -347,15 +345,10 @@ impl Node {
 
     /// Hands in the TUN (a VPN service's, `tun_rs::AsyncDevice::from_fd`) or replaces it after
     /// the service rebuilt its interface; `None` detaches it. The old device is dropped (closed)
-    /// once its loop has stopped.
-    pub fn set_tun(self: &Arc<Self>, dev: Option<AsyncDevice>) {
-        let tun_gen = self.tun_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let has = dev.is_some();
+    /// once the TUN loop has moved off it.
+    pub fn set_tun(&self, dev: Option<AsyncDevice>) {
         self.tun.store(dev.map(Arc::new));
         self.tun_changed.notify_waiters();
-        if has && self.started.load(std::sync::atomic::Ordering::SeqCst) {
-            tokio::spawn(self.clone().tun_loop(tun_gen));
-        }
     }
 
     /// Fewer keepalives and a slower link loop (a phone with the screen off).
@@ -631,10 +624,9 @@ impl Node {
         tokio::spawn(self.clone().udp_loop());
         tokio::spawn(self.clone().link_loop());
         tokio::spawn(self.clone().tracker_loop());
-        if self.tun.load().is_some() {
-            let tun_gen = self.tun_gen.load(std::sync::atomic::Ordering::SeqCst);
-            tokio::spawn(self.clone().tun_loop(tun_gen));
-        }
+        // one TUN loop for the node's life: it follows `set_tun`, so a device handed in at any
+        // moment (even while starting) gets exactly one reader
+        tokio::spawn(self.clone().tun_loop());
         if !self.group.statics.is_empty() {
             tokio::spawn(self.clone().static_loop());
         }
@@ -1546,10 +1538,10 @@ impl Node {
         let Some((sport, 53, query)) = packet::udp(ip) else { return true };
         let (Some((domain, zone)), src, dst) = (&self.group.dns, info.src, info.dst) else { return true };
         let reply_ip = |data: &[u8]| packet::udp_packet(dst, src, 53, sport, data, 64);
-        let upstream = {
-            let via_gateway = self.group.dns_upstream.load_full();
-            if via_gateway.is_empty() { servers.load_full() } else { via_gateway }
-        };
+        // one look at the gateway's DNS: the servers and whether to protect follow from it alike
+        let via_gateway = self.group.dns_upstream.load_full();
+        let system = via_gateway.is_empty();
+        let upstream = if system { servers.load_full() } else { via_gateway };
         if upstream.is_empty() || crate::dns::in_zone(query, domain) {
             if let (Some(r), Some(tun)) = (crate::dns::answer(query, &zone.load(), domain), self.tun.load_full())
                 && let Some(p) = reply_ip(&r)
@@ -1561,8 +1553,7 @@ impl Node {
             return true;
         }
         // the gateway's DNS is reached through the tunnel; the system's past it (protected)
-        let protect =
-            if self.group.dns_upstream.load().is_empty() { self.transport.protector().cloned() } else { None };
+        let protect = if system { self.transport.protector().cloned() } else { None };
         let (me, query) = (self.clone(), query.to_vec());
         tokio::spawn(async move {
             if let Some(r) = crate::dns::forward_once(&query, &upstream, protect.as_ref()).await
@@ -1574,29 +1565,35 @@ impl Node {
         true
     }
 
-    async fn tun_loop(self: Arc<Self>, tun_gen: u64) {
-        let Some(tun) = self.tun.load_full() else { return };
-        let current = || self.tun_gen.load(std::sync::atomic::Ordering::SeqCst) == tun_gen;
+    async fn tun_loop(self: Arc<Self>) {
         // Layout: [DATA header][KIND_IP][ip packet][tag]; the IP packet is read in place.
         const OFF: usize = DATA_HDR + 1;
         let mut buf = vec![0u8; OFF + MAX_DATAGRAM + TAG_LEN + MAX_PAD];
-        log::info!("TUN | Thread receiver - started");
+        let mut logged = false;
         loop {
+            // taken before looking at the device, so a `set_tun` right after is not missed
             let changed = self.tun_changed.notified();
-            if !current() {
-                break;
+            tokio::pin!(changed);
+            let Some(tun) = self.tun.load_full() else {
+                changed.await;
+                continue;
+            };
+            if !logged {
+                log::info!("TUN | Thread receiver - started");
+                logged = true;
             }
             let n = tokio::select! {
                 r = tun.recv(&mut buf[OFF..OFF + MAX_DATAGRAM - 64]) => match r {
                     Ok(n) => n,
                     Err(e) => {
-                        if current() {
-                            log::error!("TUN | read error: {e}");
-                        }
-                        break;
+                        // a broken device: wait for the next one instead of spinning on it
+                        log::error!("TUN | read error: {e}");
+                        drop(tun);
+                        changed.as_mut().await;
+                        continue;
                     }
                 },
-                _ = changed => continue,
+                _ = changed.as_mut() => continue,
             };
             let Some(IpInfo { dst, ttl, .. }) = packet::parse(&buf[OFF..OFF + n]) else { continue };
             if self.tun_dns.is_some() && self.tun_dns_query(&buf[OFF..OFF + n]) {
@@ -1672,7 +1669,6 @@ impl Node {
                 c.wire_tx.add(len);
             }
         }
-        log::info!("TUN | Thread receiver - stopped");
     }
 
     pub async fn shutdown(&self) {
@@ -1682,5 +1678,20 @@ impl Node {
                 self.transport.send_to(&p, c.addr()).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tun_dns_addr_is_in_the_group_ula() {
+        let g = crate::group::GroupSecret::from_bytes([7; 32]).id();
+        let a = tun_dns_addr(&g);
+        assert!(crate::ckr::ula_prefix(&g).contains(&a));
+        assert_eq!(a.octets()[15], 0x53);
+        assert_eq!(a, tun_dns_addr(&g));
+        assert_ne!(a, tun_dns_addr(&crate::group::GroupSecret::from_bytes([8; 32]).id()));
     }
 }
