@@ -8,7 +8,7 @@ use ed25519_dalek::SigningKey;
 use ipnet::{IpNet, Ipv4Net};
 use log::LevelFilter;
 
-use dvpn::{api, config, logger, tracker_server};
+use dvpn::{config, logger, tracker_server};
 
 use dvpn::config::{Config, GroupConfig, SOCKET_DEFAULT_ADDR, STATE_FILE_NAME, parse_obfs};
 use dvpn::crypto::{encode_b64, random_bytes};
@@ -418,19 +418,24 @@ fn api_target(conf: &Config, cli_addr: Option<String>) -> String {
     SOCKET_DEFAULT_ADDR.to_owned()
 }
 
-fn diag(
-    rt: &tokio::runtime::Runtime,
-    conf: &Config,
-    api: Option<String>,
-    req: &str,
-    key: Option<String>,
-) -> rmpv::Value {
-    let addr = api_target(conf, api);
-    let mut fields = vec![("req", rmpv::Value::from(req))];
-    if let Some(k) = key {
-        fields.push(("key", k.into()));
-    }
-    rt.block_on(api::query(&addr, fields)).unwrap_or_else(|e| die(format!("{e:#}")))
+/// The running node's API (`--dir` / `-a`), or die.
+fn api_client(rt: &tokio::runtime::Runtime, conf: &Config, cli_addr: Option<String>) -> dvpn_client::Client {
+    let addr: dvpn_client::ApiAddr = api_target(conf, cli_addr).parse().unwrap_or_else(|e| match e {});
+    rt.block_on(dvpn_client::Client::connect(addr.clone(), "dvpn-cli"))
+        .unwrap_or_else(|e| die(format!("API {addr}: {e}")))
+}
+
+/// A request's answer, or die with the node's error.
+fn ask<T>(rt: &tokio::runtime::Runtime, f: impl Future<Output = Result<T, dvpn_client::Error>>) -> T {
+    rt.block_on(f).unwrap_or_else(|e| die(e))
+}
+
+fn dash(v: Option<impl std::fmt::Display>) -> String {
+    v.map_or_else(|| "-".to_owned(), |v| v.to_string())
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
 }
 
 /// 1536 -> "1.5 KiB"
@@ -442,21 +447,6 @@ fn human_bytes(n: u64) -> String {
         u += 1;
     }
     if u == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[u]) }
-}
-
-fn mp<'a>(v: &'a rmpv::Value, k: &str) -> &'a rmpv::Value {
-    static NIL: rmpv::Value = rmpv::Value::Nil;
-    v.as_map().and_then(|m| m.iter().find(|(a, _)| a.as_str() == Some(k)).map(|(_, b)| b)).unwrap_or(&NIL)
-}
-
-fn mps(v: &rmpv::Value, k: &str) -> String {
-    match mp(v, k) {
-        rmpv::Value::Nil => "-".into(),
-        rmpv::Value::String(s) => s.as_str().unwrap_or_default().to_owned(),
-        rmpv::Value::Boolean(b) => if *b { "yes" } else { "no" }.into(),
-        rmpv::Value::F64(f) => format!("{f:.1}"),
-        other => other.to_string(),
-    }
 }
 
 fn cmd_acl(conf: &Config, dir: &Path, cmd: AclCommand) {
@@ -1021,48 +1011,37 @@ fn main() {
         Some(Command::Node(cmd)) => cmd_node(&mut conf, &dir, cmd),
         Some(Command::Acl(cmd)) => cmd_acl(&conf, &dir, cmd),
         Some(Command::Status) => {
-            let s = diag(&rt, &conf, cli.api_addr, "status", None);
-            println!("node      {} ({})", mps(&s, "name"), mps(&s, "key"));
-            println!("group     {}", mps(&s, "group"));
-            let prefixes: Vec<String> = mp(&s, "prefixes")
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect();
-            println!("addresses {}", prefixes.join(", "));
-            println!("relay     {}   certificate valid {} more days", mps(&s, "relay"), mps(&s, "cert_days"));
-            println!("socket    {}", mps(&s, "local_addr"));
-            for t in mp(&s, "servers").as_array().into_iter().flatten() {
-                println!(
-                    "tracker   {} {}",
-                    mps(t, "addr"),
-                    if mps(t, "connected") == "yes" { "connected" } else { "not connected" }
-                );
+            let c = api_client(&rt, &conf, cli.api_addr);
+            let s = ask(&rt, c.status());
+            println!("node      {} ({})", s.name, s.key);
+            println!("group     {} ({}){}", s.group_name, s.group, if s.admin { ", admin" } else { "" });
+            println!("addresses {}, {}", s.prefixes.join(", "), s.ula);
+            println!("relay     {}   certificate valid {} more days", yes_no(s.relay), s.cert_days);
+            println!("socket    {}", dash(s.local_addr));
+            for t in &s.servers {
+                println!("tracker   {} {}", t.addr, if t.connected { "connected" } else { "not connected" });
             }
             println!(
                 "exit      IPv4 {}, IPv6 {}{}",
-                mps(&s, "exit_v4"),
-                mps(&s, "exit_v6"),
-                if mps(&s, "kill_switch") == "yes" { "  (kill switch on: no gateway alive)" } else { "" }
+                dash(s.exit_v4),
+                dash(s.exit_v6),
+                if s.kill_switch { "  (kill switch on: no gateway alive)" } else { "" }
             );
         }
         Some(Command::Neighbors) => {
-            let v = diag(&rt, &conf, cli.api_addr, "neighbors", None);
-            let rows: Vec<Vec<String>> = v
-                .as_array()
+            let c = api_client(&rt, &conf, cli.api_addr);
+            let rows: Vec<Vec<String>> = ask(&rt, c.neighbors())
                 .into_iter()
-                .flatten()
                 .map(|n| {
                     vec![
-                        mps(n, "name"),
-                        mps(n, "key").chars().take(10).collect(),
-                        mps(n, "endpoint"),
-                        mps(n, "rtt_ms"),
-                        mps(n, "alive"),
-                        format!("{} s", mps(n, "session_secs")),
-                        human_bytes(mp(n, "tx_bytes").as_u64().unwrap_or_default()),
-                        human_bytes(mp(n, "rx_bytes").as_u64().unwrap_or_default()),
+                        dash(n.name),
+                        n.key.chars().take(10).collect(),
+                        dash(n.endpoint),
+                        dash(n.rtt_ms.map(|r| format!("{r:.1}"))),
+                        yes_no(n.alive).into(),
+                        format!("{} s", n.session_secs),
+                        human_bytes(n.tx_bytes),
+                        human_bytes(n.rx_bytes),
                     ]
                 })
                 .collect();
@@ -1072,80 +1051,65 @@ fn main() {
             );
         }
         Some(Command::Routes) => {
-            let v = diag(&rt, &conf, cli.api_addr, "routes", None);
-            let mesh: Vec<Vec<String>> = mp(&v, "mesh")
-                .as_array()
+            let c = api_client(&rt, &conf, cli.api_addr);
+            let r = ask(&rt, c.routes());
+            let mesh: Vec<Vec<String>> = r
+                .mesh
                 .into_iter()
-                .flatten()
-                .map(|r| {
-                    vec![mps(r, "name"), mps(r, "key").chars().take(10).collect(), mps(r, "via_name"), mps(r, "cost")]
-                })
+                .map(|m| vec![dash(m.name), m.key.chars().take(10).collect(), dash(m.via_name), m.cost.to_string()])
                 .collect();
             println!("\nMesh (node: first hop, cost in ms)\n{}", github_table(&["Node", "Key", "Via", "Cost"], &mesh));
-            let ckr: Vec<Vec<String>> = mp(&v, "ckr")
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|r| vec![mps(r, "net"), mps(r, "to"), mps(r, "system")])
-                .collect();
+            let ckr: Vec<Vec<String>> = r.ckr.into_iter().map(|c| vec![c.net, c.to, yes_no(c.system).into()]).collect();
             println!("\nCKR (destination: node)\n{}\n", github_table(&["Prefix", "To", "System route"], &ckr));
         }
         Some(Command::Metrics) => {
-            let v = diag(&rt, &conf, cli.api_addr, "metrics", None);
-            let pair = |p: &rmpv::Value| {
-                format!(
-                    "{} / {}",
-                    mp(p, "packets").as_u64().unwrap_or_default(),
-                    human_bytes(mp(p, "bytes").as_u64().unwrap_or_default())
-                )
-            };
-            let rows: Vec<Vec<String>> = mp(&v, "peers")
-                .as_array()
+            let c = api_client(&rt, &conf, cli.api_addr);
+            let m = ask(&rt, c.metrics());
+            let pair = |p: dvpn_client::Counter| format!("{} / {}", p.packets, human_bytes(p.bytes));
+            let rows: Vec<Vec<String>> = m
+                .peers
                 .into_iter()
-                .flatten()
                 .map(|p| {
                     vec![
-                        mps(p, "name"),
-                        mps(p, "key").chars().take(10).collect(),
-                        pair(mp(p, "ip_tx")),
-                        pair(mp(p, "ip_rx")),
-                        pair(mp(p, "wire_tx")),
-                        pair(mp(p, "wire_rx")),
+                        dash(p.name),
+                        p.key.chars().take(10).collect(),
+                        pair(p.ip_tx),
+                        pair(p.ip_rx),
+                        pair(p.wire_tx),
+                        pair(p.wire_rx),
                     ]
                 })
                 .collect();
             println!(
                 "\nUptime {} s, handshakes {}, relayed for others {}",
-                mps(&v, "uptime_secs"),
-                mps(&v, "handshakes"),
-                pair(mp(&v, "relayed"))
+                m.uptime_secs,
+                m.handshakes,
+                pair(m.relayed)
             );
             println!(
                 "\nTraffic (packets / bytes; IP: with the member on any path, wire: the direct session)\n{}",
                 github_table(&["Name", "Key", "IP sent", "IP received", "Wire sent", "Wire received"], &rows)
             );
-            let drops: Vec<Vec<String>> = mp(&v, "drops")
-                .as_map()
-                .into_iter()
-                .flatten()
-                .map(|(k, n)| vec![k.as_str().unwrap_or_default().to_owned(), n.to_string()])
-                .collect();
+            let drops: Vec<Vec<String>> = m.drops.into_iter().map(|(k, n)| vec![k, n.to_string()]).collect();
             println!("\nDropped packets\n{}\n", github_table(&["Reason", "Packets"], &drops));
         }
         Some(Command::Ping { node, count }) => {
+            let c = api_client(&rt, &conf, cli.api_addr);
             let (mut got, mut sum) = (0, 0.0);
             for i in 0..count {
                 if i > 0 {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
-                let v = diag(&rt, &conf, cli.api_addr.clone(), "ping", Some(node.clone()));
-                match v {
-                    rmpv::Value::Nil => println!("{node}: no answer"),
-                    _ => {
-                        let ms = mp(&v, "rtt_ms").as_f64().unwrap_or_default();
-                        println!("{node}: {ms:.2} ms ({})", mps(&v, "via"));
+                match ask(&rt, c.ping(&node)) {
+                    None => println!("{node}: no answer"),
+                    Some(p) => {
+                        let via = match p.via {
+                            dvpn_client::Via::Direct => "direct",
+                            dvpn_client::Via::Relays => "relays",
+                        };
+                        println!("{node}: {:.2} ms ({via})", p.rtt_ms);
                         got += 1;
-                        sum += ms;
+                        sum += p.rtt_ms;
                     }
                 }
             }
@@ -1158,10 +1122,10 @@ fn main() {
             }
         }
         Some(Command::Path { node }) => {
-            let v = diag(&rt, &conf, cli.api_addr, "path", Some(node.clone()));
-            match v.as_array() {
+            let c = api_client(&rt, &conf, cli.api_addr);
+            match ask(&rt, c.path(&node)) {
                 Some(hops) if !hops.is_empty() => {
-                    let names: Vec<String> = hops.iter().map(|h| mps(h, "name")).collect();
+                    let names: Vec<String> = hops.into_iter().map(|h| h.name.unwrap_or(h.key)).collect();
                     println!("{} (this node) -> {}", conf.identity.id().short(), names.join(" -> "));
                 }
                 _ => die(format!("no route to {node}")),

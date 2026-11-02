@@ -221,7 +221,9 @@
   - [x] workspace, транспорт UDP/unix, `init` с версией, ошибки (`ErrorCode`), ответ на ping, повторный `init`,
     типы и методы всех `get` (кроме устаревших `peer_*`/`server_*`), `set_exit`; тесты против настоящего узла
     через сокет в `api::tests` (2026-11-02)
-  - [ ] CLI на клиенте, события, переподключение с backoff, трубы, `blocking`, `MockNode`
+  - [x] CLI на клиенте: `dvpn status/neighbors/routes/metrics/path/ping` через `dvpn-client`, `api::query`
+    удалён; `status` показывает имя группы, роль и ULA (2026-11-02)
+  - [ ] события, переподключение с backoff, трубы, `blocking`, `MockNode`
 - [ ] **9.3** DVPNpy под v4: `key` вместо `peer_id`, без `peer_crypto`, новые запросы и события, исключения на новые
   коды ошибок; Python 3.10+, `pyproject.toml`, type hints, тесты против живого узла
 - [ ] **9.4** DVPN-tui (новый репозиторий, `ratatui` + DVPNrs): статус, соседи, маршруты и `path`, `ping`, счётчики
