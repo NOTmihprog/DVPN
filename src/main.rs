@@ -1139,10 +1139,9 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
                 let v = diag(&rt, &conf, cli.api_addr.clone(), "ping", Some(node.clone()));
-                match v.as_str() {
-                    Some(err) => die(format!("{node}: {err}")),
-                    None if v.is_nil() => println!("{node}: no answer"),
-                    None => {
+                match v {
+                    rmpv::Value::Nil => println!("{node}: no answer"),
+                    _ => {
                         let ms = mp(&v, "rtt_ms").as_f64().unwrap_or_default();
                         println!("{node}: {ms:.2} ms ({})", mps(&v, "via"));
                         got += 1;

@@ -1,10 +1,15 @@
-//! Local control API: msgpack maps over a UDP or unix datagram socket, same request set as v2.
+//! Local control API: msgpack maps over a UDP or unix datagram socket (`doc/api.md`).
 //!
-//! Client -> node: `{"type": "init", "name": ..}` first, then `get` / `set` / `del` / `route`
-//! requests carrying an `id` (answered with `{"type": "res", "id": .., "res": ..}`), `net`
-//! packets `{"rou": route, "key": .., "pack": bin}` and `ping` / `pong` / `close`. Nodes are
-//! named by their key (base64url) or a unique prefix of a known one, in the `key` field.
+//! Client -> node: `{"type": "init", "name": .., "version": 4}` first (answered with
+//! `{"type": "init", "version", "key", "name", ..}`), then `get` / `set` / `del` / `route`
+//! requests carrying an `id` (answered with `{"type": "res", "id": .., "res": ..}`, or
+//! `{"type": "res", "id": .., "err": code, "msg": text}` when they fail), `net` packets
+//! `{"rou": route, "key": .., "pack": bin}` and `ping` / `pong` / `close`. Nodes are named by
+//! their key (base64url), a unique prefix of a known one or a member name, in the `key` field.
 //! Node -> client: responses, `event`s, `net` packets for registered routes, `ping`.
+//!
+//! An `init` without a `version` (a v2/v3 client) or with one this node does not serve is
+//! answered with `{"type": "error", "err": "version_unsupported", "min", "max"}`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -30,6 +35,25 @@ use crate::storage::{Event, PeerRecord, PeerUpdate, ResolveError};
 
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 const CONN_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// The API protocol version this node speaks, and the oldest one it still serves.
+pub const API_VERSION: u64 = 4;
+pub const API_VERSION_MIN: u64 = 4;
+
+/// A failed request: a stable code for programs, a message for people.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiError {
+    pub code: &'static str,
+    pub msg: String,
+}
+
+impl ApiError {
+    fn new(code: &'static str, msg: impl Into<String>) -> Self {
+        ApiError { code, msg: msg.into() }
+    }
+}
+
+type Reply = Result<Value, ApiError>;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ApiAddr {
@@ -118,15 +142,26 @@ pub async fn query(addr: &str, fields: Vec<(&str, Value)>) -> anyhow::Result<Val
         rmpv::encode::write_value(&mut d, v).expect("write to vec");
         d
     };
-    let init = map(vec![("type", "init".into()), ("name", "dvpn-cli".into())]);
+    let init = map(vec![("type", "init".into()), ("name", "dvpn-cli".into()), ("version", API_VERSION.into())]);
     let mut req = vec![("type", Value::from("get")), ("id", Value::from(1))];
     req.extend(fields);
     let (init, req, close) = (encode(&init), encode(&map(req)), encode(&map(vec![("type", "close".into())])));
     let mut buf = vec![0u8; MAX_DATAGRAM];
-    let reply = |data: &[u8]| -> Option<Value> {
+    // the answer to our request, or the node's refusal (of the request or of the whole connection)
+    let reply = |data: &[u8]| -> Option<Result<Value, std::io::Error>> {
         let v = rmpv::decode::read_value(&mut &data[..]).ok()?;
-        (field(&v, "type").and_then(Value::as_str) == Some("res") && field(&v, "id").and_then(Value::as_i64) == Some(1))
-            .then(|| field(&v, "res").cloned().unwrap_or(Value::Nil))
+        let failed = |v: &Value| {
+            let text = |k| field(v, k).and_then(Value::as_str).unwrap_or_default().to_owned();
+            Err(std::io::Error::other(format!("{} ({})", text("msg"), text("err"))))
+        };
+        match field(&v, "type").and_then(Value::as_str) {
+            Some("res") if field(&v, "id").and_then(Value::as_i64) == Some(1) => Some(match field(&v, "err") {
+                Some(_) => failed(&v),
+                None => Ok(field(&v, "res").cloned().unwrap_or(Value::Nil)),
+            }),
+            Some("error") => Some(failed(&v)),
+            _ => None,
+        }
     };
     let deadline = std::time::Duration::from_secs(3);
     if let Ok(a) = addr.parse::<SocketAddr>() {
@@ -139,7 +174,7 @@ pub async fn query(addr: &str, fields: Vec<(&str, Value)>) -> anyhow::Result<Val
             loop {
                 let n = s.recv(&mut buf).await?;
                 if let Some(v) = reply(&buf[..n]) {
-                    return Ok::<_, std::io::Error>(v);
+                    return v;
                 }
             }
         })
@@ -160,7 +195,7 @@ pub async fn query(addr: &str, fields: Vec<(&str, Value)>) -> anyhow::Result<Val
                 loop {
                     let n = s.recv(&mut buf).await?;
                     if let Some(v) = reply(&buf[..n]) {
-                        return Ok::<_, std::io::Error>(v);
+                        return v;
                     }
                 }
             })
@@ -270,6 +305,8 @@ struct Conn {
     last_ping: Option<Instant>,
     pings_sent: u32,
     last_pong: Option<Instant>,
+    /// The API version from `init`.
+    version: u64,
 }
 
 #[derive(Default)]
@@ -316,12 +353,29 @@ pub struct Api {
     state: Mutex<State>,
 }
 
-fn res(id: Option<&Value>, v: Value) -> Value {
-    map(vec![("type", "res".into()), ("id", id.cloned().unwrap_or(Value::Nil)), ("res", v)])
+/// The answer to request `id`: `res`, or `err` (code) and `msg` when it failed.
+fn res(id: Option<&Value>, r: Reply) -> Value {
+    let id = id.cloned().unwrap_or(Value::Nil);
+    match r {
+        Ok(v) => map(vec![("type", "res".into()), ("id", id), ("res", v)]),
+        Err(e) => map(vec![("type", "res".into()), ("id", id), ("err", e.code.into()), ("msg", e.msg.into())]),
+    }
 }
 
-fn err(s: &str) -> Value {
-    Value::from(s)
+/// A failure not tied to a request (`{"type": "error"}`), with extra fields.
+fn error_msg(code: &str, msg: &str, extra: Vec<(&str, Value)>) -> Value {
+    let mut v = vec![("type", Value::from("error")), ("err", code.into()), ("msg", msg.into())];
+    v.extend(extra);
+    map(v)
+}
+
+/// `min..=max` as `[min, max]`.
+fn range<T: Copy + Into<Value>>(r: &std::ops::RangeInclusive<T>) -> Value {
+    Value::Array(vec![(*r.start()).into(), (*r.end()).into()])
+}
+
+fn bad_param(name: &str, what: &str) -> ApiError {
+    ApiError::new("bad_param", format!("{name}: {what}"))
 }
 
 impl Api {
@@ -422,32 +476,73 @@ impl Api {
     /// `get ping`: the round trip to a member over our session with it, or nil without answer.
     async fn ping_req(self: Arc<Self>, p: Value, from: ApiAddr) {
         let result = match self.peer_arg(&p) {
-            Ok(peer) => match self.node.ping(peer).await {
+            Ok(peer) => Ok(match self.node.ping(peer).await {
                 Some((ms, mesh)) => {
                     map(vec![("rtt_ms", ms.into()), ("via", if mesh { "relays" } else { "direct" }.into())])
                 }
                 None => Value::Nil,
-            },
-            Err(e) => e.into(),
+            }),
+            Err(e) => Err(e),
         };
         self.sock.send(&res(field(&p, "id"), result), &from).await;
     }
 
+    /// `init`: registers the client (again, if it was), answers with the node's identity, or
+    /// refuses an API version this node does not speak.
+    fn init(&self, p: &Value, from: &ApiAddr) -> Value {
+        let name = field(p, "name").and_then(Value::as_str).unwrap_or_default();
+        let version = match field(p, "version").map(|v| (v, v.as_u64())) {
+            Some((_, Some(v))) if (API_VERSION_MIN..=API_VERSION).contains(&v) => v,
+            asked => {
+                let asked = asked.map_or_else(|| "none (a v3 client?)".to_owned(), |(v, _)| v.to_string());
+                log::info!("API | conn {from} ({name}) asks for API version {asked}: refused");
+                self.state.lock().close(from);
+                let msg =
+                    format!("API version {asked} is not served: this node speaks {API_VERSION_MIN}..{API_VERSION}");
+                return error_msg(
+                    "version_unsupported",
+                    &msg,
+                    vec![("min", API_VERSION_MIN.into()), ("max", API_VERSION.into())],
+                );
+            }
+        };
+        self.state
+            .lock()
+            .conns
+            .entry(from.clone())
+            .or_insert(Conn { last_ping: None, pings_sent: 0, last_pong: None, version })
+            .version = version;
+        log::debug!("API | conn {from} init, name {name:?}, version {version}");
+        let n = &self.node;
+        let cert = n.own_cert();
+        map(vec![
+            ("type", "init".into()),
+            ("version", API_VERSION.into()),
+            ("min_version", API_VERSION_MIN.into()),
+            ("key", n.storage.self_id().to_string().into()),
+            ("name", cert.body.name.clone().into()),
+            ("group", n.group_id().to_string().into()),
+            ("group_name", n.group_name().into()),
+            ("admin", n.is_admin().into()),
+            ("node_version", env!("CARGO_PKG_VERSION").into()),
+        ])
+    }
+
     async fn handle(&self, p: &Value, from: &ApiAddr) -> Option<Value> {
         let kind = field(p, "type")?.as_str()?;
-        let known = self.state.lock().conns.contains_key(from);
-        match (known, kind) {
-            (false, "init") => {
-                self.state.lock().conns.insert(from.clone(), Conn { last_ping: None, pings_sent: 0, last_pong: None });
-                log::debug!("API | conn {from} init, name {:?}", field(p, "name").and_then(Value::as_str));
-                None
-            }
-            (_, "ping") => Some(map(vec![("type", "pong".into())])),
-            (false, _) => {
-                log::debug!("API | receive {kind} from unknown conn {from}");
-                Some(map(vec![("type", "close".into())]))
-            }
-            (true, "pong") => {
+        if kind == "init" {
+            return Some(self.init(p, from));
+        }
+        if kind == "ping" {
+            return Some(map(vec![("type", "pong".into())]));
+        }
+        if !self.state.lock().conns.contains_key(from) {
+            log::debug!("API | receive {kind} from unknown conn {from}");
+            return Some(map(vec![("type", "close".into())]));
+        }
+        let id = field(p, "id");
+        match kind {
+            "pong" => {
                 let mut st = self.state.lock();
                 if let Some(c) = st.conns.get_mut(from) {
                     c.last_pong = Some(Instant::now());
@@ -457,19 +552,19 @@ impl Api {
                 }
                 None
             }
-            (true, "net") => {
+            "net" => {
                 self.handle_net(p, from).await;
                 None
             }
-            (true, "get") => Some(res(field(p, "id"), self.handle_get(p))),
-            (true, "set") => Some(res(field(p, "id"), self.handle_set(p))),
-            (true, "del") => Some(res(field(p, "id"), self.handle_del(p))),
-            (true, "route") => Some(res(field(p, "id"), self.handle_route(p, from))),
-            (true, "close") => {
+            "get" => Some(res(id, self.handle_get(p))),
+            "set" => Some(res(id, self.handle_set(p))),
+            "del" => Some(res(id, self.handle_del(p))),
+            "route" => Some(res(id, self.handle_route(p, from))),
+            "close" => {
                 self.state.lock().close(from);
                 Some(map(vec![("type", "close".into())]))
             }
-            _ => None,
+            _ => Some(error_msg("unknown_type", &format!("unknown message type {kind:?}"), Vec::new())),
         }
     }
 
@@ -487,10 +582,140 @@ impl Api {
         }
     }
 
-    /// `key`: a full node key or a unique prefix of a known one. Error codes for replies:
+    /// `get group`: the group as this node sees it, without secrets.
+    fn group_info(&self) -> Value {
+        let n = &self.node;
+        let (g, me) = (n.group_id(), n.storage.self_id());
+        let now_ms = crate::state::now_ms();
+        let (epoch, prev_until) = n.psk_epoch();
+        // an announced epoch we have not switched to yet
+        let next = n.group_store().epoch(&g).filter(|(e, _)| *e > epoch).map(|(e, at)| {
+            let has_key = n.is_admin() || n.group_store().has_epoch_key(&g, &me, e);
+            map(vec![
+                ("epoch", e.into()),
+                ("at", (at / 1000).into()),
+                ("started", (now_ms >= at).into()),
+                ("has_key", has_key.into()),
+            ])
+        });
+        let cert = n.own_cert();
+        let p = n.links.profile();
+        let obfs = map(vec![
+            ("junk_count", range(&p.junk_count)),
+            ("junk_size", range(&p.junk_size)),
+            ("signatures", p.signatures.len().into()),
+            ("init_pad", range(&p.init_pad)),
+            ("resp_pad", range(&p.resp_pad)),
+            ("data_pad", range(&p.data_pad)),
+        ]);
+        let servers = n.clients.iter().map(|c| {
+            map(vec![
+                ("addr", c.addr().to_string().into()),
+                ("key", encode_b64(&c.key.to_bytes()).into()),
+                ("connected", c.is_connected().into()),
+            ])
+        });
+        let statics = n.statics().iter().map(|s| {
+            map(vec![
+                ("key", s.key.to_string().into()),
+                ("name", opt_str(n.storage.name(&s.key))),
+                ("endpoints", Value::Array(s.endpoints.iter().map(|e| e.as_str().into()).collect())),
+                ("direct", n.direct(&s.key).into()),
+            ])
+        });
+        map(vec![
+            ("id", g.to_string().into()),
+            ("name", n.group_name().into()),
+            ("admin", n.is_admin().into()),
+            ("epoch", epoch.into()),
+            ("prev_epoch_until", prev_until.map_or(Value::Nil, |ms| (ms / 1000).into())),
+            ("next_epoch", next.unwrap_or(Value::Nil)),
+            (
+                "cert",
+                map(vec![
+                    ("not_after", cert.body.not_after.into()),
+                    ("days", (cert.body.not_after.saturating_sub(crate::clock::now_unix()) / 86400).into()),
+                    ("invite", cert.grant.is_some().into()),
+                ]),
+            ),
+            ("obfs", obfs),
+            ("servers", Value::Array(servers.collect())),
+            ("statics", Value::Array(statics.collect())),
+        ])
+    }
+
+    /// `get members`: everybody in the group's records and handshakes, offline and revoked ones
+    /// included, by name.
+    fn members(&self) -> Value {
+        let n = &self.node;
+        let me = n.storage.self_id();
+        let revoked = n.group_store().revoked(&n.group_id());
+        let now = crate::clock::now_unix();
+        let mut certs = n.member_certs();
+        certs.sort_by_cached_key(|c| (c.body.name.clone(), c.body.node.to_string()));
+        let mut out: Vec<Value> = certs
+            .iter()
+            .map(|c| {
+                let (b, id) = (&c.body, c.body.node);
+                let (hosts, nets): (Vec<&ipnet::IpNet>, Vec<&ipnet::IpNet>) =
+                    b.prefixes.iter().partition(|p| p.prefix_len() == p.max_prefix_len());
+                let roles = [
+                    (crate::group::Roles::ADMIN, "admin"),
+                    (crate::group::Roles::RELAY, "relay"),
+                    (crate::group::Roles::EXIT_V4, "exit_v4"),
+                    (crate::group::Roles::EXIT_V6, "exit_v6"),
+                ]
+                .into_iter()
+                .filter(|(bit, _)| b.roles.has(*bit))
+                .map(|(_, name)| Value::from(name));
+                let gone = revoked.contains(&id);
+                map(vec![
+                    ("key", id.to_string().into()),
+                    ("name", b.name.clone().into()),
+                    ("addrs", Value::Array(hosts.iter().map(|p| p.addr().to_string().into()).collect())),
+                    ("routes", Value::Array(nets.iter().map(|p| p.to_string().into()).collect())),
+                    ("roles", Value::Array(roles.collect())),
+                    ("not_after", b.not_after.into()),
+                    ("days", (b.not_after.saturating_sub(now) / 86400).into()),
+                    ("expired", (b.not_after < now).into()),
+                    ("invite", c.grant.is_some().into()),
+                    ("revoked", gone.into()),
+                    ("self", (id == me).into()),
+                    ("online", (id == me || (!gone && n.reachable(&id))).into()),
+                    ("direct", (id != me && !gone && n.direct(&id)).into()),
+                ])
+            })
+            .collect();
+        // revoked before we ever saw their certificate
+        let mut unseen: Vec<NodeId> =
+            revoked.into_iter().filter(|k| !certs.iter().any(|c| c.body.node == *k)).collect();
+        unseen.sort_by_cached_key(|k| k.to_string());
+        out.extend(unseen.into_iter().map(|k| {
+            map(vec![
+                ("key", k.to_string().into()),
+                ("name", Value::Nil),
+                ("addrs", Value::Array(Vec::new())),
+                ("routes", Value::Array(Vec::new())),
+                ("roles", Value::Array(Vec::new())),
+                ("not_after", Value::Nil),
+                ("days", Value::Nil),
+                ("expired", false.into()),
+                ("invite", false.into()),
+                ("revoked", true.into()),
+                ("self", false.into()),
+                ("online", false.into()),
+                ("direct", false.into()),
+            ])
+        }));
+        Value::Array(out)
+    }
+
+    /// `key`: a full node key, a unique prefix of a known one or a member name. Errors:
     /// `key_validate_error` (missing, invalid or unknown), `key_ambiguous`.
-    fn peer_arg(&self, p: &Value) -> Result<NodeId, &'static str> {
-        let s = field(p, "key").and_then(Value::as_str).ok_or("key_validate_error")?;
+    fn peer_arg(&self, p: &Value) -> Result<NodeId, ApiError> {
+        let s = field(p, "key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::new("key_validate_error", "key: a node key, key prefix or name is needed"))?;
         let storage = &self.node.storage;
         // a member name works too, if it names exactly one peer
         let by_name: Vec<NodeId> =
@@ -499,41 +724,58 @@ impl Api {
             return Ok(*one);
         }
         storage.resolve(s).map_err(|e| match e {
-            ResolveError::NotFound => "key_validate_error",
-            ResolveError::Ambiguous(_) => "key_ambiguous",
+            ResolveError::NotFound => ApiError::new("key_validate_error", format!("{s}: no such node key or name")),
+            ResolveError::Ambiguous(n) => {
+                ApiError::new("key_ambiguous", format!("{s} matches {n} nodes: give more of the key"))
+            }
         })
     }
 
-    fn handle_get(&self, p: &Value) -> Value {
+    /// `addr: [ip, port]` of a discovery server this node uses.
+    fn server_arg(&self, p: &Value) -> Result<Arc<crate::tracker_client::TrackerClient>, ApiError> {
+        let a = field(p, "addr").and_then(parse_addr).ok_or_else(|| bad_param("addr", "expected [ip, port]"))?;
+        self.node
+            .client(&a)
+            .cloned()
+            .ok_or_else(|| ApiError::new("server_not_found", format!("{a}: not a discovery server of this node")))
+    }
+
+    fn handle_get(&self, p: &Value) -> Reply {
         let storage = &self.node.storage;
-        let req = field(p, "req").and_then(Value::as_str).unwrap_or_default();
-        let peer = self.peer_arg(p).ok();
-        let rec = || peer.and_then(|id| storage.get(&id));
-        let client = || field(p, "addr").and_then(parse_addr).and_then(|a| self.node.client(&a).cloned());
-        match req {
+        let req = field(p, "req").and_then(Value::as_str).ok_or_else(|| bad_param("req", "missing"))?;
+        // the record of the node in `key`
+        let rec = || -> Result<_, ApiError> {
+            let id = self.peer_arg(p)?;
+            Ok(storage.get(&id).map(|(r, e)| (id, r, e)))
+        };
+        Ok(match req {
             "key" => storage.self_id().to_string().into(),
             "peers" => Value::Array(storage.ids().iter().map(|i| i.to_string().into()).collect()),
-            "peer_exist" => peer.is_some_and(|id| storage.exists(&id)).into(),
-            "peer_name" => opt_str(rec().and_then(|(r, _)| r.name)),
-            "peer_addr" => opt_str(rec().and_then(|(r, _)| r.addr.map(|a| a.to_string()))),
-            "peer_sub_args" => rec().map_or(Value::Nil, |(r, _)| sub_args_value(&r)),
+            "peer_exist" => match self.peer_arg(p) {
+                Ok(id) => storage.exists(&id).into(),
+                Err(e) if e.code == "key_validate_error" => false.into(),
+                Err(e) => return Err(e),
+            },
+            "peer_name" => opt_str(rec()?.and_then(|(_, r, _)| r.name)),
+            "peer_addr" => opt_str(rec()?.and_then(|(_, r, _)| r.addr.map(|a| a.to_string()))),
+            "peer_sub_args" => rec()?.map_or(Value::Nil, |(_, r, _)| sub_args_value(&r)),
             "peer_sub_arg" => {
-                let arg = field(p, "arg").and_then(Value::as_str).unwrap_or_default();
-                rec().and_then(|(r, _)| r.sub_args?.get(arg).map(json_to_mp)).unwrap_or(Value::Nil)
+                let arg = field(p, "arg").and_then(Value::as_str).ok_or_else(|| bad_param("arg", "missing"))?;
+                rec()?.and_then(|(_, r, _)| r.sub_args?.get(arg).map(json_to_mp)).unwrap_or(Value::Nil)
             }
-            "peer_endpoint" => addr_value(rec().and_then(|(_, e)| e)),
-            "peer_status" => rec().is_some_and(|(_, e)| e.is_some()).into(),
-            "peer_ping" => peer.and_then(|id| storage.rtt_ms(&id)).unwrap_or(0.0).into(),
+            "peer_endpoint" => addr_value(rec()?.and_then(|(_, _, e)| e)),
+            "peer_status" => rec()?.is_some_and(|(_, _, e)| e.is_some()).into(),
+            "peer_ping" => storage.rtt_ms(&self.peer_arg(p)?).unwrap_or(0.0).into(),
             // Encryption is always on; this tells whether a Noise session is up.
             "peer_crypto_status" => {
-                if peer.is_some_and(|id| self.node.links.current(&id).is_some()) { "noise_ikpsk2" } else { "no" }.into()
+                if self.node.links.current(&self.peer_arg(p)?).is_some() { "noise_ikpsk2" } else { "no" }.into()
             }
             "servers" => Value::Array(self.node.clients.iter().map(|c| addr_value(Some(c.addr()))).collect()),
-            "server_status" => client().map_or(Value::Nil, |c| c.is_connected().into()),
-            "server_key" => client().map_or(Value::Nil, |c| Value::Binary(c.key.to_bytes().to_vec())),
-            "server_last_announce" => client().map_or(Value::Nil, |c| c.timestamps().0.into()),
-            "server_last_search" => client().map_or(Value::Nil, |c| c.timestamps().1.into()),
-            "server_last_response" => client().map_or(Value::Nil, |c| c.timestamps().2.into()),
+            "server_status" => self.server_arg(p)?.is_connected().into(),
+            "server_key" => Value::Binary(self.server_arg(p)?.key.to_bytes().to_vec()),
+            "server_last_announce" => self.server_arg(p)?.timestamps().0.into(),
+            "server_last_search" => self.server_arg(p)?.timestamps().1.into(),
+            "server_last_response" => self.server_arg(p)?.timestamps().2.into(),
             "local_addr" => addr_value(self.node.transport.local_addr().ok()),
             // diagnostics (dvpn status / neighbors / routes / path)
             "status" => {
@@ -566,6 +808,11 @@ impl Api {
                     ("exit_v6", name(gw6)),
                     ("kill_switch", kill.into()),
                     ("local_addr", opt_str(n.transport.local_addr().ok().map(|a| a.to_string()))),
+                    ("group_name", n.group_name().into()),
+                    ("admin", n.is_admin().into()),
+                    ("ula", crate::ckr::ula_addr(&n.group_id(), &storage.self_id()).to_string().into()),
+                    ("epoch", n.psk_epoch().0.into()),
+                    ("uptime_secs", n.metrics.uptime_secs().into()),
                 ])
             }
             "neighbors" => Value::Array(
@@ -637,7 +884,16 @@ impl Api {
                     ("peers", Value::Array(peers.collect())),
                 ])
             }
-            "path" => match peer.and_then(|id| self.node.path(&id)) {
+            "version" => map(vec![
+                ("api", API_VERSION.into()),
+                ("api_min", API_VERSION_MIN.into()),
+                ("node", env!("CARGO_PKG_VERSION").into()),
+                ("wire", String::from_utf8_lossy(crate::noise::PROLOGUE).into_owned().into()),
+            ]),
+            "group" => self.group_info(),
+            "members" => self.members(),
+            // nil: no path known now (not an error)
+            "path" => match self.node.path(&self.peer_arg(p)?) {
                 Some(hops) => Value::Array(
                     hops.iter()
                         .map(|h| map(vec![("key", h.to_string().into()), ("name", opt_str(storage.name(h)))]))
@@ -645,22 +901,21 @@ impl Api {
                 ),
                 None => Value::Nil,
             },
-            _ => Value::Nil,
-        }
+            other => return Err(ApiError::new("unknown_request", format!("get {other:?}: no such request"))),
+        })
     }
 
-    fn handle_set(&self, p: &Value) -> Value {
-        if field(p, "req").and_then(Value::as_str) != Some("peer") {
-            return Value::Nil;
+    fn handle_set(&self, p: &Value) -> Reply {
+        match field(p, "req").and_then(Value::as_str) {
+            Some("peer") => {}
+            Some(other) => return Err(ApiError::new("unknown_request", format!("set {other:?}: no such request"))),
+            None => return Err(bad_param("req", "missing")),
         }
-        let peer = match self.peer_arg(p) {
-            Ok(id) => id,
-            Err(code) => return err(code),
-        };
+        let peer = self.peer_arg(p)?;
         let force = match field(p, "force") {
             None => false,
             Some(Value::Boolean(b)) => *b,
-            Some(_) => return err("force_not_bool"),
+            Some(_) => return Err(ApiError::new("force_not_bool", "force: expected true or false")),
         };
         // `force` means "fields not given are cleared", like in v2.
         fn pick<T>(given: Option<T>, force: bool) -> Option<Option<T>> {
@@ -671,21 +926,21 @@ impl Api {
             None => None,
             Some(v) => match v.as_str() {
                 Some(s) => Some(s.to_owned()),
-                None => return err("name_not_str"),
+                None => return Err(ApiError::new("name_not_str", "name: expected a string")),
             },
         };
         let addr = match field(p, "addr") {
             None => None,
             Some(v) => match v.as_str().and_then(|s| s.parse().ok()) {
                 Some(a) => Some(a),
-                None => return err("addr_validate_error"),
+                None => return Err(ApiError::new("addr_validate_error", "addr: expected an IPv4 address")),
             },
         };
         let endpoint = match field(p, "endpoint") {
             None => None,
             Some(v) => match parse_addr(v) {
                 Some(a) => Some(a),
-                None => return err("endpoint_validate_error"),
+                None => return Err(ApiError::new("endpoint_validate_error", "endpoint: expected [ip, port]")),
             },
         };
         let sub_args = match field(p, "sub_args") {
@@ -694,7 +949,7 @@ impl Api {
                 Json::Object(m) => Some(m),
                 _ => unreachable!(),
             },
-            Some(_) => return err("sub_args_not_dict"),
+            Some(_) => return Err(ApiError::new("sub_args_not_dict", "sub_args: expected a map")),
         };
         self.node.storage.set_peer(
             peer,
@@ -705,56 +960,378 @@ impl Api {
                 sub_args: pick(sub_args, force),
             },
         );
-        Value::Nil
+        Ok(Value::Nil)
     }
 
-    fn handle_del(&self, p: &Value) -> Value {
+    fn handle_del(&self, p: &Value) -> Reply {
         let storage = &self.node.storage;
-        let peer = match self.peer_arg(p) {
-            Ok(id) => id,
-            Err(code) => return err(code),
-        };
+        let req = field(p, "req").and_then(Value::as_str).ok_or_else(|| bad_param("req", "missing"))?;
+        if !matches!(req, "peer" | "peer_endpoint") {
+            return Err(ApiError::new("unknown_request", format!("del {req:?}: no such request")));
+        }
+        let peer = self.peer_arg(p)?;
         if !storage.exists(&peer) {
-            return err("peer_not_exist");
+            return Err(ApiError::new("peer_not_exist", format!("{}: not a known node", peer.short())));
         }
-        match field(p, "req").and_then(Value::as_str) {
-            Some("peer") if storage.is_self(&peer) => err("error_delete_self_peer"),
-            Some("peer") => storage.del_peer(&peer).into(),
-            Some("peer_endpoint") => storage.del_endpoint(&peer).into(),
-            _ => Value::Nil,
-        }
+        Ok(match req {
+            "peer" if storage.is_self(&peer) => {
+                return Err(ApiError::new("error_delete_self_peer", "this node cannot delete itself"));
+            }
+            "peer" => storage.del_peer(&peer).into(),
+            _ => storage.del_endpoint(&peer).into(),
+        })
     }
 
-    fn handle_route(&self, p: &Value, from: &ApiAddr) -> Value {
+    fn handle_route(&self, p: &Value, from: &ApiAddr) -> Reply {
         let mut st = self.state.lock();
+        let not_int = || ApiError::new("not_int", "route: expected an integer");
         let route = field(p, "route").and_then(Value::as_u64);
         match field(p, "req").and_then(Value::as_str) {
             Some("reg") => {
-                let Some(r) = route else { return err("not_int") };
+                let r = route.ok_or_else(not_int)?;
                 if !(KIND_API_MIN as u64..=KIND_API_MAX as u64).contains(&r) {
-                    return err("out_of_range");
+                    return Err(ApiError::new(
+                        "out_of_range",
+                        format!("route {r}: API routes are {KIND_API_MIN}..={KIND_API_MAX}"),
+                    ));
                 }
                 let r = r as u8;
                 if st.route_owner.contains_key(&r) {
-                    return err("route_exist");
+                    return Err(ApiError::new("route_exist", format!("route {r} is taken by another client")));
                 }
                 st.route_owner.insert(r, from.clone());
                 log::debug!("API | conn {from} route {r} added");
-                Value::Nil
+                Ok(Value::Nil)
             }
             Some("del") => {
-                let Some(r) = route.and_then(|r| u8::try_from(r).ok()) else { return err("not_int") };
+                let r = route.and_then(|r| u8::try_from(r).ok()).ok_or_else(not_int)?;
                 match st.route_owner.get(&r) {
-                    None => err("route_not_exist"),
-                    Some(a) if a != from => err("not_permission"),
+                    None => Err(ApiError::new("route_not_exist", format!("route {r} is not taken"))),
+                    Some(a) if a != from => {
+                        Err(ApiError::new("not_permission", format!("route {r} is taken by another client")))
+                    }
                     Some(_) => {
                         st.route_owner.remove(&r);
-                        Value::Nil
+                        Ok(Value::Nil)
                     }
                 }
             }
-            Some("routes") => st.routes_of(from),
-            _ => Value::Nil,
+            Some("routes") => Ok(st.routes_of(from)),
+            Some(other) => Err(ApiError::new("unknown_request", format!("route {other:?}: no such request"))),
+            None => Err(bad_param("req", "missing")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::group::{CertBody, GroupSecret};
+    use crate::identity::Identity;
+    use crate::state::StateStore;
+    use crate::storage::PeerStorage;
+
+    /// A node with no TUN, no trackers and no peers, and its API (not started: requests go to
+    /// `handle` directly).
+    async fn api(admin: bool) -> Api {
+        api_with_secret(admin).await.0
+    }
+
+    /// The test node and its group's secret (to write group records as an admin would).
+    async fn api_with_secret(admin: bool) -> (Api, GroupSecret) {
+        let identity = Arc::new(Identity::generate());
+        let secret = GroupSecret::generate();
+        let mut body = CertBody::new(identity.id(), "alice", vec!["10.10.33.1/32".parse().unwrap()]);
+        if admin {
+            body.roles.0 |= crate::group::Roles::ADMIN;
+        }
+        let cert = secret.issue(body);
+        let storage = Arc::new(PeerStorage::new(identity.id()));
+        storage.set_peer(identity.id(), PeerUpdate::from_cert(&cert));
+        let transport = crate::transport::Transport::new("127.0.0.1".parse().unwrap(), (0, 0)).await.unwrap();
+        let group = crate::link::Group {
+            id: secret.id(),
+            psk: secret.psk(0),
+            obfs: crate::obfs::Profile::none(),
+            cert: cert.clone(),
+        };
+        let links = crate::link::Links::new(identity.clone(), group.clone());
+        let e2e = crate::link::Links::new(identity.clone(), group);
+        let ctx = crate::node::GroupCtx {
+            id: secret.id(),
+            secret: admin.then(|| secret.clone()),
+            cert: cert.clone(),
+            store: Arc::new(StateStore::memory()),
+            epoch: 0,
+            psk: secret.psk(0),
+            identity,
+            on_cert: Box::new(|_| {}),
+            on_epoch: Box::new(|_, _| {}),
+            statics: Vec::new(),
+            routes: Vec::new(),
+            tun_prefix: 24,
+            group_name: "home".into(),
+            dns: None,
+            dns_upstream: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
+            resolved_tun: None,
+            tun_dns: false,
+            exits: Default::default(),
+            config_path: std::env::temp_dir().join("dvpn-api-test-no-config.toml"),
+        };
+        let node = Node::new(storage, transport, (links, e2e), Vec::new(), None, cert.body.ipv4(), ctx);
+        (Api { node, sock: ApiSocket::bind("127.0.0.1:0").await.unwrap(), state: Mutex::new(State::default()) }, secret)
+    }
+
+    fn client() -> ApiAddr {
+        ApiAddr::Inet("127.0.0.1:40000".parse().unwrap())
+    }
+
+    fn msg(pairs: Vec<(&str, Value)>) -> Value {
+        map(pairs)
+    }
+
+    fn s<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
+        field(v, k).and_then(Value::as_str)
+    }
+
+    async fn init(api: &Api, version: Option<Value>) -> Value {
+        let mut m = vec![("type", Value::from("init")), ("name", "test".into())];
+        if let Some(v) = version {
+            m.push(("version", v));
+        }
+        api.handle(&msg(m), &client()).await.expect("init is answered")
+    }
+
+    async fn request(api: &Api, kind: &str, fields: Vec<(&str, Value)>) -> Value {
+        let mut m = vec![("type", Value::from(kind)), ("id", Value::from(7))];
+        m.extend(fields);
+        api.handle(&msg(m), &client()).await.expect("a request is answered")
+    }
+
+    #[tokio::test]
+    async fn init_answers_with_the_node() {
+        let api = api(true).await;
+        let r = init(&api, Some(API_VERSION.into())).await;
+        assert_eq!(s(&r, "type"), Some("init"));
+        assert_eq!(field(&r, "version").and_then(Value::as_u64), Some(API_VERSION));
+        assert_eq!(field(&r, "min_version").and_then(Value::as_u64), Some(API_VERSION_MIN));
+        assert_eq!(s(&r, "key"), Some(api.node.storage.self_id().to_string().as_str()));
+        assert_eq!(s(&r, "name"), Some("alice"));
+        assert_eq!(s(&r, "group"), Some(api.node.group_id().to_string().as_str()));
+        assert_eq!(s(&r, "group_name"), Some("home"));
+        assert_eq!(field(&r, "admin").and_then(Value::as_bool), Some(true));
+        assert_eq!(s(&r, "node_version"), Some(env!("CARGO_PKG_VERSION")));
+        // registered: requests are served
+        let r = request(&api, "get", vec![("req", "key".into())]).await;
+        assert_eq!(s(&r, "type"), Some("res"));
+        assert_eq!(field(&r, "id").and_then(Value::as_u64), Some(7));
+        assert_eq!(s(&r, "res"), Some(api.node.storage.self_id().to_string().as_str()));
+        assert!(field(&r, "err").is_none());
+
+        let member = self::api(false).await;
+        let r = init(&member, Some(API_VERSION.into())).await;
+        assert_eq!(field(&r, "admin").and_then(Value::as_bool), Some(false));
+    }
+
+    #[tokio::test]
+    async fn init_refuses_other_versions() {
+        let api = api(false).await;
+        for v in [None, Some(Value::from(3)), Some(Value::from(API_VERSION + 1)), Some(Value::from("4"))] {
+            let r = init(&api, v.clone()).await;
+            assert_eq!(s(&r, "type"), Some("error"), "{v:?}");
+            assert_eq!(s(&r, "err"), Some("version_unsupported"), "{v:?}");
+            assert!(s(&r, "msg").is_some_and(|m| m.contains("not served")), "{r}");
+            assert_eq!(field(&r, "min").and_then(Value::as_u64), Some(API_VERSION_MIN));
+            assert_eq!(field(&r, "max").and_then(Value::as_u64), Some(API_VERSION));
+            // not registered: told to go away
+            let r = request(&api, "get", vec![("req", "key".into())]).await;
+            assert_eq!(s(&r, "type"), Some("close"));
+        }
+        // a connection that re-inits with a bad version is dropped
+        init(&api, Some(API_VERSION.into())).await;
+        init(&api, Some(3.into())).await;
+        assert_eq!(s(&request(&api, "get", vec![("req", "key".into())]).await, "type"), Some("close"));
+    }
+
+    #[tokio::test]
+    async fn errors_come_in_err_and_msg() {
+        let api = api(false).await;
+        init(&api, Some(API_VERSION.into())).await;
+        let err = |r: &Value| (s(r, "err").map(str::to_owned), field(r, "res").is_some(), s(r, "msg").is_some());
+        // (message type, fields, expected error code)
+        type Case<'a> = (&'a str, Vec<(&'a str, Value)>, &'a str);
+        let cases: Vec<Case> = vec![
+            ("get", vec![], "bad_param"),
+            ("get", vec![("req", "nope".into())], "unknown_request"),
+            ("get", vec![("req", "peer_name".into())], "key_validate_error"),
+            ("get", vec![("req", "peer_name".into()), ("key", "bob".into())], "key_validate_error"),
+            ("get", vec![("req", "path".into()), ("key", "!!".into())], "key_validate_error"),
+            ("get", vec![("req", "peer_sub_arg".into()), ("key", "alice".into())], "bad_param"),
+            ("get", vec![("req", "server_status".into())], "bad_param"),
+            (
+                "get",
+                vec![("req", "server_key".into()), ("addr", Value::Array(vec!["192.0.2.1".into(), 6485.into()]))],
+                "server_not_found",
+            ),
+            ("set", vec![("req", "nope".into())], "unknown_request"),
+            ("set", vec![("req", "peer".into()), ("key", "alice".into()), ("force", 1.into())], "force_not_bool"),
+            ("set", vec![("req", "peer".into()), ("key", "alice".into()), ("addr", "x".into())], "addr_validate_error"),
+            ("del", vec![("req", "nope".into()), ("key", "alice".into())], "unknown_request"),
+            ("del", vec![("req", "peer".into()), ("key", "alice".into())], "error_delete_self_peer"),
+            ("route", vec![("req", "reg".into())], "not_int"),
+            ("route", vec![("req", "reg".into()), ("route", 10.into())], "out_of_range"),
+            ("route", vec![("req", "del".into()), ("route", 40.into())], "route_not_exist"),
+            ("route", vec![("req", "nope".into())], "unknown_request"),
+        ];
+        for (kind, fields, code) in cases {
+            let what = format!("{kind} {fields:?}");
+            let r = request(&api, kind, fields).await;
+            assert_eq!(s(&r, "type"), Some("res"), "{what}");
+            assert_eq!(field(&r, "id").and_then(Value::as_u64), Some(7), "{what}");
+            assert_eq!(err(&r), (Some(code.to_owned()), false, true), "{what}: {r}");
+        }
+        // a name, a key prefix, the key: all the same node
+        let me = api.node.storage.self_id().to_string();
+        for key in ["alice", &me[..6], &me] {
+            let r = request(&api, "get", vec![("req", "peer_name".into()), ("key", key.into())]).await;
+            assert_eq!(s(&r, "res"), Some("alice"), "{key}");
+        }
+        let r = request(&api, "get", vec![("req", "peer_exist".into()), ("key", "bob".into())]).await;
+        assert_eq!(field(&r, "res").and_then(Value::as_bool), Some(false), "an unknown node does not exist");
+    }
+
+    #[tokio::test]
+    async fn routes_and_unknown_types() {
+        let api = api(false).await;
+        init(&api, Some(API_VERSION.into())).await;
+        let reg = request(&api, "route", vec![("req", "reg".into()), ("route", 40.into())]).await;
+        assert!(field(&reg, "err").is_none() && field(&reg, "res").is_none(), "{reg}"); // nil result
+        let again = request(&api, "route", vec![("req", "reg".into()), ("route", 40.into())]).await;
+        assert_eq!(s(&again, "err"), Some("route_exist"));
+        let list = request(&api, "route", vec![("req", "routes".into())]).await;
+        assert_eq!(field(&list, "res"), Some(&Value::Array(vec![40.into()])));
+
+        let r = api.handle(&msg(vec![("type", "frobnicate".into())]), &client()).await.unwrap();
+        assert_eq!((s(&r, "type"), s(&r, "err")), (Some("error"), Some("unknown_type")));
+        // ping is answered even before init
+        let other = ApiAddr::Inet("127.0.0.1:40001".parse().unwrap());
+        let r = api.handle(&msg(vec![("type", "ping".into())]), &other).await.unwrap();
+        assert_eq!(s(&r, "type"), Some("pong"));
+    }
+
+    fn get_ok(r: &Value) -> &Value {
+        assert!(field(r, "err").is_none(), "{r}");
+        field(r, "res").unwrap_or(&Value::Nil)
+    }
+
+    fn strs(v: &Value, k: &str) -> Vec<String> {
+        field(v, k)
+            .and_then(Value::as_array)
+            .map_or_else(Vec::new, |a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+    }
+
+    #[tokio::test]
+    async fn group_and_status() {
+        let (api, secret) = api_with_secret(true).await;
+        init(&api, Some(API_VERSION.into())).await;
+        let r = request(&api, "get", vec![("req", "group".into())]).await;
+        let g = get_ok(&r);
+        assert_eq!(s(g, "id"), Some(secret.id().to_string().as_str()));
+        assert_eq!(s(g, "name"), Some("home"));
+        assert_eq!(field(g, "admin").and_then(Value::as_bool), Some(true));
+        assert_eq!(field(g, "epoch").and_then(Value::as_u64), Some(0));
+        assert!(field(g, "next_epoch").is_none() && field(g, "prev_epoch_until").is_none(), "{g}");
+        let cert = field(g, "cert").unwrap();
+        // issued just now: a full TTL, or a second less of it
+        let ttl_days = crate::group::CERT_TTL_SECS / 86400;
+        let days = field(cert, "days").and_then(Value::as_u64).unwrap();
+        assert!(days == ttl_days || days + 1 == ttl_days, "{days}");
+        assert_eq!(field(cert, "invite").and_then(Value::as_bool), Some(false));
+        let obfs = field(g, "obfs").unwrap();
+        assert_eq!(field(obfs, "data_pad"), Some(&Value::Array(vec![0.into(), 0.into()])));
+        assert_eq!(field(obfs, "signatures").and_then(Value::as_u64), Some(0));
+        assert_eq!(field(g, "servers"), Some(&Value::Array(Vec::new())));
+        assert_eq!(field(g, "statics"), Some(&Value::Array(Vec::new())));
+
+        // a psk change announced for a minute from now
+        api.node.group_store().rotate(&secret, 0, 60_000);
+        let r = request(&api, "get", vec![("req", "group".into())]).await;
+        let next = field(get_ok(&r), "next_epoch").expect("announced epoch");
+        assert_eq!(field(next, "epoch").and_then(Value::as_u64), Some(1));
+        assert_eq!(field(next, "started").and_then(Value::as_bool), Some(false));
+        assert_eq!(field(next, "has_key").and_then(Value::as_bool), Some(true), "an admin has every psk");
+        let at = field(next, "at").and_then(Value::as_u64).unwrap();
+        assert!(at > crate::clock::now_unix() && at <= crate::clock::now_unix() + 61, "{at}");
+
+        let r = request(&api, "get", vec![("req", "status".into())]).await;
+        let st = get_ok(&r);
+        assert_eq!((s(st, "group_name"), field(st, "admin").and_then(Value::as_bool)), (Some("home"), Some(true)));
+        assert_eq!(field(st, "epoch").and_then(Value::as_u64), Some(0));
+        assert!(s(st, "ula").is_some_and(|a| a.parse::<std::net::Ipv6Addr>().is_ok()), "{st}");
+        assert!(field(st, "uptime_secs").and_then(Value::as_u64).is_some());
+
+        let r = request(&api, "get", vec![("req", "version".into())]).await;
+        let v = get_ok(&r);
+        assert_eq!(field(v, "api").and_then(Value::as_u64), Some(API_VERSION));
+        assert_eq!((s(v, "node"), s(v, "wire")), (Some(env!("CARGO_PKG_VERSION")), Some("dvpn/4")));
+    }
+
+    #[tokio::test]
+    async fn members_from_records() {
+        let (api, secret) = api_with_secret(true).await;
+        init(&api, Some(API_VERSION.into())).await;
+        let store = api.node.group_store();
+        let issue = |name: &str, prefixes: &[&str], roles: u8| {
+            let mut b =
+                CertBody::new(Identity::generate().id(), name, prefixes.iter().map(|p| p.parse().unwrap()).collect());
+            b.roles.0 = roles;
+            let c = secret.issue(b);
+            store.add(&secret, crate::state::Body::Cert(Box::new(c.clone())), false);
+            c.body.node
+        };
+        let bob = issue("bob", &["10.10.33.2/32", "192.168.1.0/24"], crate::group::Roles::RELAY);
+        let dave = issue("dave", &["10.10.33.4/32"], 0);
+        let carol = Identity::generate().id(); // revoked before anybody saw it
+        store.add(&secret, crate::state::Body::Revoke { key: dave }, false);
+        store.add(&secret, crate::state::Body::Revoke { key: carol }, false);
+
+        let r = request(&api, "get", vec![("req", "members".into())]).await;
+        let list = get_ok(&r).as_array().expect("a list").clone();
+        let names: Vec<Option<&str>> = list.iter().map(|m| s(m, "name")).collect();
+        assert_eq!(names, vec![Some("alice"), Some("bob"), Some("dave"), None], "by name, unseen revoked last");
+
+        let me = &list[0];
+        assert_eq!(s(me, "key"), Some(api.node.storage.self_id().to_string().as_str()));
+        assert_eq!(strs(me, "roles"), vec!["admin"]);
+        assert_eq!(strs(me, "addrs"), vec!["10.10.33.1"]);
+        let flags =
+            |m: &Value| ["self", "online", "direct", "revoked"].map(|k| field(m, k).and_then(Value::as_bool).unwrap());
+        assert_eq!(flags(me), [true, true, false, false]);
+
+        let b = &list[1];
+        assert_eq!(s(b, "key"), Some(bob.to_string().as_str()));
+        assert_eq!(strs(b, "addrs"), vec!["10.10.33.2"]);
+        assert_eq!(strs(b, "routes"), vec!["192.168.1.0/24"]);
+        assert_eq!(strs(b, "roles"), vec!["relay"]);
+        assert_eq!(flags(b), [false, false, false, false], "offline: no link, no route");
+        assert_eq!(field(b, "expired").and_then(Value::as_bool), Some(false));
+        assert!(field(b, "days").and_then(Value::as_u64).is_some_and(|d| d >= 29));
+
+        assert_eq!(flags(&list[2]), [false, false, false, true], "dave: revoked, certificate known");
+        let c = &list[3];
+        assert_eq!(s(c, "key"), Some(carol.to_string().as_str()));
+        assert_eq!(flags(c), [false, false, false, true]);
+        assert!(field(c, "days").is_none() && strs(c, "addrs").is_empty());
+    }
+
+    #[test]
+    fn res_shapes() {
+        let ok = res(Some(&Value::from(1)), Ok(Value::from(5)));
+        assert_eq!(field(&ok, "res").and_then(Value::as_u64), Some(5));
+        assert!(field(&ok, "err").is_none());
+        let failed = res(None, Err(ApiError::new("not_admin", "only admins")));
+        assert_eq!((s(&failed, "err"), s(&failed, "msg")), (Some("not_admin"), Some("only admins")));
+        assert!(failed.as_map().unwrap().iter().any(|(k, v)| k.as_str() == Some("id") && v.is_nil()));
+        assert!(field(&failed, "res").is_none());
     }
 }

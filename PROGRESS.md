@@ -203,7 +203,16 @@
 - [ ] **9.1** API узла v4 (этот репозиторий): версия в `init` и ответ на него; `get members/group/exit/acl`;
   `set exit`; админские `invite/node/revoke/rotate/acl` (ошибка `not_admin` без секрета); события `neighbor`,
   `route`, `exit`, `member`, подписка на `metrics`; `peer_*` — устаревшие; тесты в netns, `doc/api.md`
-- [ ] **9.2** DVPNrs (новый репозиторий): клиент на Rust по образцу DVPNpy — UDP/unix, автоопределение адреса,
+  (аудит пробелов — PLAN, этап 9, «9.1 подробно»)
+  - [x] версия API в `init` и ответ на него (`version_unsupported` без версии), ошибки в `err`/`msg` вместо
+    строки в `res`, `unknown_request`/`bad_param`/`server_not_found`; юнит-тесты API на узле без сети
+    (`api::tests`); `doc/api.md`; клиенты CLI и DVPN-android переведены (2026-11-02)
+  - [x] `get group` (эпохи psk и объявленная смена, свой сертификат, профиль маскировки, серверы, статические
+    узлы), `get members` (все участники по записям и рукопожатиям, офлайн и исключённые, online/direct),
+    `get version`, в `status` — `group_name`, `admin`, `ula`, `epoch`, `uptime_secs` (2026-11-02)
+  - [ ] `get exit`, `get acl`
+- [ ] **9.2** DVPNrs (новый репозиторий, крейт `dvpn-client`, MIT OR Apache-2.0; создан 2026-11-02, план в
+  `DVPNrs/PLAN.md`; CLI от него не зависит): клиент на Rust по образцу DVPNpy — UDP/unix, автоопределение адреса,
   init/ping/переподключение, типизированные запросы, ответы и ошибки, поток событий, «трубы» маршрутов 32–255;
   sync и async (`tokio`); примеры; тесты против живого узла
 - [ ] **9.3** DVPNpy под v4: `key` вместо `peer_id`, без `peer_crypto`, новые запросы и события, исключения на новые

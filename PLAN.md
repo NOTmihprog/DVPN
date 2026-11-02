@@ -869,13 +869,15 @@ src/
   - `peer_*` из v3 остаются для совместимости, но в документации помечены устаревшими в пользу `members` /
     `neighbors`;
   - тесты API в netns-стенде (клиентом из DVPNrs или скриптом), описание в `doc/api.md`.
-- **DVPNrs** (новый репозиторий `DVPN/DVPNrs`) — клиентская библиотека на Rust, по образцу DVPNpy:
+- **DVPNrs** (новый репозиторий `DVPN/DVPNrs`, крейт `dvpn-client`, MIT OR Apache-2.0; план — `PLAN.md` там) —
+  клиентская библиотека на Rust, по образцу DVPNpy:
   - транспорт UDP и unix-сокет, автоопределение адреса как у CLI (`/run/dvpn/<tun>.sock` или `127.0.0.1:9902`);
   - `init`, ответы на ping узла, автоматическое переподключение после перезапуска узла;
   - типизированные запросы и ответы (`Status`, `Neighbor`, `Route`, `Metrics`, `Member`, …) и ошибки (`enum`);
   - поток событий (канал / колбэк), «трубы» маршрутов API 32–255 для своих протоколов поверх сети;
   - синхронный клиент и асинхронный (feature `tokio`); примеры; тесты против живого узла (`#[ignore]` + netns в CI);
-  - DVPN-gui и DVPN-tui используют её вместо своих реализаций; CLI `dvpn` — по возможности тоже (общие типы).
+  - DVPN-gui, DVPN-tui и DVPN-android используют её вместо своих реализаций; CLI `dvpn` от неё не зависит
+    (решение 2026-11-02): общий у них только протокол и номер его версии.
 - **DVPNpy** — переписать под v4: `peer_id` → `key`, убрать `peer_crypto`/`crypto`, новые запросы и события,
   маршруты API через mesh, исключения на новые коды ошибок (`key_ambiguous`, `not_admin`, …); Python 3.10+,
   `pyproject.toml` (пакет `dvpn`), type hints, тесты против живого узла.
@@ -896,6 +898,103 @@ src/
 - **Готово, когда:** DVPNrs и DVPNpy проходят тесты против узла v4 в netns-стенде (статус, соседи, маршруты,
   события, своя «труба» через ретранслятор); DVPN-tui и DVPN-gui показывают сеть из нескольких узлов с
   ретранслятором, меняют шлюз, а у админа — выдают invite, по которому новый узел входит в группу.
+
+#### 9.1 подробно: чего не хватает в API узла (аудит `src/api.rs`, 2026-11-02)
+
+Сейчас API — это набор v2 (`peer_*`, `server_*`, `set/del peer`, маршруты 32–255) плюс диагностика
+(`status`, `neighbors`, `routes`, `path`, `ping`, `metrics`). Всё, что касается группы, участников, шлюзов и ACL,
+умеет только CLI: он пишет `state.bin` / `config.toml`, а узел подхватывает изменения опросом mtime
+(`store.reload()` в `link_loop`, `exit_tick`). Для клиентов этого мало.
+
+**A. Протокол (общее для всех запросов)**
+
+1. ✅ (2026-11-02) **`init` без ответа и без версии.** Узел молча регистрирует клиента — клиент не знает,
+   подключился ли он и к какому узлу. Нужно: `{"type": "init", "name", "version": 4}` → `{"type": "init", "version", "key", "name",
+   "group", "admin": bool, "node_version": "4.0.0-dev"}`; несовместимая версия → `{"type": "error", "err":
+   "version_unsupported", "min", "max"}`.
+2. **Ошибку нельзя отличить от результата.** Ошибки — строки в `res`, а `get key`, `peer_name` тоже возвращают
+   строку; неизвестный `req` → `nil`, как «нет данных». Нужно отдельное поле: `{"type": "res", "id", "err":
+   "<код>", "msg": "<текст для человека>"}`; `unknown_request`, `bad_param`. ✅ (2026-11-02) Сделано без режима
+   совместимости: клиент без `version` получает `version_unsupported` (DVPN-gui и DVPNpy всё равно переписываются
+   под v4, DVPN-android обновлён тем же изменением); `init` отвечает ещё `min_version`, `group_name`,
+   `node_version`.
+3. **Разнобой форматов.** Адрес — то `[ip, port]` (`peer_endpoint`, события), то строка `"ip:port"`
+   (`status.servers[].addr`, `neighbors[].endpoint`, `local_addr` в `status`); ключ сервера — `bytes` при
+   base64url везде остальном. Привести к одному виду (строка `"ip:port"`, ключи base64url), в `doc/api.md` —
+   таблица типов.
+4. **Размер ответа.** Ответ — одна датаграмма (`MAX_DATAGRAM` 65507, unix-сокет — ещё меньше по умолчанию):
+   `neighbors`, `metrics`, `members` на большой группе не влезут. Нужно: ответ `{"err": "too_large"}` вместо
+   тихой потери и постраничность (`offset`, `limit`, в ответе `total`) для списков.
+5. **Права.** Любой локальный пользователь с доступом к UDP `127.0.0.1:9902` управляет узлом; с админскими
+   операциями это уже выдача invite и исключение участников. Нужно: права unix-сокета `0660` (группа `dvpn`);
+   админские запросы — только по unix-сокету или с токеном из файла `/run/dvpn/<tun>.token` (`0600`, создаёт
+   узел при старте), `init` несёт `token`; без него → `not_permitted`. Для UDP без токена — только чтение.
+6. **Подписки вместо рассылки всем.** Сейчас каждое событие уходит всем клиентам. Нужно `{"type": "sub",
+   "events": ["peer", "neighbor", ...]}` / `unsub`; по умолчанию — как сейчас (совместимость).
+
+**B. get: чего нет** — ✅ `group`, `members`, `version`, поля `status` (2026-11-02); `statics` вошёл в `group`
+(ключ, имя, адреса, есть ли прямая связь), следующая попытка соединения не выводится. Остались `exit`, `acl`.
+
+| запрос | что вернуть | откуда |
+|---|---|---|
+| `group` | id, имя, роль (`admin`/`member`), эпоха psk и запланированная смена (`next_epoch`, `at`), срок своего сертификата, профиль маскировки без секретов, трекеры и статические узлы | `GroupCtx`, `store.epoch()` |
+| `members` | все по записям группы, в т.ч. офлайн: имя, ключ, адреса, подсети, роли, срок сертификата, `revoked`, `online` (есть путь), `direct` (есть прямая сессия) | `store.certs()`, `Membership`, `peer_certs`, `path` |
+| `exit` | настройки `[exit]` (v4, v6, kill_switch, dns, sources, table) и текущее состояние: выбранный шлюз и kill switch по каждому семейству, живы ли шлюзы из списка | `exits`, `exit4/6`, `kill` |
+| `acl` | правила TOML-текстом (имена вместо ключей, как `dvpn acl show`) и разобранными: `default`, `rules` | `store.acl()` |
+| `statics` | статические узлы: ключ, адреса, есть ли сессия, следующая попытка | `group.statics` |
+| `version` | версия узла, протокола на проводе, API | — |
+| `status` (дополнить) | имя группы, роль, адрес v4 и ULA v6, имя TUN, `uptime_secs`, эпоха psk | — |
+
+**C. set / del: чего нет**
+
+Все админские операции выполняются **внутри узла**: `store.add(secret, …)`, затем сразу `apply` и `spread`
+(без ожидания опроса файла), `store.save()`. Без секрета группы → `not_admin`; часы не прошли проверку
+(`clock::trusted`) → `clock_untrusted`.
+
+| запрос | параметры | результат / ошибки |
+|---|---|---|
+| `set exit` | `v4`, `v6` (списки), `kill_switch`, `dns`, `sources`, `table`; отсутствующие поля не меняются | новые настройки; узел пишет `[exit]` через `conf.set_exits` и применяет сразу. `gateway_unknown`, `dns_invalid`, `sources_invalid`, `table_invalid` |
+| `set invite` | `name`, `addr`?, `ttl_hours`?, `statics`?, `routes`?, `relay`? | `{invite, name, addr, until}`. `addr_taken`, `name_taken`, `endpoint_invalid`, `route_invalid`, `no_servers` (предупреждение, а не ошибка) |
+| `set node` | `key`, `name`?, `addr`?, `add_routes`?, `del_routes`?, `relay`? | новый сертификат участника. `member_not_seen`, `addr_taken`, `key_ambiguous` |
+| `set revoke` | `key`, `rotate` (по умолчанию true), `lead_secs` (120) | `{epoch, at}`. `revoke_self`, `member_unknown` |
+| `set rotate` | `lead_secs` | `{epoch, at, sealed_to}` |
+| `set acl` | `toml` (текст) | разобранные правила. `acl_parse` с `msg` (строка и причина) |
+| `del acl` | | снять все правила |
+
+Логику `invite` / `node set` / `revoke` / `rotate` / `acl set` из `main.rs` (`cmd_group`, `cmd_node`,
+`cmd_acl`) вынести в `ops.rs` как функции над `StateStore` + `GroupSecret` + `Config`, чтобы CLI и API звали
+одно и то же. Заодно CLI при работающем узле может идти через API (§15 п.7), а без узла — как сейчас, через файлы.
+
+Не через API (узла без группы нет): `group create/join/leave/backup/restore`, `show-key` — клиенты зовут
+`dvpn::ops` напрямую (`ops::join`/`leave` уже есть) или CLI.
+
+**D. События: чего нет**
+
+Сейчас только `storage::Event`: `Peer` (add/update/del локальной записи), `Server`, `Ping`. Добавить:
+
+* `neighbor`: `{key, name, state: "up" | "down", endpoint}` — появление и потеря прямой сессии, смена endpoint
+  (роуминг);
+* `route`: `{key, via, cost}` или `via: nil` — смена первого хопа и недостижимость;
+* `exit`: `{family: "v4" | "v6", gateway, kill_switch}` — смена шлюза, включение kill switch;
+* `member`: `{action: "add" | "update" | "revoke", key, name, …}` — из `apply(&changed)`; `epoch`: `{epoch, at,
+  state: "planned" | "active"}`;
+* `metrics` по подписке: `{"type": "sub", "events": ["metrics"], "interval": 2}` — снимок счётчиков раз в N
+  секунд (для спарклайнов без опроса);
+* `log` по подписке с уровнем (`info`/`warn`) — журнал узла в TUI по SSH без `journalctl`.
+
+**E. Устаревшее**
+
+* `peer_*`, `set peer` с `name`/`addr`, `del peer` — имя и адрес теперь задаёт сертификат; оставить, в
+  `doc/api.md` пометить устаревшими в пользу `members` / `neighbors`.
+* `peer_crypto_status` — шифрование есть всегда; заменить полем `session` в `members`.
+
+**F. Тесты и документация**
+
+* юнит-тесты разбора и ответов `handle_get/set` (узел без сети, `StateStore::memory()`);
+* netns-стенд: админ выдаёт invite через API, новый узел входит; `set exit` меняет шлюз; `revoke` рвёт сессии;
+  подписка получает `neighbor` и `member`;
+* fuzz-цель на разбор запросов API (уже есть msgpack — расширить на новые запросы);
+* `doc/api.md`: все запросы, ошибки, события, права, версия.
 
 ---
 

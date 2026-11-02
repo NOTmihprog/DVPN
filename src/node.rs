@@ -258,6 +258,58 @@ impl Node {
         self.group.id
     }
 
+    /// The group's local name (`[[groups]] name`).
+    pub fn group_name(&self) -> &str {
+        &self.group.group_name
+    }
+
+    /// Whether this node holds the group secret (can sign certificates and group records).
+    pub fn is_admin(&self) -> bool {
+        self.group.secret.is_some()
+    }
+
+    /// The group records (certificates, revocations, psk epochs, ACL).
+    pub fn group_store(&self) -> &StateStore {
+        &self.group.store
+    }
+
+    /// `[[static_peers]]`.
+    pub fn statics(&self) -> &[crate::group::StaticRef] {
+        &self.group.statics
+    }
+
+    /// psk epochs: the one we send with, and until when (unix ms) the previous one is still
+    /// accepted after a change.
+    pub fn psk_epoch(&self) -> (u32, Option<u64>) {
+        let st = self.psk.lock();
+        let now = crate::state::now_ms();
+        (st.0.0, st.1.map(|(_, until)| until).filter(|u| now < *u))
+    }
+
+    /// Every member's newest certificate we know of: ours, those seen in handshakes and from
+    /// trackers, and those in the records, revoked ones included.
+    pub fn member_certs(&self) -> Vec<Cert> {
+        let mut newest: HashMap<NodeId, Cert> = HashMap::new();
+        let own = self.cert.read().clone();
+        let seen = self.peer_certs.lock().values().cloned().collect::<Vec<_>>();
+        for c in seen.into_iter().chain(self.group.store.certs(&self.group.id)).chain([own]) {
+            if newest.get(&c.body.node).is_none_or(|old| old.body.not_after < c.body.not_after) {
+                newest.insert(c.body.node, c);
+            }
+        }
+        newest.into_values().collect()
+    }
+
+    /// Whether we can reach `peer` now: a live direct link or a route through relays.
+    pub fn reachable(&self, peer: &NodeId) -> bool {
+        self.link_alive(peer) || self.next_hop(peer).is_some()
+    }
+
+    /// Whether the direct link to `peer` is alive.
+    pub fn direct(&self, peer: &NodeId) -> bool {
+        self.link_alive(peer)
+    }
+
     /// The CKR table now in use.
     pub fn ckr(&self) -> Arc<CkrTable> {
         self.ckr.load_full()

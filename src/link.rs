@@ -255,6 +255,11 @@ pub struct Links {
 }
 
 impl Links {
+    /// The masking profile of the group (`[groups.obfs]`): sizes and counts, no secrets.
+    pub fn profile(&self) -> &Profile {
+        &self.group.obfs
+    }
+
     pub fn new(identity: Arc<Identity>, group: Group) -> Self {
         let key = Arc::new(Key { epoch: 0, psk: group.psk, obfs: Arc::new(Obfs::new(&group.psk, group.obfs.clone())) });
         Links {

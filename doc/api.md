@@ -17,16 +17,53 @@
 
 ## Подключение
 
-Каждое сообщение — msgpack-словарь с полем `type`.
+Каждое сообщение — msgpack-словарь с полем `type`. Версия протокола API — **4**.
 
-1. Клиент отправляет `{"type": "init", "name": "my-app"}`. Без этого на остальные запросы приходит
-   `{"type": "close"}`.
-2. Узел шлёт клиенту `{"type": "ping"}` раз в 15 с; клиент отвечает `{"type": "pong"}`, иначе примерно через 45 с
+1. Клиент отправляет `{"type": "init", "name": "my-app", "version": 4}`. Узел отвечает:
+
+   ```
+   {"type": "init", "version": 4, "min_version": 4,     # версии API, которые узел обслуживает
+    "key": "DZVS…", "name": "alice",                    # этот узел
+    "group": "<id группы>", "group_name": "home",
+    "admin": true,                                      # есть ли у узла секрет группы
+    "node_version": "4.0.0-dev"}
+   ```
+
+   Без `version` или с версией, которую узел не обслуживает, приходит
+   `{"type": "error", "err": "version_unsupported", "msg": "…", "min": 4, "max": 4}`, и клиент не подключён.
+   Повторный `init` допустим (например, после `close`).
+2. Пока клиент не подключён, на запросы приходит `{"type": "close"}` — нужно снова отправить `init`.
+3. Узел шлёт клиенту `{"type": "ping"}` раз в 15 с; клиент отвечает `{"type": "pong"}`, иначе примерно через 45 с
    соединение закрывается.
-3. Отключиться — `{"type": "close"}`.
+4. Отключиться — `{"type": "close"}`.
 
 Запросы `get` / `set` / `del` / `route` содержат произвольный `id`; ответ приходит как
 `{"type": "res", "id": <тот же id>, "res": <результат>}`.
+
+### Ошибки
+
+Неудачный запрос отвечает без `res`, с кодом и текстом:
+
+```
+{"type": "res", "id": 1, "err": "key_validate_error", "msg": "bob: no such node key or name"}
+```
+
+`err` — стабильный код для программ, `msg` — текст для людей (может меняться). `nil` в `res` — это результат
+(«нет данных», «нет пути»), а не ошибка. Сообщение неизвестного типа — `{"type": "error", "err":
+"unknown_type", "msg"}`.
+
+| код | когда |
+|---|---|
+| `version_unsupported` | `init` без `version` или с неподдерживаемой |
+| `unknown_type` | неизвестный `type` сообщения |
+| `unknown_request` | неизвестный `req` |
+| `bad_param` | не хватает параметра или он не того типа (`req`, `arg`, `addr`) |
+| `key_validate_error` | `key` не передан, или нет узла с таким ключом, началом ключа или именем |
+| `key_ambiguous` | начало ключа подходит нескольким узлам |
+| `server_not_found` | `addr` — не сервер обнаружения этого узла |
+| `name_not_str`, `addr_validate_error`, `endpoint_validate_error`, `sub_args_not_dict`, `force_not_bool` | `set peer`: неверное поле |
+| `peer_not_exist`, `error_delete_self_peer` | `del` |
+| `not_int`, `out_of_range`, `route_exist`, `route_not_exist`, `not_permission` | `route` |
 
 Узлы везде обозначаются полем `key` — публичным ключом узла (base64url). В запросах можно передать однозначное
 начало ключа или имя участника.
@@ -38,7 +75,8 @@ import socket, msgpack
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(("127.0.0.1", 0))
 node = ("127.0.0.1", 9902)
-s.sendto(msgpack.dumps({"type": "init", "name": "example"}), node)
+s.sendto(msgpack.dumps({"type": "init", "name": "example", "version": 4}), node)
+print(msgpack.loads(s.recv(65535)))   # {'type': 'init', 'version': 4, 'key': 'DZVS...', 'name': 'alice', ...}
 s.sendto(msgpack.dumps({"type": "get", "id": 1, "req": "status"}), node)
 print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 'DZVS...', 'name': 'alice', ...}}
 ```
@@ -53,7 +91,8 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 
 | `req` | параметры | результат |
 |---|---|---|
-| `status` | | словарь: `key`, `name`, `group`, `prefixes` (адреса и подсети из сертификата), `relay`, `cert_days`, `servers` (`[{addr, connected}]`), `exit_v4`, `exit_v6` (имя текущего шлюза или nil), `kill_switch`, `local_addr` |
+| `status` | | словарь: `key`, `name`, `group`, `group_name`, `admin`, `prefixes` (адреса и подсети из сертификата), `ula` (IPv6-адрес узла в группе), `relay`, `cert_days`, `epoch` (эпоха psk), `servers` (`[{addr, connected}]`), `exit_v4`, `exit_v6` (имя текущего шлюза или nil), `kill_switch`, `local_addr`, `uptime_secs` |
+| `version` | | `{api, api_min, node, wire}`: версии API, программы узла и протокола на проводе (`"dvpn/4"`) |
 | `neighbors` | | список прямых соседей: `key`, `name`, `endpoint`, `rtt_ms`, `alive`, `session_secs`, `tx_packets`, `tx_bytes`, `rx_packets`, `rx_bytes` |
 | `routes` | | `{"mesh": [{key, name, via, via_name, cost}], "ckr": [{net, to, system}]}` |
 | `path` | `key` | список хопов `[{key, name}]` до участника (последний — он сам) или nil |
@@ -61,6 +100,56 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 | `metrics` | | счётчики, см. [ниже](#metrics) |
 
 `ping` отвечает не сразу (ждёт ответа участника), остальные запросы при этом обслуживаются.
+
+### Группа и участники
+
+| `req` | параметры | результат |
+|---|---|---|
+| `group` | | группа глазами этого узла, без секретов, см. [ниже](#group) |
+| `members` | | все участники, в том числе офлайн и исключённые, см. [ниже](#members) |
+
+#### group
+
+```
+{
+  "id": "<id группы>", "name": "home", "admin": true,
+  "epoch": 3,                                   # эпоха psk, с которой узел шлёт
+  "prev_epoch_until": 1793650000 | nil,         # до этого времени ещё принимается прошлый psk
+  "next_epoch": {"epoch": 4, "at": 1793650120,  # объявленная смена psk (unix-время перехода)
+                 "started": false,              # время перехода уже наступило
+                 "has_key": true} | nil,        # у узла есть новый psk (нет — после перехода связи не будет)
+  "cert": {"not_after": 1796000000, "days": 24, "invite": false},   # свой сертификат; invite — ещё от invite
+  "obfs": {"junk_count": [0, 0], "junk_size": [40, 40], "signatures": 0,
+           "init_pad": [0, 0], "resp_pad": [0, 0], "data_pad": [0, 0]},   # профиль маскировки: размеры и счётчики
+  "servers": [{"addr": "203.0.113.1:6485", "key": "...", "connected": true}],
+  "statics": [{"key": "...", "name": "vps" | nil, "endpoints": ["vps.example.org:8647"], "direct": true}]
+}
+```
+
+Время везде — unix-секунды.
+
+#### members
+
+Список, по имени. Участники берутся из записей группы, из рукопожатий и от серверов обнаружения; для каждого —
+самый свежий сертификат.
+
+```
+{
+  "key": "...", "name": "bob",
+  "addrs": ["10.10.33.2"],                      # адреса узла (/32, /128)
+  "routes": ["192.168.1.0/24"],                 # подсети за ним
+  "roles": ["relay"],                           # admin, relay, exit_v4, exit_v6
+  "not_after": 1796000000, "days": 24, "expired": false,
+  "invite": false,                              # сертификат ещё от invite (админ не видел узел в сети)
+  "revoked": false,
+  "self": false,                                # это сам узел
+  "online": true,                               # есть путь: напрямую или через ретрансляторы
+  "direct": false                               # есть живая прямая связь
+}
+```
+
+Исключённый узел, сертификат которого этот узел не видел, приходит с `name`, `not_after`, `days` = nil и пустыми
+списками.
 
 ### Участники и серверы
 
@@ -105,14 +194,15 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 
 `{"type": "set", "id": 2, "req": "peer", "key": "...", "name": "...", "addr": "10.10.33.5",
 "endpoint": ["1.2.3.4", 5000], "sub_args": {...}, "force": false}` — поля, которых нет, не меняются; с
-`"force": true` — очищаются. Ошибки возвращаются строкой: `key_validate_error`, `key_ambiguous`, `name_not_str`,
-`addr_validate_error`, `endpoint_validate_error`, `sub_args_not_dict`, `force_not_bool`.
+`"force": true` — очищаются. Ошибки (в `err`, см. [выше](#ошибки)): `key_validate_error`, `key_ambiguous`,
+`name_not_str`, `addr_validate_error`, `endpoint_validate_error`, `sub_args_not_dict`, `force_not_bool`.
 
 Имя и адрес участника задаёт его сертификат; `set` меняет только локальные данные узла (например, `sub_args` или
 адрес для попытки соединения).
 
 `{"type": "del", "id": 3, "req": "peer" | "peer_endpoint", "key": "..."}` — удалить участника из локального
-списка или сбросить его текущее соединение. Ошибки: `peer_not_exist`, `error_delete_self_peer`.
+списка или сбросить его текущее соединение. Ошибки: `key_validate_error`, `key_ambiguous`, `peer_not_exist`,
+`error_delete_self_peer`.
 
 ## События
 
@@ -128,8 +218,8 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 по тем же зашифрованным сессиям, что и IP-трафик, напрямую или через ретрансляторы:
 
 ```
-{"type": "route", "id": 4, "req": "reg", "route": 40}      → nil или "route_exist" / "out_of_range"
-{"type": "route", "id": 5, "req": "del", "route": 40}      → nil или "route_not_exist" / "not_permission"
+{"type": "route", "id": 4, "req": "reg", "route": 40}      → nil или ошибка route_exist / out_of_range / not_int
+{"type": "route", "id": 5, "req": "del", "route": 40}      → nil или ошибка route_not_exist / not_permission
 {"type": "route", "id": 6, "req": "routes"}                → [40]
 {"type": "net", "rou": 40, "key": "<кому>", "pack": b"данные"}
 ```
