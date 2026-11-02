@@ -180,7 +180,7 @@
 - [~] **7.2** UniFFI-биндинги (2026-11-02, репозиторий `DVPN-android`, `native/`): `run.rs` — общий запуск узла для CLI и приложений (`Tun::External`, `protect`, `on_plan`), `ops.rs` — `join`/`leave` для CLI и приложений; в узле сменяемый TUN (`Node::set_tun`, tun-rs `AsyncDevice::from_fd`), слушатель плана (`set_plan_listener`) → `VpnConfig` для `VpnService.Builder` (адреса, маршруты, `~` как excludeRoute, DNS), DNS внутри TUN на `<ULA>::53` (`tun_dns_addr`), логгер с приёмником (`logger::set_sink`); мост: `DvpnNode` + `NodeHost`, API узла через unix-сокет в папке приложения (JSON ⇄ msgpack), тесты моста. Осталось: сборка `.so` под все ABI и APK
 - [~] **7.3** экономный к батарее keepalive (2026-11-02): `Node::set_power_save` — keepalive 22–28 с вместо 12–18 с, link loop раз в ~2 с; приложение включает при выключенном экране; смена сети → `network_changed` (новый порт). Осталось: замер расхода в фоне
 - [~] **7.4** импорт группы по QR (2026-11-02): приложение — QR, ссылки `dvpn://invite/…`, `dvpn:…`, вставка, предпросмотр приглашения; режим `Static`-клиента — не начат
-- [ ] **7.5** сборка APK, ручной тест в фоне (Kotlin-часть и Gradle написаны, не собирались: нет SDK на машине)
+- [~] **7.5** сборка APK (2026-11-02): `DVPN-android` собирается (debug и release с R8, 4 ABI, Android 12+), в том числе на aarch64-хосте (`scripts/android-ld`, aapt2 под aarch64). Осталось: ручной тест в фоне на устройстве
 
 **Критерий приёмки:** [ ] Android-узел входит в группу по QR и держит связь в фоне без утечки своего трафика в туннель.
 
