@@ -69,9 +69,10 @@ impl std::fmt::Display for ApiAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApiAddr::Inet(a) => write!(f, "{a}"),
-            #[cfg(unix)]
             // an abstract name as `ss` shows it
+            #[cfg(unix)]
             ApiAddr::Unix(p) if is_abstract(p) => write!(f, "@{}", p.display().to_string().trim_start_matches('\0')),
+            #[cfg(unix)]
             ApiAddr::Unix(p) => write!(f, "{}", p.display()),
         }
     }

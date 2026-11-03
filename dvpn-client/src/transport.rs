@@ -29,6 +29,9 @@ impl Socket {
     /// `abstract_addr`: a unix socket's own address in the abstract namespace (Linux only;
     /// elsewhere a file anyway).
     pub async fn open(addr: &ApiAddr, abstract_addr: bool) -> std::io::Result<Socket> {
+        // only unix sockets on Linux have abstract addresses
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _ = abstract_addr;
         match addr {
             ApiAddr::Udp(a) => {
                 let local: std::net::SocketAddr =
@@ -55,7 +58,6 @@ impl Socket {
                     s.set_nonblocking(true)?;
                     return Ok(Socket::Unix { sock: UnixDatagram::from_std(s)?, node: node.clone(), me: None });
                 }
-                let _ = abstract_addr;
                 let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, Into::into);
                 let me =
                     dir.join(format!("dvpn-client-{}-{}.sock", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
