@@ -380,9 +380,11 @@ impl Invite {
     }
 
     /// Decodes and checks an invite: the grant must be the group's and, if `now` is given,
-    /// still usable.
+    /// still usable. Whitespace anywhere is ignored (base64url has none): an invite copied from
+    /// a terminal or a message comes with line breaks.
     pub fn decode(s: &str, now: Option<u64>) -> Result<Self, InviteError> {
-        let bytes = crate::crypto::decode_b64(s.trim()).map_err(|_| InviteError::Encoding)?;
+        let s: String = s.split_whitespace().collect();
+        let bytes = crate::crypto::decode_b64(&s).map_err(|_| InviteError::Encoding)?;
         let inv: Invite = postcard::from_bytes(&bytes).map_err(|_| InviteError::Encoding)?;
         if inv.version != INVITE_VERSION {
             return Err(InviteError::Version(inv.version));
@@ -508,6 +510,10 @@ mod tests {
         assert_eq!(back.join.enroll(node).verify(&g.id(), Some(now_unix())), Ok(()));
 
         assert_eq!(Invite::decode(&text, Some(now_unix() + 61)).err(), Some(InviteError::Expired));
+        // copied from a terminal: broken into lines, indented
+        let wrapped: String =
+            text.as_bytes().chunks(40).map(|c| format!("  {}\r\n", std::str::from_utf8(c).unwrap())).collect();
+        assert_eq!(Invite::decode(&wrapped, Some(now_unix())).unwrap().encode(), text);
         assert_eq!(Invite::decode("not an invite", None).err(), Some(InviteError::Encoding));
         // another join key than the granted one
         let mut bad = inv.clone();
