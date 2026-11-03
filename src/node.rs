@@ -131,6 +131,12 @@ pub struct Node {
     clients_by_addr: HashMap<SocketAddr, Arc<TrackerClient>>,
     /// The TUN: created with the node, or handed in (and replaced) by a VPN service (`set_tun`).
     tun: arc_swap::ArcSwapOption<AsyncDevice>,
+    /// Without nftables (not Linux) the node enforces the ACL itself: the rules for this node,
+    /// and the flows it started, whose replies pass.
+    #[cfg(not(target_os = "linux"))]
+    acl_filter: arc_swap::ArcSwapOption<crate::aclfilter::Filter>,
+    #[cfg(not(target_os = "linux"))]
+    flows: crate::aclfilter::Flows,
     /// Told by `set_tun`: the one TUN loop moves to the new device (or waits for one).
     tun_changed: tokio::sync::Notify,
     started: std::sync::atomic::AtomicBool,
@@ -219,6 +225,10 @@ impl Node {
             clients,
             clients_by_addr,
             tun: arc_swap::ArcSwapOption::new(tun),
+            #[cfg(not(target_os = "linux"))]
+            acl_filter: arc_swap::ArcSwapOption::empty(),
+            #[cfg(not(target_os = "linux"))]
+            flows: Default::default(),
             tun_changed: tokio::sync::Notify::new(),
             started: std::sync::atomic::AtomicBool::new(false),
             plan_listener: OnceLock::new(),
@@ -391,7 +401,24 @@ impl Node {
             }
             self.group.dns_upstream.store(Arc::new(plan.dns_upstream.clone()));
         }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let members = plan.members.clone().into_iter().collect();
+            let filter = plan.acl.as_ref().and_then(|a| crate::aclfilter::Filter::new(a, &me, &members));
+            if filter.is_some() != self.acl_filter.load().is_some() {
+                log::info!(
+                    "ACL | {}",
+                    if filter.is_some() { "rules enforced by the node" } else { "no rules for this node" }
+                );
+            }
+            self.acl_filter.store(filter.map(Arc::new));
+        }
         tokio::task::block_in_place(|| self.system.lock().apply(&me, &current, &plan));
+        // a default route into the overlay came or went: our own packets follow at once
+        #[cfg(windows)]
+        if let Some(pin) = self.system.lock().pin() {
+            self.transport.pin(pin);
+        }
         if let Some(l) = self.plan_listener.get() {
             l(&plan);
         }
@@ -699,6 +726,22 @@ impl Node {
         tokio::spawn(self.clone().tun_loop());
         if !self.group.statics.is_empty() {
             tokio::spawn(self.clone().static_loop());
+        }
+        #[cfg(windows)]
+        tokio::spawn(self.clone().underlay_loop());
+    }
+
+    /// Windows: follows the physical network (another Wi-Fi, a cable plugged in): the holes in
+    /// our routes and the interface our own packets are pinned to move with its default route.
+    #[cfg(windows)]
+    async fn underlay_loop(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(3));
+        loop {
+            tick.tick().await;
+            let pin = tokio::task::block_in_place(|| self.system.lock().underlay_changed());
+            if let Some(pin) = pin {
+                self.transport.pin(pin);
+            }
         }
     }
 
@@ -1077,6 +1120,14 @@ impl Node {
         if !own {
             self.metrics.dropped(crate::metrics::Drop::ForeignSource);
             log::debug!("Link | packet from {} with foreign source dropped", node(peer));
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(f) = self.acl_filter.load().as_ref()
+            && !f.allows(&self.flows, body)
+        {
+            self.metrics.dropped(crate::metrics::Drop::Acl);
+            log::trace!("ACL | packet from {} dropped", node(peer));
             return;
         }
         match tun.send(body).await {
@@ -1721,6 +1772,10 @@ impl Node {
                     continue;
                 }
             };
+            #[cfg(not(target_os = "linux"))]
+            if self.acl_filter.load().is_some() {
+                self.flows.outbound(&buf[OFF..OFF + n]);
+            }
             let direct = self.links.current(&peer).is_some();
             let mtu = if direct { DIRECT_MTU } else { RELAY_MTU };
             if n > mtu && packet::dont_fragment(&buf[OFF..OFF + n]) {

@@ -73,10 +73,13 @@ pub enum Drop {
     HopLimit,
     /// To relay: no way on to the destination.
     NoWayOn,
+    /// From a member: the ACL does not let it reach this node (filtered by the node itself
+    /// where there is no nftables).
+    Acl,
 }
 
 impl Drop {
-    pub const ALL: [Drop; 10] = [
+    pub const ALL: [Drop; 11] = [
         Drop::NoRoute,
         Drop::NoSession,
         Drop::Unreachable,
@@ -87,6 +90,7 @@ impl Drop {
         Drop::NotRelay,
         Drop::HopLimit,
         Drop::NoWayOn,
+        Drop::Acl,
     ];
 
     pub fn name(self) -> &'static str {
@@ -101,6 +105,7 @@ impl Drop {
             Drop::NotRelay => "not_relay",
             Drop::HopLimit => "hop_limit",
             Drop::NoWayOn => "no_way_on",
+            Drop::Acl => "acl",
         }
     }
 }

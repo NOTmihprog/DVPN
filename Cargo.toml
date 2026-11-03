@@ -45,6 +45,13 @@ rpassword = "7"
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = "0.3"
+# routes and socket pinning (winnet.rs); the version tokio already brings
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
 
 [profile.release]
 lto = true

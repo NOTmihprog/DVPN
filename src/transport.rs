@@ -106,6 +106,10 @@ pub struct Transport {
     bind_addr: IpAddr,
     port_range: (u16, u16),
     protect: Option<Protect>,
+    /// Windows: the interfaces our packets must leave by, IPv4 and IPv6 (0: any), while the
+    /// overlay takes the default route (`sysroute_win.rs`).
+    #[cfg(windows)]
+    pinned: std::sync::Mutex<[u32; 2]>,
 }
 
 fn random_port(range: (u16, u16)) -> u16 {
@@ -138,6 +142,8 @@ impl Transport {
                         bind_addr,
                         port_range,
                         protect,
+                        #[cfg(windows)]
+                        pinned: std::sync::Mutex::new([0, 0]),
                     }));
                 }
                 Err(e) if attempt == 0 && bind_addr == IpAddr::V6(Ipv6Addr::UNSPECIFIED) => {
@@ -195,6 +201,36 @@ impl Transport {
         }
     }
 
+    /// Windows: sends our packets out of these interfaces (IPv4, IPv6; 0: as the routes say),
+    /// now and after every change of port. Linux uses the fwmark instead.
+    #[cfg(windows)]
+    pub fn pin(&self, interfaces: [u32; 2]) {
+        let mut p = self.pinned.lock().unwrap_or_else(|e| e.into_inner());
+        if *p != interfaces {
+            *p = interfaces;
+            self.pin_socket(&self.sock.load(), interfaces);
+            log::info!(
+                "Transport | own packets out of interface IPv4 {}, IPv6 {} (0: any)",
+                interfaces[0],
+                interfaces[1]
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    fn pin_socket(&self, sock: &UdpSocket, [v4, v6]: [u32; 2]) {
+        use std::os::windows::io::AsRawSocket;
+        let raw = sock.as_raw_socket() as windows_sys::Win32::Networking::WinSock::SOCKET;
+        let r = if self.families.v6 {
+            crate::winnet::pin_socket(raw, v4, v6, self.families.v4)
+        } else {
+            crate::winnet::pin_socket_v4(raw, v4)
+        };
+        if let Err(e) = r {
+            log::warn!("Transport | cannot pin the socket to the physical interface: {e}");
+        }
+    }
+
     pub async fn change_port(&self) {
         let mut failures: u32 = 0;
         loop {
@@ -203,6 +239,8 @@ impl Transport {
                 .and_then(|(s, f)| protect_socket(&s, self.protect.as_ref()).map(|()| (s, f)))
             {
                 Ok((sock, _)) => {
+                    #[cfg(windows)]
+                    self.pin_socket(&sock, *self.pinned.lock().unwrap_or_else(|e| e.into_inner()));
                     self.sock.store(Arc::new(sock));
                     self.rebound.notify_waiters();
                     log::warn!("Transport | Port changed, new port {port}");

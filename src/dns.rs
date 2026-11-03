@@ -248,7 +248,82 @@ pub async fn serve(addr: IpAddr, zone: Arc<ArcSwap<Zone>>, domain: String, upstr
     }
 }
 
+/// Windows: the Name Resolution Policy Table (NRPT) sends `.<domain>`, and with a gateway in
+/// use every name (`.`), to the node's DNS server. The rules carry the comment `dvpn` /
+/// `dvpn-all`; they outlive the process, so they are removed on exit and on the next start.
+#[cfg(windows)]
+mod nrpt {
+    use std::net::IpAddr;
+    use std::sync::Mutex;
+
+    /// Our DNS server, for the rule for all names.
+    static SERVER: Mutex<Option<IpAddr>> = Mutex::new(None);
+
+    fn ps(script: &str) -> bool {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+            .is_ok_and(|o| o.status.success() && o.stderr.is_empty())
+    }
+
+    fn remove(comment: &str) -> String {
+        format!(
+            "Get-DnsClientNrptRule | Where-Object Comment -eq '{comment}' | \
+             ForEach-Object {{ Remove-DnsClientNrptRule -Name $_.Name -Force }}"
+        )
+    }
+
+    fn add(namespace: &str, server: IpAddr, comment: &str) -> String {
+        format!(
+            "Add-DnsClientNrptRule -Namespace '{namespace}' -NameServers '{server}' -Comment '{comment}' | Out-Null"
+        )
+    }
+
+    pub fn configure(server: IpAddr, domain: &str) -> bool {
+        *SERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(server);
+        let script = format!(
+            "{}; {}; {}; Clear-DnsClientCache",
+            remove("dvpn"),
+            remove("dvpn-all"),
+            add(&format!(".{domain}"), server, "dvpn")
+        );
+        ps(&script)
+    }
+
+    pub fn route_all(all: bool) -> bool {
+        let Some(server) = *SERVER.lock().unwrap_or_else(|e| e.into_inner()) else { return false };
+        let script = if all {
+            format!("{}; {}; Clear-DnsClientCache", remove("dvpn-all"), add(".", server, "dvpn-all"))
+        } else {
+            format!("{}; Clear-DnsClientCache", remove("dvpn-all"))
+        };
+        ps(&script)
+    }
+
+    pub fn clear() {
+        ps(&format!("{}; {}; Clear-DnsClientCache", remove("dvpn"), remove("dvpn-all")));
+    }
+}
+
+/// Windows: removes our NRPT rules (on exit).
+#[cfg(windows)]
+pub fn resolved_clear() {
+    nrpt::clear();
+}
+
 /// All names to us (and so through the gateway) or only our domain, in systemd-resolved.
+#[cfg(windows)]
+pub fn resolved_route_all(_tun: &str, domain: &str, all: bool) {
+    if nrpt::route_all(all) {
+        log::info!(
+            "DNS | Windows NRPT: {}",
+            if all { "all names through the tunnel".to_owned() } else { format!("only *.{domain}") }
+        );
+    }
+}
+
+/// All names to us (and so through the gateway) or only our domain, in systemd-resolved.
+#[cfg(not(windows))]
 pub fn resolved_route_all(tun: &str, domain: &str, all: bool) {
     let run =
         |args: &[&str]| std::process::Command::new("resolvectl").args(args).output().is_ok_and(|o| o.status.success());
@@ -260,8 +335,21 @@ pub fn resolved_route_all(tun: &str, domain: &str, all: bool) {
     }
 }
 
+/// Windows: an NRPT rule sends `*.<domain>` to us (split DNS).
+#[cfg(windows)]
+pub fn configure_resolved(_tun: &str, addr: IpAddr, domain: &str) -> bool {
+    let done = nrpt::configure(addr, domain);
+    if done {
+        log::info!("DNS | Windows NRPT sends *.{domain} to {addr}");
+    } else {
+        log::info!("DNS | NRPT not configured: point *.{domain} at {addr} by hand if needed");
+    }
+    done
+}
+
 /// Points systemd-resolved at us for the domain on the TUN link (split DNS) and lets it ask
 /// mDNS there (`<member>.local`); `false` if resolvectl is not there or failed.
+#[cfg(not(windows))]
 pub fn configure_resolved(tun: &str, addr: IpAddr, domain: &str) -> bool {
     let ok =
         |args: &[&str]| std::process::Command::new("resolvectl").args(args).output().is_ok_and(|o| o.status.success());

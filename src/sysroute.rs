@@ -19,18 +19,22 @@
 //! cleaned up on start (after a crash). Uses the `ip` command (iproute2).
 
 use std::collections::BTreeSet;
+#[cfg(not(windows))]
 use std::process::Command;
 
 use ipnet::IpNet;
 
 pub const FWMARK: u32 = 0x7347;
 pub const TABLE: u32 = 7347;
+#[cfg(not(windows))]
 const PRIORITY: u32 = 7347;
 /// The table of the internet routes for `[exit] v4_sources` without `table`.
 pub const EXIT_TABLE: u32 = 7348;
 /// The `from <source>` rules: after ours (7346, 7347), before the main table.
+#[cfg(not(windows))]
 const EXIT_PRIORITY: u32 = 7348;
 /// Marks our routes (`proto 73`), so that we only ever remove our own.
+#[cfg(not(windows))]
 const PROTO: &str = "73";
 
 /// A wanted route in our table.
@@ -42,6 +46,7 @@ pub enum SysRoute {
 }
 
 impl SysRoute {
+    #[cfg_attr(windows, allow(dead_code))]
     fn net(&self) -> IpNet {
         match self {
             SysRoute::Dev(n) | SysRoute::Throw(n) => *n,
@@ -81,15 +86,18 @@ impl Wanted {
         }
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     fn is_empty(&self) -> bool {
         self.routes.is_empty() && self.sources.is_empty()
     }
 }
 
+#[cfg(not(windows))]
 fn family(n: &IpNet) -> &'static str {
     if matches!(n, IpNet::V4(_)) { "-4" } else { "-6" }
 }
 
+#[cfg(not(windows))]
 fn ip(args: &[String]) -> bool {
     match Command::new("ip").args(args).output() {
         Ok(o) if o.status.success() => true,
@@ -104,11 +112,16 @@ fn ip(args: &[String]) -> bool {
     }
 }
 
+#[cfg(not(windows))]
 fn args(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
+#[cfg(windows)]
+pub use crate::sysroute_win::SysRoutes;
+
 /// Installs and removes our routes.
+#[cfg(not(windows))]
 pub struct SysRoutes {
     tun: String,
     installed: BTreeSet<(u32, SysRoute)>,
@@ -116,8 +129,9 @@ pub struct SysRoutes {
     rules: bool,
 }
 
+#[cfg(not(windows))]
 impl SysRoutes {
-    pub fn new(tun: &str) -> Self {
+    pub fn new(tun: &str, _tun_index: u32) -> Self {
         let s = SysRoutes { tun: tun.to_owned(), installed: BTreeSet::new(), sources: BTreeSet::new(), rules: false };
         if cfg!(target_os = "linux") {
             s.remove_all(); // leftovers of a crashed run

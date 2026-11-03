@@ -42,7 +42,8 @@ impl System {
     /// Manage system routes on the TUN (`[net] manage_routes`).
     pub fn manage_routes(&mut self) {
         if self.tun.is_some() {
-            self.routes = Some(crate::sysroute::SysRoutes::new(&self.tun_name));
+            let index = self.tun.as_ref().and_then(|t| t.if_index().ok()).unwrap_or(0);
+            self.routes = Some(crate::sysroute::SysRoutes::new(&self.tun_name, index));
         }
     }
 
@@ -107,6 +108,20 @@ impl System {
         }
     }
 
+    /// Windows: the interfaces DVPN's own socket must use now (`sysroute_win.rs`); `None` when
+    /// routes are not managed.
+    #[cfg(windows)]
+    pub fn pin(&self) -> Option<[u32; 2]> {
+        self.routes.as_ref().map(|r| r.pin())
+    }
+
+    /// Windows: looks at the physical network again (holes move with its default route);
+    /// returns the interfaces to pin DVPN's socket to.
+    #[cfg(windows)]
+    pub fn underlay_changed(&mut self) -> Option<[u32; 2]> {
+        self.routes.as_mut().and_then(|r| r.underlay_changed())
+    }
+
     /// Removes what was applied (on exit): routes and rules, the gateway, the ACL.
     pub fn clear(&mut self) {
         if let Some(r) = self.routes.as_mut() {
@@ -117,6 +132,11 @@ impl System {
         }
         if self.acl.take().is_some() {
             crate::acl::apply_nft(&self.tun_name, None);
+        }
+        // systemd-resolved forgets the TUN link with it; Windows' NRPT rules stay
+        #[cfg(windows)]
+        if self.resolved.is_some() {
+            crate::dns::resolved_clear();
         }
     }
 }

@@ -2,6 +2,7 @@
 //! they are a library so that fuzz targets and benchmarks can reach the parsers.
 
 pub mod acl;
+pub mod aclfilter;
 pub mod api;
 pub mod apply;
 pub mod backup;
@@ -31,7 +32,11 @@ pub mod run;
 pub mod state;
 pub mod storage;
 pub mod sysroute;
+#[cfg(windows)]
+pub mod sysroute_win;
 pub mod tracker_client;
 pub mod tracker_server;
 pub mod transport;
 pub mod tunnel;
+#[cfg(windows)]
+pub mod winnet;

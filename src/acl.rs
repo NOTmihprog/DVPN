@@ -17,7 +17,8 @@
 //! Each node enforces the rules whose `to` includes it, on traffic arriving from the tunnel for
 //! itself or the subnets behind it, first match wins. Replies to its own connections always pass
 //! (conntrack), and so does what is not from a member's address (the internet through an exit
-//! is not a member). Rendered into nftables (`table inet dvpn_acl`), Linux for now.
+//! is not a member). Rendered into nftables (`table inet dvpn_acl`) on Linux; elsewhere the node
+//! filters the packets itself (`aclfilter.rs`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -185,7 +186,7 @@ impl Acl {
         s
     }
 
-    fn covers(&self, w: &Who, n: &NodeId) -> bool {
+    pub(crate) fn covers(&self, w: &Who, n: &NodeId) -> bool {
         match w {
             Who::Anybody => true,
             Who::Tag(t) => self.tags.get(t).is_some_and(|ids| ids.contains(n)),
@@ -259,9 +260,7 @@ const TABLE: &str = "dvpn_acl";
 /// Installs (or with `None` removes) the ACL chain for traffic from `tun`.
 pub fn apply_nft(tun: &str, chain: Option<&str>) {
     if !cfg!(target_os = "linux") {
-        if chain.is_some() {
-            log::warn!("ACL | enforced on Linux only for now");
-        }
+        // elsewhere the node enforces the rules itself (aclfilter.rs)
         return;
     }
     let _ = Command::new("nft").args(["delete", "table", "inet", TABLE]).stderr(Stdio::null()).status();
