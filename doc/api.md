@@ -52,7 +52,7 @@ UDP `127.0.0.1:9902`.
     "key": "DZVS…", "name": "alice",                    # этот узел
     "group": "<id группы>", "group_name": "home",
     "admin": true,                                      # есть ли у узла секрет группы
-    "node_version": "4.0.0-dev"}
+    "node_version": "4.1.0"}
    ```
 
    Без `version` или с версией, которую узел не обслуживает, приходит
