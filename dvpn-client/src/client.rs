@@ -59,7 +59,7 @@ impl Client {
     /// finds the token itself ([`ApiAddr::find_token`]); without it only reading works.
     pub async fn connect(addr: ApiAddr, name: &str) -> Result<Client, Error> {
         // a unix socket: an abstract address first (Linux; see transport.rs), which a node
-        // older than 4.3 leaves unanswered: then a file
+        // older than 4.2.1 leaves unanswered: then a file
         if cfg!(any(target_os = "linux", target_os = "android")) && matches!(addr, ApiAddr::Unix(_)) {
             match Self::connect_on(&addr, name, true, Duration::from_millis(1500)).await {
                 Err(Error::Timeout) => {}

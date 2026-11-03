@@ -3,7 +3,7 @@
 //! On Linux that address is first an abstract one (no file): a node run by systemd with
 //! `PrivateTmp` / `ProtectHome` does not see `/tmp` or `/run/user`, where a file would be, and
 //! could not answer. The socket is connected to the node's, so only the node can send to it.
-//! A node older than 4.3 does not answer an abstract address: then a file, as before.
+//! A node older than 4.2.1 does not answer an abstract address: then a file, as before.
 
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU32, Ordering};
