@@ -2575,6 +2575,20 @@ mod tests {
         assert!(e.v4.is_empty() && e.kill_switch);
         let acl = c.acl().await.unwrap();
         assert!(!acl.set && acl.default == "allow" && acl.rules.is_empty());
+
+        // API routes for a protocol of one's own
+        c.route_reg(40).await.unwrap();
+        c.route_reg(41).await.unwrap();
+        assert_eq!(c.own_routes().await.unwrap(), vec![40, 41]);
+        assert_eq!(code(c.route_reg(40).await), Some(ErrorCode::RouteExist));
+        assert_eq!(code(c.route_reg(31).await), Some(ErrorCode::OutOfRange));
+        c.route_del(41).await.unwrap();
+        assert_eq!(c.own_routes().await.unwrap(), vec![40]);
+        assert!(matches!(
+            c.send_net(40, "alice", &[0; dvpn_client::MAX_PAYLOAD + 1]).await,
+            Err(dvpn_client::Error::PacketTooLarge { .. })
+        ));
+        c.send_net(40, "alice", b"hello").await.unwrap();
         drop(c);
         std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
     }

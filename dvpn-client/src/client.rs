@@ -25,8 +25,11 @@ struct Shared {
     init: Mutex<Option<oneshot::Sender<Reply>>>,
     events: broadcast::Sender<Value>,
     typed: broadcast::Sender<Event>,
+    net: broadcast::Sender<NetPacket>,
     /// The last `sub` sent (with the token), sent again when the node forgot us.
     sub: Mutex<Option<Vec<u8>>>,
+    /// API routes this client holds, as `route reg` messages: taken again when the node forgot us.
+    routes: Mutex<std::collections::BTreeMap<u8, Vec<u8>>>,
 }
 
 impl Shared {
@@ -59,6 +62,7 @@ impl Client {
         let sock = Socket::open(&addr).await?;
         let (events, _) = broadcast::channel(256);
         let (typed, _) = broadcast::channel(256);
+        let (net, _) = broadcast::channel(1024);
         let shared = Arc::new(Shared {
             sock,
             name: name.to_owned(),
@@ -66,7 +70,9 @@ impl Client {
             init: Mutex::default(),
             events,
             typed,
+            net,
             sub: Mutex::default(),
+            routes: Mutex::default(),
         });
         let task = tokio::spawn(recv_loop(shared.clone()));
         let (tx, rx) = oneshot::channel();
@@ -137,6 +143,49 @@ impl Client {
         self.request("sub", None, f).await?;
         *self.shared.sub.lock().await = Some(again);
         Ok(())
+    }
+
+    // ---- API routes: a protocol of one's own over the network ----
+
+    /// Takes API route `route` (32..=255): packets members send to it come to this client
+    /// ([`Client::net_packets`]). Taken again by itself if the node restarts.
+    pub async fn route_reg(&self, route: u8) -> Result<(), Error> {
+        let f = vec![("route", Value::from(route))];
+        let again = self.message("route", Some("reg"), 0, f.clone());
+        self.request("route", Some("reg"), f).await?;
+        self.shared.routes.lock().await.insert(route, again);
+        Ok(())
+    }
+
+    /// Gives API route `route` back.
+    pub async fn route_del(&self, route: u8) -> Result<(), Error> {
+        self.shared.routes.lock().await.remove(&route);
+        self.request("route", Some("del"), vec![("route", Value::from(route))]).await.map(|_| ())
+    }
+
+    /// The API routes this client holds, as the node sees it.
+    pub async fn own_routes(&self) -> Result<Vec<u8>, Error> {
+        from_value(self.request("route", Some("routes"), Vec::new()).await?)
+    }
+
+    /// Sends `data` on API route `route` to member `node` (key, prefix or name), straight or
+    /// through relays. Like UDP: no answer, delivery not guaranteed; the route must be ours.
+    pub async fn send_net(&self, route: u8, node: &str, data: &[u8]) -> Result<(), Error> {
+        if data.len() > MAX_PAYLOAD {
+            return Err(Error::PacketTooLarge { len: data.len(), max: MAX_PAYLOAD });
+        }
+        let m = map(vec![
+            ("type", "net".into()),
+            ("rou", route.into()),
+            ("key", node.into()),
+            ("pack", Value::Binary(data.to_vec())),
+        ]);
+        self.shared.sock.send(&encode(&m)).await.map_err(Error::from)
+    }
+
+    /// Packets members send to the routes this client holds.
+    pub fn net_packets(&self) -> broadcast::Receiver<NetPacket> {
+        self.shared.net.subscribe()
     }
 
     /// Any request: `{"type": kind, "req": req, ...fields}`; its `res`, or the node's error.
@@ -420,10 +469,25 @@ async fn recv_loop(shared: Arc<Shared>) {
             Some("init") => {
                 if let Some(tx) = shared.init.lock().await.take() {
                     let _ = tx.send(Ok(v));
-                } else if let Some(sub) = shared.sub.lock().await.clone() {
-                    // introduced ourselves again: the node forgot our subscription too
-                    let _ = shared.sock.send(&sub).await;
+                } else {
+                    // introduced ourselves again: the node forgot our subscription and routes too
+                    if let Some(sub) = shared.sub.lock().await.clone() {
+                        let _ = shared.sock.send(&sub).await;
+                    }
+                    let again: Vec<Vec<u8>> = shared.routes.lock().await.values().cloned().collect();
+                    for m in again {
+                        let _ = shared.sock.send(&m).await;
+                    }
                 }
+            }
+            Some("net") => {
+                let route = field(&v, "rou").and_then(Value::as_u64).and_then(|r| u8::try_from(r).ok());
+                let key = field_str(&v, "key").map(str::to_owned);
+                let data = field(&v, "pack").and_then(|p| p.as_slice()).map(<[u8]>::to_vec);
+                if let (Some(route), Some(key), Some(data)) = (route, key, data) {
+                    let _ = shared.net.send(NetPacket { route, key, data });
+                }
+                let _ = shared.events.send(v);
             }
             Some("event") => {
                 if let Some(e) = field(&v, "event") {

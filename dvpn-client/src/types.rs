@@ -553,6 +553,21 @@ pub struct Subscription {
     pub log_level: Option<LogLevel>,
 }
 
+/// API routes a client may take for its own protocol over the network (`route reg`).
+pub const ROUTES: std::ops::RangeInclusive<u8> = 32..=255;
+
+/// The largest packet that goes through relays too (directly: ~1400 bytes).
+pub const MAX_PAYLOAD: usize = 1350;
+
+/// A packet of a client's own protocol, from or to a member, on an API route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetPacket {
+    pub route: u8,
+    /// The member it came from.
+    pub key: String,
+    pub data: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

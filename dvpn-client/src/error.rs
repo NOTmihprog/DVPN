@@ -21,6 +21,11 @@ pub enum Error {
     },
     /// An answer of the wrong shape.
     Protocol(String),
+    /// A packet for an API route larger than [`crate::MAX_PAYLOAD`].
+    PacketTooLarge {
+        len: usize,
+        max: usize,
+    },
 }
 
 impl Error {
@@ -42,6 +47,7 @@ impl fmt::Display for Error {
             Error::VersionUnsupported { msg, .. } => write!(f, "{msg}"),
             Error::Api { code, msg } => write!(f, "{msg} ({code})"),
             Error::Protocol(m) => write!(f, "unexpected answer from the node: {m}"),
+            Error::PacketTooLarge { len, max } => write!(f, "a packet of {len} bytes, at most {max} go through relays"),
         }
     }
 }
