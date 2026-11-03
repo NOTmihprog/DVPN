@@ -61,3 +61,23 @@ jobs:
       # needs unprivileged user namespaces and /dev/net/tun on the runner
       - name: netns e2e
         run: tests/netns-e2e.sh
+
+  # natively on the Windows runner (dvpn-ci-win: MSVC, rustup, Git, Node already there).
+  # cmd, not PowerShell: each step is one command, and cargo's stderr is not an error
+  windows:
+    runs-on: windows
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: rustup update stable --no-self-update
+      - name: clippy
+        run: cargo clippy --all-targets --locked --workspace
+      - name: test
+        run: cargo test --locked --workspace
+      - name: release build
+        run: cargo build --release --locked --bin dvpn
+      - name: runs
+        run: target\release\dvpn.exe --version

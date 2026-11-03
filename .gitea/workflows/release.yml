@@ -1,0 +1,65 @@
+name: release
+
+# A tag vX.Y.Z (with the same version in Cargo.toml) builds the programs and publishes them as
+# the Gitea release of that tag. A tag with a suffix (v4.0.0-rc1) makes a pre-release.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # aarch64: the musl target brings its own libc, gcc only links (and builds ring's C)
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+  CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+  WINTUN: wintun-0.14.1.zip
+  WINTUN_SHA256: 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the previous tag, for the notes
+      - name: tag matches Cargo.toml
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "тег $GITHUB_REF_NAME, а в Cargo.toml $v"; exit 1; }
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-pc-windows-gnu
+      - uses: https://github.com/Swatinem/rust-cache@v2
+      - name: cross tools
+        run: |
+          SUDO=$(command -v sudo || true)
+          $SUDO apt-get update
+          $SUDO apt-get install -y musl-tools gcc-aarch64-linux-gnu gcc-mingw-w64-x86-64 file zip
+      - name: build
+        run: |
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-pc-windows-gnu; do
+            cargo build --release --locked --target $t --bin dvpn
+          done
+      - name: package
+        run: |
+          mkdir dist
+          for a in x86_64:amd64 aarch64:arm64; do
+            B=target/${a%%:*}-unknown-linux-musl/release/dvpn
+            file "$B" | grep -Eq 'statically linked|static-pie linked'
+            cp "$B" dist/dvpn-linux-${a##*:}
+          done
+          dist/dvpn-linux-amd64 --version
+          # Windows: dvpn.exe with wintun.dll next to it, as doc/install.md asks
+          curl -sSfLO "https://www.wintun.net/builds/$WINTUN"
+          echo "$WINTUN_SHA256  $WINTUN" | sha256sum -c
+          unzip -q "$WINTUN"
+          mkdir dvpn-windows-amd64
+          cp target/x86_64-pc-windows-gnu/release/dvpn.exe wintun/bin/amd64/wintun.dll dvpn-windows-amd64/
+          cp wintun/LICENSE.txt dvpn-windows-amd64/wintun-LICENSE.txt
+          cp LICENSE* README.md dvpn-windows-amd64/ 2>/dev/null || true
+          zip -qr dist/dvpn-windows-amd64.zip dvpn-windows-amd64
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+      - name: publish
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .gitea/release.sh

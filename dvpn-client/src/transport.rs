@@ -1,5 +1,6 @@
 //! The datagram socket to the node: UDP, or a unix socket with an address of our own.
 
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::net::UdpSocket;

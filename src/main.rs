@@ -380,6 +380,7 @@ fn api_target(conf: &Config, cli_addr: Option<String>) -> String {
 }
 
 /// The name the API socket is named after: the TUN's, also without a TUN (`-d`, no `[net]`).
+#[cfg(unix)]
 fn tun_name(conf: &Config) -> &str {
     conf.net.as_ref().map_or("dnet", |n| n.tun_name.as_str())
 }

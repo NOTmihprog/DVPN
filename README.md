@@ -98,7 +98,8 @@ DVPN не анонимизирует. Если нужна именно анон�
 | Системные маршруты, kill switch | да | пока вручную | пока вручную |
 | Шлюз `[gateway]`, ACL, split DNS | да (nftables, systemd-resolved) | нет | нет |
 
-Поддержка Windows запланирована вместе с автоматической сборкой релизов.
+Готовые сборки для Linux (x86_64, aarch64) и Windows — на странице [релизов](https://git.mihprog.com/DVPN/DVPN/releases).
+Полная поддержка Windows (маршруты, kill switch, служба) запланирована.
 Android и мобильные клиенты — этап 7 [плана](PLAN.md).
 
 ## Лицензия
