@@ -6,10 +6,12 @@
 # NRPT, the kill switch (routes into the tunnel, the internet blocked, a hole through the
 # physical gateway still open), and that stopping the service leaves nothing behind.
 #
-#   tests\windows-e2e.ps1 -Dvpn target\release\dvpn.exe -Wintun path\to\wintun.dll
+#   tests\windows-e2e.ps1 -Dvpn target\release\dvpn.exe [-Wintun path\to\wintun.dll]
+# Without -Wintun the official wintun-0.14.1 is downloaded (curl.exe: through ALL_PROXY if set)
+# and checked by its sha256.
 param(
     [Parameter(Mandatory)] [string] $Dvpn,
-    [Parameter(Mandatory)] [string] $Wintun,
+    [string] $Wintun,
     # stays reachable while the kill switch is on (a hole): the CI runner's own Gitea
     [string] $Keep = "git.mihprog.com"
 )
@@ -47,6 +49,14 @@ function SetKey([string] $file, [string] $key, [string] $value) {
 try {
     if (Get-Service dvpn -ErrorAction SilentlyContinue) { throw "a dvpn service is installed on this machine already" }
     New-Item -ItemType Directory -Force $a, $b | Out-Null
+    if (-not $Wintun) {
+        $zip = Join-Path $root "wintun.zip"
+        curl.exe -fsSL --max-time 120 -o $zip https://www.wintun.net/builds/wintun-0.14.1.zip
+        $h = (Get-FileHash $zip -Algorithm SHA256).Hash
+        if ($h -ne "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51") { throw "wintun-0.14.1.zip: sha256 $h" }
+        Expand-Archive $zip -DestinationPath $root -Force
+        $Wintun = Join-Path $root "wintun\bin\amd64\wintun.dll"
+    }
     foreach ($d in $a, $b) { Copy-Item $Dvpn "$d\dvpn.exe"; Copy-Item $Wintun "$d\wintun.dll" }
 
     # b: the group and its admin, a subnet behind it
