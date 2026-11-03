@@ -152,7 +152,26 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
-    std::fs::write(path, text)
+    std::fs::write(path, text)?;
+    restrict_private(path)
+}
+
+/// Windows: the file for SYSTEM, Administrators and its owner only, not inherited from its
+/// folder (where `Users` may read): what 0600 is on unix (PLAN 3.14).
+#[cfg(windows)]
+pub fn restrict_private(path: &Path) -> std::io::Result<()> {
+    // SYSTEM, Administrators, OWNER RIGHTS: by SID, the names are translated
+    let ok = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F", "*S-1-3-4:F"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if ok { Ok(()) } else { Err(std::io::Error::other("icacls could not restrict the file")) }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn restrict_private(_: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// A random host address in `net/prefix` (not the network or broadcast address).

@@ -8,6 +8,9 @@ use ed25519_dalek::SigningKey;
 use ipnet::{IpNet, Ipv4Net};
 use log::LevelFilter;
 
+#[cfg(windows)]
+mod winservice;
+
 use dvpn::{config, logger, ops, tracker_server};
 
 use dvpn::config::{Config, GroupConfig, SOCKET_DEFAULT_ADDR, STATE_FILE_NAME, parse_obfs};
@@ -123,6 +126,26 @@ enum Command {
         #[arg(short = 'p', long, default_value_t = 6485)]
         port: u16,
     },
+    /// The node as a Windows service: starts with the system, log in dvpn.log next to config.toml
+    #[cfg(windows)]
+    #[command(subcommand)]
+    Service(ServiceCommand),
+}
+
+#[cfg(windows)]
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Register the service for this directory (--dir) and start it (as Administrator)
+    Install,
+    /// Stop and remove the service
+    Uninstall,
+    Start,
+    Stop,
+    /// Whether the service is installed and running
+    Status,
+    /// What the service manager runs (not by hand)
+    #[command(hide = true)]
+    Run,
 }
 
 #[derive(Subcommand)]
@@ -840,18 +863,29 @@ async fn wait_ctrl_c() {
             _ = term.recv() => log::info!("Terminated, exiting."),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = tokio::signal::ctrl_c().await;
-        log::info!(" Pressed Ctrl+C, exiting.");
+        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_shutdown};
+        let (Ok(mut close), Ok(mut shutdown), Ok(mut brk)) = (ctrl_close(), ctrl_shutdown(), ctrl_break()) else {
+            let _ = tokio::signal::ctrl_c().await;
+            return log::info!(" Pressed Ctrl+C, exiting.");
+        };
+        // closing the console window or the system shutting down: clean up as for Ctrl+C
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => log::info!(" Pressed Ctrl+C, exiting."),
+            _ = brk.recv() => log::info!(" Pressed Ctrl+Break, exiting."),
+            _ = close.recv() => log::info!("Console closed, exiting."),
+            _ = shutdown.recv() => log::info!("System shutting down, exiting."),
+        }
     }
 }
 
-async fn run_node(conf: Config, dir: PathBuf, api_addr: Option<String>) {
+/// Runs the node until `stop` (Ctrl+C, or the Windows service stopping).
+async fn run_node(conf: Config, dir: PathBuf, api_addr: Option<String>, stop: impl std::future::Future<Output = ()>) {
     let api_addr = api_addr.unwrap_or_else(|| api_addr_default(&conf));
     let opts = dvpn::run::Options { api_addr, tun: dvpn::run::Tun::FromConfig, protect: None, on_plan: None };
     let running = dvpn::run::start(conf, &dir, opts).await.unwrap_or_else(|e| die(format!("{e:#}")));
-    wait_ctrl_c().await;
+    stop.await;
     running.shutdown().await;
 }
 
@@ -915,7 +949,7 @@ fn main() {
         None => {
             log::info!("Starting dvpn {VERSION}");
             log::info!("Node key: {}", conf.identity.id());
-            rt.block_on(run_node(conf, dir, cli.api_addr));
+            rt.block_on(run_node(conf, dir, cli.api_addr, wait_ctrl_c()));
         }
         Some(Command::GenKey | Command::ShowKey { key: Some(_) }) => unreachable!(),
         Some(Command::ShowKey { key: None }) => println!("{}", conf.identity.id()),
@@ -1112,5 +1146,66 @@ fn main() {
             }
         }
         Some(Command::Server { addr, port }) => rt.block_on(run_server(&mut conf, addr, port)),
+        #[cfg(windows)]
+        Some(Command::Service(cmd)) => cmd_service(cmd, conf, dir, cli.api_addr, rt),
+    }
+}
+
+#[cfg(windows)]
+fn cmd_service(cmd: ServiceCommand, conf: Config, dir: PathBuf, api_addr: Option<String>, rt: tokio::runtime::Runtime) {
+    use windows_service::service::ServiceState;
+    let fail = |what: &str, e: windows_service::Error| -> ! {
+        die(format!("service {what}: {e} (run it from an Administrator prompt)"))
+    };
+    match cmd {
+        ServiceCommand::Run => {
+            winservice::log_to_file(&dir);
+            log::info!("Starting dvpn {VERSION} as the Windows service");
+            log::info!("Node key: {}", conf.identity.id());
+            let body: winservice::Body = Box::new(move |stop| {
+                rt.block_on(run_node(conf, dir, api_addr, async {
+                    let _ = stop.await;
+                    log::info!("Service stopping");
+                }))
+            });
+            if let Err(e) = winservice::dispatch(body) {
+                die(format!(
+                    "not started by the service manager ({e}): use `dvpn service install`, or run without `service`"
+                ));
+            }
+        }
+        ServiceCommand::Install => {
+            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+            // canonicalize gives \\?\C:\...; the service manager wants the plain path
+            let plain = PathBuf::from(dir.to_string_lossy().trim_start_matches(r"\\?\").to_owned());
+            winservice::install(&plain).unwrap_or_else(|e| fail("install", e));
+            println!(
+                "Service {} installed for {} and started; log: {}",
+                winservice::NAME,
+                plain.display(),
+                plain.join("dvpn.log").display()
+            );
+        }
+        ServiceCommand::Uninstall => {
+            winservice::uninstall().unwrap_or_else(|e| fail("uninstall", e));
+            println!("Service {} stopped and removed", winservice::NAME);
+        }
+        ServiceCommand::Start => match winservice::start() {
+            Ok(true) => println!("Service started"),
+            Ok(false) => println!("Service starting (see dvpn.log)"),
+            Err(e) => fail("start", e),
+        },
+        ServiceCommand::Stop => match winservice::stop() {
+            Ok(true) => println!("Service stopped"),
+            Ok(false) => println!("Service stopping"),
+            Err(e) => fail("stop", e),
+        },
+        ServiceCommand::Status => match winservice::state() {
+            Ok(None) => println!("Service not installed"),
+            Ok(Some(ServiceState::Running)) => println!("Service running"),
+            Ok(Some(ServiceState::Stopped)) => println!("Service stopped"),
+            Ok(Some(s)) => println!("Service {s:?}"),
+            Err(e) => fail("status", e),
+        },
     }
 }

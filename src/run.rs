@@ -91,6 +91,11 @@ pub async fn start(mut conf: Config, dir: &Path, opts: Options) -> anyhow::Resul
     if conf.too_open() {
         log::warn!("{} is readable by other users, but holds secrets: chmod 600 it", conf.path().display());
     }
+    // a file from before (or copied in): narrowed as every save does
+    #[cfg(windows)]
+    if let Err(e) = crate::config::restrict_private(conf.path()) {
+        log::warn!("{}: {e}; it holds secrets: allow only Administrators and SYSTEM", conf.path().display());
+    }
     if !crate::clock::trusted() {
         log::warn!("The clock is earlier than this build: certificate expiry is not checked until it is set (NTP)");
     }
