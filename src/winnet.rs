@@ -191,3 +191,67 @@ pub fn pin_socket_v4(sock: SOCKET, v4_index: u32) -> io::Result<()> {
     let r = unsafe { setsockopt(sock, IPPROTO_IP, IP_UNICAST_IF, (&v4_index.to_be() as *const u32).cast(), 4) };
     if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A route of ours on the loopback interface, in a benchmarking prefix (198.18.0.0/15): it
+    /// leads nowhere and touches no real traffic.
+    fn test_route() -> Route {
+        Route { net: "198.18.77.0/24".parse().unwrap(), if_index: 1, next_hop: None, metric: TAG_METRIC }
+    }
+
+    fn present(r: &Route) -> bool {
+        routes(false).unwrap().iter().any(|(x, _)| x.net == r.net && x.if_index == r.if_index && x.metric == r.metric)
+    }
+
+    /// Changing routes needs an Administrator (the CI runner is one); elsewhere these skip.
+    fn admin() -> bool {
+        match add_route(&test_route()) {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(5) => {
+                eprintln!("not an Administrator: route tests skipped");
+                false
+            }
+            Err(e) => panic!("add_route: {e}"),
+        }
+    }
+
+    #[test]
+    fn routes_added_found_removed() {
+        if !admin() {
+            return;
+        }
+        let r = test_route();
+        assert!(present(&r), "added");
+        add_route(&r).expect("adding again is fine");
+        del_route(&r).unwrap();
+        assert!(!present(&r), "removed");
+        del_route(&r).expect("removing again is fine");
+        // a crashed run's routes are found by their metric
+        add_route(&r).unwrap();
+        remove_tagged();
+        assert!(!present(&r), "removed by its metric");
+    }
+
+    #[test]
+    fn default_route_and_pinning() {
+        // the machine's own default route, never one on the excluded interface
+        if let Some((i, _)) = default_route(false, 0) {
+            assert_ne!(default_route(false, i).map(|d| d.0), Some(i));
+        }
+        // pinned to the physical interface, as while the overlay takes the default route
+        // (loopback is no interface to pin to: Windows refuses it)
+        let phys = default_route(false, 0).map_or(0, |d| d.0);
+        // dual-stack as the node's own (std's sockets on [::] are IPv6 only on Windows)
+        let dual = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None).unwrap();
+        dual.set_only_v6(false).unwrap();
+        dual.bind(&"[::]:0".parse::<std::net::SocketAddr>().unwrap().into()).unwrap();
+        let v4 = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        use std::os::windows::io::AsRawSocket;
+        pin_socket(dual.as_raw_socket() as SOCKET, phys, 0, true).expect("dual-stack socket pinned");
+        pin_socket(dual.as_raw_socket() as SOCKET, 0, 0, true).expect("and freed");
+        pin_socket_v4(v4.as_raw_socket() as SOCKET, phys).expect("IPv4 socket pinned");
+    }
+}
