@@ -70,6 +70,8 @@ impl std::fmt::Display for ApiAddr {
         match self {
             ApiAddr::Inet(a) => write!(f, "{a}"),
             #[cfg(unix)]
+            // an abstract name as `ss` shows it
+            ApiAddr::Unix(p) if is_abstract(p) => write!(f, "@{}", p.display().to_string().trim_start_matches('\0')),
             ApiAddr::Unix(p) => write!(f, "{}", p.display()),
         }
     }
@@ -79,6 +81,30 @@ pub enum ApiSocket {
     Inet(UdpSocket),
     #[cfg(unix)]
     Unix(UnixDatagram, PathBuf),
+}
+
+/// A unix client's address: a socket file, or on Linux an abstract name, kept as a path with a
+/// leading NUL (how socket2 takes it). Clients use abstract names so that a node in a systemd
+/// sandbox (`PrivateTmp`, `ProtectHome`) can answer them; unnamed ones cannot be answered.
+#[cfg(unix)]
+fn unix_client(a: &tokio::net::unix::SocketAddr) -> Option<ApiAddr> {
+    if let Some(p) = a.as_pathname() {
+        return Some(ApiAddr::Unix(p.to_owned()));
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(name) = a.as_abstract_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut b = vec![0u8];
+        b.extend_from_slice(name);
+        return Some(ApiAddr::Unix(PathBuf::from(std::ffi::OsStr::from_bytes(&b))));
+    }
+    None
+}
+
+#[cfg(unix)]
+fn is_abstract(p: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    p.as_os_str().as_bytes().first() == Some(&0)
 }
 
 impl ApiSocket {
@@ -116,9 +142,7 @@ impl ApiSocket {
         match self {
             ApiSocket::Inet(s) => s.recv_from(buf).await.map(|(n, a)| (n, Some(ApiAddr::Inet(a)))),
             #[cfg(unix)]
-            ApiSocket::Unix(s, _) => {
-                s.recv_from(buf).await.map(|(n, a)| (n, a.as_pathname().map(|p| ApiAddr::Unix(p.to_owned()))))
-            }
+            ApiSocket::Unix(s, _) => s.recv_from(buf).await.map(|(n, a)| (n, unix_client(&a))),
         }
     }
 
@@ -143,6 +167,17 @@ impl ApiSocket {
         }
         let r = match (self, to) {
             (ApiSocket::Inet(s), ApiAddr::Inet(a)) => s.send_to(&data, a).await,
+            #[cfg(unix)]
+            (ApiSocket::Unix(s, _), ApiAddr::Unix(p)) if is_abstract(p) => {
+                // tokio sends to paths only: socket2 takes the abstract name (a leading NUL)
+                match socket2::SockAddr::unix(p) {
+                    Ok(addr) => {
+                        s.async_io(tokio::io::Interest::WRITABLE, || socket2::SockRef::from(s).send_to(&data, &addr))
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             #[cfg(unix)]
             (ApiSocket::Unix(s, _), ApiAddr::Unix(p)) => s.send_to(&data, p).await,
             #[cfg(unix)]

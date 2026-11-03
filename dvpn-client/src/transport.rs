@@ -1,4 +1,9 @@
 //! The datagram socket to the node: UDP, or a unix socket with an address of our own.
+//!
+//! On Linux that address is first an abstract one (no file): a node run by systemd with
+//! `PrivateTmp` / `ProtectHome` does not see `/tmp` or `/run/user`, where a file would be, and
+//! could not answer. The socket is connected to the node's, so only the node can send to it.
+//! A node older than 4.3 does not answer an abstract address: then a file, as before.
 
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,12 +20,15 @@ pub enum Socket {
     Unix {
         sock: UnixDatagram,
         node: std::path::PathBuf,
-        me: std::path::PathBuf,
+        /// The file to remove when done (none for an abstract address).
+        me: Option<std::path::PathBuf>,
     },
 }
 
 impl Socket {
-    pub async fn open(addr: &ApiAddr) -> std::io::Result<Socket> {
+    /// `abstract_addr`: a unix socket's own address in the abstract namespace (Linux only;
+    /// elsewhere a file anyway).
+    pub async fn open(addr: &ApiAddr, abstract_addr: bool) -> std::io::Result<Socket> {
         match addr {
             ApiAddr::Udp(a) => {
                 let local: std::net::SocketAddr =
@@ -33,12 +41,27 @@ impl Socket {
             ApiAddr::Unix(node) => {
                 // a datagram client needs an address of its own for the answers
                 static N: AtomicU32 = AtomicU32::new(0);
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if abstract_addr {
+                    #[cfg(target_os = "android")]
+                    use std::os::android::net::SocketAddrExt;
+                    #[cfg(target_os = "linux")]
+                    use std::os::linux::net::SocketAddrExt;
+                    let name = format!("dvpn-client-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+                    let me = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
+                    let s = std::os::unix::net::UnixDatagram::bind_addr(&me)?;
+                    // connected: datagrams from anybody but the node are refused by the kernel
+                    s.connect(node)?;
+                    s.set_nonblocking(true)?;
+                    return Ok(Socket::Unix { sock: UnixDatagram::from_std(s)?, node: node.clone(), me: None });
+                }
+                let _ = abstract_addr;
                 let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, Into::into);
                 let me =
                     dir.join(format!("dvpn-client-{}-{}.sock", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
                 let _ = std::fs::remove_file(&me);
                 let sock = UnixDatagram::bind(&me)?;
-                Ok(Socket::Unix { sock, node: node.clone(), me })
+                Ok(Socket::Unix { sock, node: node.clone(), me: Some(me) })
             }
             #[cfg(not(unix))]
             ApiAddr::Unix(p) => Err(std::io::Error::new(
@@ -77,7 +100,7 @@ impl Socket {
 impl Drop for Socket {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Socket::Unix { me, .. } = self {
+        if let Socket::Unix { me: Some(me), .. } = self {
             let _ = std::fs::remove_file(me);
         }
     }

@@ -138,7 +138,8 @@ KillSignal=SIGTERM
 TimeoutStopSec=10
 Restart=on-failure
 RestartSec=5
-# немного изоляции, совместимой с работой узла
+# немного изоляции, совместимой с работой узла (клиенты API с 4.3 отвечают на абстрактный
+# адрес, который PrivateTmp и ProtectHome не прячут)
 NoNewPrivileges=yes
 ProtectHome=yes
 PrivateTmp=yes
@@ -146,6 +147,10 @@ PrivateTmp=yes
 [Install]
 WantedBy=multi-user.target
 ```
+
+> `dvpn status` версии 4.2 и раньше с узлом под этим юнитом пишет «no answer from the node's API»: свой
+> сокет для ответов он кладёт в `/tmp` или `/run/user`, которых узел не видит. Обновите `dvpn` или запустите
+> `XDG_RUNTIME_DIR=/run/dvpn dvpn status` (от root).
 
 ```shell
 sudo systemctl daemon-reload

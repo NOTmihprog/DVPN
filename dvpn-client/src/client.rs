@@ -58,8 +58,20 @@ impl Client {
     /// Connects to the node at `addr` as `name` (shown in the node's log). For a UDP API it
     /// finds the token itself ([`ApiAddr::find_token`]); without it only reading works.
     pub async fn connect(addr: ApiAddr, name: &str) -> Result<Client, Error> {
+        // a unix socket: an abstract address first (Linux; see transport.rs), which a node
+        // older than 4.3 leaves unanswered: then a file
+        if cfg!(any(target_os = "linux", target_os = "android")) && matches!(addr, ApiAddr::Unix(_)) {
+            match Self::connect_on(&addr, name, true, Duration::from_millis(1500)).await {
+                Err(Error::Timeout) => {}
+                r => return r,
+            }
+        }
+        Self::connect_on(&addr, name, false, DEFAULT_TIMEOUT).await
+    }
+
+    async fn connect_on(addr: &ApiAddr, name: &str, abstract_addr: bool, wait: Duration) -> Result<Client, Error> {
         let token = addr.find_token();
-        let sock = Socket::open(&addr).await?;
+        let sock = Socket::open(addr, abstract_addr).await?;
         let (events, _) = broadcast::channel(256);
         let (typed, _) = broadcast::channel(256);
         let (net, _) = broadcast::channel(1024);
@@ -78,7 +90,7 @@ impl Client {
         let (tx, rx) = oneshot::channel();
         *shared.init.lock().await = Some(tx);
         shared.sock.send(&shared.init_msg()).await?;
-        let answer = match tokio::time::timeout(DEFAULT_TIMEOUT, rx).await {
+        let answer = match tokio::time::timeout(wait, rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(Error::Closed),
             Err(_) => Err(Error::Timeout),
