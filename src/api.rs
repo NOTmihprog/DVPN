@@ -2165,7 +2165,16 @@ mod tests {
         };
         let node = Node::new(storage, transport, (links, e2e), Vec::new(), None, cert.body.ipv4(), ctx);
         let sock = ApiSocket::bind("127.0.0.1:0").await.unwrap();
-        (Api { node, sock, state: Mutex::new(State::default()), access: access::Access::Open, tasks: Tasks::default() }, secret)
+        (
+            Api {
+                node,
+                sock,
+                state: Mutex::new(State::default()),
+                access: access::Access::Open,
+                tasks: Tasks::default(),
+            },
+            secret,
+        )
     }
 
     /// A config of its own for each test node, with its key and group (an invite takes the
