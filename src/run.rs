@@ -39,12 +39,14 @@ pub struct Options {
 /// A started node.
 pub struct Running {
     pub node: Arc<Node>,
-    _api: Arc<crate::api::Api>,
+    api: Arc<crate::api::Api>,
 }
 
 impl Running {
-    /// Undoes what the node changed in the system and says goodbye to the trackers.
+    /// Stops the node's tasks, undoes what it changed in the system and says goodbye to the
+    /// trackers. Nothing of it runs afterwards: the same node can start again in this process.
     pub async fn shutdown(self) {
+        self.api.stop().await;
         self.node.set_tun(None);
         self.node.shutdown().await;
     }
@@ -254,5 +256,5 @@ pub async fn start(mut conf: Config, dir: &Path, opts: Options) -> anyhow::Resul
     }
     node.start();
     let api = crate::api::Api::start(node.clone(), api_sock, conf.api_token_all);
-    Ok(Running { node, _api: api })
+    Ok(Running { node, api })
 }

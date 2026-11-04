@@ -123,6 +123,26 @@ pub fn tun_dns_addr(group: &GroupId) -> std::net::Ipv6Addr {
 /// A packet for an API client: (route, from peer, payload).
 pub type ApiPacket = (u8, NodeId, Vec<u8>);
 
+/// Background tasks that must end with their owner. A process that exits after `shutdown` would
+/// not notice them, but an app keeps running and starts the node again: a task left behind keeps
+/// the whole node alive, its socket and its sessions, under the same key as the new one.
+#[derive(Default)]
+pub struct Tasks(parking_lot::Mutex<tokio::task::JoinSet<()>>);
+
+impl Tasks {
+    pub fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let mut set = self.0.lock();
+        while set.try_join_next().is_some() {}
+        set.spawn(task);
+    }
+
+    /// Aborts the tasks and waits for them: what they hold is released on return.
+    pub async fn stop(&self) {
+        let mut set = std::mem::take(&mut *self.0.lock());
+        set.shutdown().await;
+    }
+}
+
 pub struct Node {
     pub storage: Arc<PeerStorage>,
     pub transport: Arc<Transport>,
@@ -140,6 +160,7 @@ pub struct Node {
     /// Told by `set_tun`: the one TUN loop moves to the new device (or waits for one).
     tun_changed: tokio::sync::Notify,
     started: std::sync::atomic::AtomicBool,
+    tasks: Tasks,
     plan_listener: OnceLock<PlanListener>,
     /// Answer DNS queries to `tun_dns_addr` that arrive in the TUN (no TUN of our own to serve
     /// DNS on), forwarding other names to these servers when no gateway's DNS is in use.
@@ -231,6 +252,7 @@ impl Node {
             flows: Default::default(),
             tun_changed: tokio::sync::Notify::new(),
             started: std::sync::atomic::AtomicBool::new(false),
+            tasks: Tasks::default(),
             plan_listener: OnceLock::new(),
             tun_dns,
             power_save: std::sync::atomic::AtomicBool::new(false),
@@ -712,23 +734,23 @@ impl Node {
         self.update_psks();
         {
             let me = self.clone();
-            tokio::spawn(async move {
+            self.tasks.spawn(async move {
                 // an admin renews its own certificate too
                 let own = me.cert.read().clone();
                 me.member_seen(&own).await;
             });
         }
-        tokio::spawn(self.clone().udp_loop());
-        tokio::spawn(self.clone().link_loop());
-        tokio::spawn(self.clone().tracker_loop());
+        self.tasks.spawn(self.clone().udp_loop());
+        self.tasks.spawn(self.clone().link_loop());
+        self.tasks.spawn(self.clone().tracker_loop());
         // one TUN loop for the node's life: it follows `set_tun`, so a device handed in at any
         // moment (even while starting) gets exactly one reader
-        tokio::spawn(self.clone().tun_loop());
+        self.tasks.spawn(self.clone().tun_loop());
         if !self.group.statics.is_empty() {
-            tokio::spawn(self.clone().static_loop());
+            self.tasks.spawn(self.clone().static_loop());
         }
         #[cfg(windows)]
-        tokio::spawn(self.clone().underlay_loop());
+        self.tasks.spawn(self.clone().underlay_loop());
     }
 
     /// Windows: follows the physical network (another Wi-Fi, a cable plugged in): the holes in
@@ -1704,7 +1726,7 @@ impl Node {
         // the gateway's DNS is reached through the tunnel; the system's past it (protected)
         let protect = if system { self.transport.protector().cloned() } else { None };
         let (me, query) = (self.clone(), query.to_vec());
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             if let Some(r) = crate::dns::forward_once(&query, &upstream, protect.as_ref()).await
                 && let (Some(p), Some(tun)) = (packet::udp_packet(dst, src, 53, sport, &r, 64), me.tun.load_full())
             {
@@ -1824,7 +1846,10 @@ impl Node {
         }
     }
 
+    /// Stops the node's tasks first: a running loop would put back what is undone here, or greet
+    /// the trackers again after the goodbye.
     pub async fn shutdown(&self) {
+        self.tasks.stop().await;
         tokio::task::block_in_place(|| self.system.lock().clear());
         for c in &self.clients {
             if let Some(p) = c.close() {

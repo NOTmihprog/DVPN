@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use crate::crypto::encode_b64;
 use crate::identity::NodeId;
 use crate::logger::node;
-use crate::node::{ApiPacket, Node};
+use crate::node::{ApiPacket, Node, Tasks};
 use crate::proto::{KIND_API_MAX, KIND_API_MIN, MAX_DATAGRAM};
 use crate::storage::{Event, PeerRecord, PeerUpdate, ResolveError};
 
@@ -817,6 +817,7 @@ pub struct Api {
     sock: ApiSocket,
     state: Mutex<State>,
     access: access::Access,
+    tasks: Tasks,
 }
 
 /// The answer to request `id`: `res`, or `err` (code) and `msg` when it failed.
@@ -940,17 +941,29 @@ impl Api {
     }
 
     fn start_with(node: Arc<Node>, sock: ApiSocket, access: access::Access) -> Arc<Self> {
-        let api = Arc::new(Api { node: node.clone(), sock, state: Mutex::new(State::default()), access });
+        let api = Arc::new(Api {
+            node: node.clone(),
+            sock,
+            state: Mutex::new(State::default()),
+            access,
+            tasks: Tasks::default(),
+        });
         let (tx, rx) = mpsc::channel(1024);
         node.set_api_sink(tx);
-        tokio::spawn(api.clone().recv_loop());
-        tokio::spawn(api.clone().ping_loop());
-        tokio::spawn(api.clone().event_loop());
-        tokio::spawn(api.clone().watch_loop());
-        tokio::spawn(api.clone().log_loop());
-        tokio::spawn(api.clone().net_loop(rx));
+        api.tasks.spawn(api.clone().recv_loop());
+        api.tasks.spawn(api.clone().ping_loop());
+        api.tasks.spawn(api.clone().event_loop());
+        api.tasks.spawn(api.clone().watch_loop());
+        api.tasks.spawn(api.clone().log_loop());
+        api.tasks.spawn(api.clone().net_loop(rx));
         log::info!("API | Full - started");
         api
+    }
+
+    /// Stops serving. Pings in flight end too: the last reference closes the socket and removes
+    /// its file, which must not happen once the next node has bound the same path.
+    pub async fn stop(&self) {
+        self.tasks.stop().await;
     }
 
     /// Sends event `e` (of `kind`) to the clients that want it.
@@ -1028,7 +1041,7 @@ impl Api {
                 && field(&packet, "req").and_then(Value::as_str) == Some("ping")
                 && self.state.lock().conns.contains_key(&from);
             if is_ping {
-                tokio::spawn(self.clone().ping_req(packet, from));
+                self.tasks.spawn(self.clone().ping_req(packet, from));
                 continue;
             }
             if let Some(reply) = self.handle(&packet, &from).await {
@@ -2087,6 +2100,22 @@ mod tests {
     use crate::state::StateStore;
     use crate::storage::PeerStorage;
 
+    /// An app stops the node and starts it again in the same process: every loop must be gone
+    /// by then, or the old node stays online next to the new one (same key, a socket of its own).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_leaves_nothing_running() {
+        let Api { node, sock, .. } = api(false).await;
+        node.start();
+        let api = Api::start_with(node.clone(), sock, access::Access::Open);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(Arc::strong_count(&node) > 2, "the loops hold the node");
+
+        api.stop().await;
+        node.shutdown().await;
+        drop(api);
+        assert_eq!(Arc::strong_count(&node), 1, "a task still holds the node");
+    }
+
     /// A node with no TUN, no trackers and no peers, and its API (not started: requests go to
     /// `handle` directly).
     async fn api(admin: bool) -> Api {
@@ -2136,7 +2165,7 @@ mod tests {
         };
         let node = Node::new(storage, transport, (links, e2e), Vec::new(), None, cert.body.ipv4(), ctx);
         let sock = ApiSocket::bind("127.0.0.1:0").await.unwrap();
-        (Api { node, sock, state: Mutex::new(State::default()), access: access::Access::Open }, secret)
+        (Api { node, sock, state: Mutex::new(State::default()), access: access::Access::Open, tasks: Tasks::default() }, secret)
     }
 
     /// A config of its own for each test node, with its key and group (an invite takes the
