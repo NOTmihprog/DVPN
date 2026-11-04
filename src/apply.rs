@@ -42,7 +42,11 @@ impl System {
     /// Manage system routes on the TUN (`[net] manage_routes`).
     pub fn manage_routes(&mut self) {
         if self.tun.is_some() {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             let index = self.tun.as_ref().and_then(|t| t.if_index().ok()).unwrap_or(0);
+            // no TUN of ours there (`new`), so never reached
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let index = 0;
             self.routes = Some(crate::sysroute::SysRoutes::new(&self.tun_name, index));
         }
     }
