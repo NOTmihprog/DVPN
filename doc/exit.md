@@ -151,6 +151,14 @@ manage_sysctl = true        # включить пересылку (ip_forward, I
 Проверка на шлюзе: `nft list table inet dvpn_gw`. Если на шлюзе есть свой файрвол, разрешите пересылку из `dnet`
 в WAN и обратно для установленных соединений.
 
+Docker ставит политику `FORWARD` в `DROP`, и `accept` в другой таблице её не отменяет. На шлюзе с Docker разрешите
+пересылку в цепочке `DOCKER-USER` (интерфейсы — свои):
+
+```shell
+iptables -I DOCKER-USER 1 -i dnet -o ens3 -j ACCEPT
+iptables -I DOCKER-USER 2 -i ens3 -o dnet -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+```
+
 ## Публичный IPv6 участнику
 
 Если у шлюза есть IPv6-префикс (например, `/64` на VPS), участнику можно дать **настоящий публичный IPv6** из

@@ -105,6 +105,8 @@ impl Gateway {
         let wan_set = g.wan.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(", ");
         let tun = &g.tun;
         g.remove_table();
+        // Chain names must not be nft keywords: `mss` is a syntax error in nft 1.0.2 (Ubuntu 22.04),
+        // and one error rejects the whole script, NAT included.
         let ok = nft(&format!(
             "table inet {TABLE} {{
     chain post {{
@@ -112,7 +114,7 @@ impl Gateway {
         iifname \"{tun}\" oifname {{ {wan_set} }} meta nfproto ipv4 masquerade
         iifname \"{tun}\" oifname {{ {wan_set} }} ip6 saddr {ula} masquerade
     }}
-    chain mss {{
+    chain clamp {{
         type filter hook forward priority -10;
         oifname \"{tun}\" tcp flags syn tcp option maxseg size set rt mtu
         iifname \"{tun}\" tcp flags syn tcp option maxseg size set rt mtu
