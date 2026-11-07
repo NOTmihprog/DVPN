@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "dvpn"
-version = "4.2.3"
+version = "4.3.0"
 dependencies = [
  "anyhow",
  "arc-swap",
