@@ -336,6 +336,11 @@ impl StateStore {
         }
     }
 
+    /// Forgets a group's records (a tracker, when nobody of the group has been around for long).
+    pub fn remove_group(&self, group: &GroupId) {
+        self.inner.lock().groups.remove(group);
+    }
+
     /// Signs and stores a new record with a timestamp after any earlier one of the same id.
     pub fn add(&self, secret: &GroupSecret, body: Body, deleted: bool) -> Entry {
         let group = secret.id();

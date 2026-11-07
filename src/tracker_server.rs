@@ -2,8 +2,8 @@
 //! records. Sessions are masked like node-to-node sessions (`tunnel.rs`) and found by their
 //! index, not the client's address, so a client whose NAT mapping changed keeps its session.
 
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,12 +17,59 @@ use crate::logger::node as show;
 use crate::noise::{TAG_LEN, Tai64n};
 use crate::obfs::MAX_PAD;
 use crate::proto::{DATA, DATA_HDR, HS_INIT, MAX_ANNOUNCE_CERTS, MAX_CANDIDATES, MAX_DATAGRAM, TrackerMsg};
-use crate::state::{Entry, Membership, StateStore, SyncMsg, record_key};
+use crate::state::{Entry, MAX_GROUP_RECORDS, Membership, StateStore, SyncMsg, record_key};
 use crate::transport::{bind_udp, normalize, wire_addr};
 use crate::tunnel::{self, MAX_SKEW, TrackerKeys};
 
 /// A client that sent nothing for this long is dropped.
 const TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Handshakes per second and burst from one address (an IPv6 /64). Each costs key exchanges, and
+/// anybody who knows the tracker's public key can make one. Room for a NAT full of nodes: they
+/// rekey every two minutes.
+const HS_PER_SOURCE: (f64, f64) = (16.0, 64.0);
+/// The same for all addresses together, against forged sources.
+const HS_TOTAL: (f64, f64) = (2000.0, 4000.0);
+/// Sources kept track of; beyond it new ones count against the total only.
+const MAX_SOURCES: usize = 1 << 16;
+/// New clients that have not announced yet: the oldest of them make room. A forged source never
+/// gets that far, and a real client takes a round trip.
+const MAX_HALF_OPEN: usize = 4096;
+const MAX_CLIENTS: usize = 1 << 16;
+/// How long the records of a group nobody is online in are kept, for members coming back...
+const GROUP_IDLE: Duration = Duration::from_secs(24 * 3600);
+/// ...and how many such groups: creating a group is free, so this is what bounds the memory.
+const MAX_IDLE_GROUPS: usize = 256;
+
+/// A token bucket: `(rate per second, burst)`.
+struct Bucket {
+    tokens: f64,
+    at: Instant,
+}
+
+impl Bucket {
+    fn new(burst: f64, now: Instant) -> Self {
+        Bucket { tokens: burst, at: now }
+    }
+
+    fn take(&mut self, (rate, burst): (f64, f64), now: Instant) -> bool {
+        self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * rate).min(burst);
+        self.at = now;
+        let ok = self.tokens >= 1.0;
+        if ok {
+            self.tokens -= 1.0;
+        }
+        ok
+    }
+}
+
+/// Who a handshake counts against: an address, for IPv6 the /64 a host usually has to itself.
+fn source(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(a) => IpAddr::V6(Ipv6Addr::from(a.to_bits() & !u128::from(u64::MAX))),
+        v4 => v4,
+    }
+}
 
 struct Client {
     /// Where its last authenticated packet came from.
@@ -53,8 +100,15 @@ pub struct Server {
     /// Group records (revocations, issued certificates, psk epochs), replicated from members;
     /// memory only, members push them again after a restart.
     store: StateStore,
-    /// Join key -> the first node that enrolled with it: an invite works for one node only.
-    joins: HashMap<NodeId, NodeId>,
+    /// Join key -> the first node that enrolled with it, by group: an invite works for one node
+    /// only.
+    joins: HashMap<GroupId, HashMap<NodeId, NodeId>>,
+    /// Groups nobody is online in, and since when.
+    idle: HashMap<GroupId, Instant>,
+    hs_total: Bucket,
+    hs_sources: HashMap<IpAddr, Bucket>,
+    /// New clients, oldest first (some may have announced or left since).
+    half_open: VecDeque<NodeId>,
 }
 
 impl Server {
@@ -68,7 +122,24 @@ impl Server {
             groups: HashMap::new(),
             store: StateStore::memory(),
             joins: HashMap::new(),
+            idle: HashMap::new(),
+            hs_total: Bucket::new(HS_TOTAL.1, Instant::now()),
+            hs_sources: HashMap::new(),
+            half_open: VecDeque::new(),
         }
+    }
+
+    /// Whether a handshake from `ip` may be looked at. One source over its limit takes nothing
+    /// from the others.
+    fn handshake_allowed(&mut self, ip: IpAddr, now: Instant) -> bool {
+        let src = source(ip);
+        if self.hs_sources.len() < MAX_SOURCES || self.hs_sources.contains_key(&src) {
+            let bucket = self.hs_sources.entry(src).or_insert_with(|| Bucket::new(HS_PER_SOURCE.1, now));
+            if !bucket.take(HS_PER_SOURCE, now) {
+                return false;
+            }
+        }
+        self.hs_total.take(HS_TOTAL, now)
     }
 
     pub fn id(&self) -> NodeId {
@@ -102,6 +173,7 @@ impl Server {
                 members.remove(&node);
                 if members.is_empty() {
                     self.groups.remove(&g);
+                    self.idle.insert(g, Instant::now());
                 }
             }
         }
@@ -140,6 +212,11 @@ impl Server {
     fn handshake(&mut self, out: &mut Out, packet: &[u8], wire_len: usize, from: SocketAddr) {
         let Some(acc) = tunnel::server_read(&self.identity, packet) else { return };
         let node = acc.node;
+        let new = !self.clients.contains_key(&node);
+        if new && self.clients.len() >= MAX_CLIENTS {
+            log::debug!("Server | full, handshake from {from} ignored");
+            return;
+        }
         // anti-probing: stale or replayed handshakes get no answer at all
         if !tunnel::fresh(acc.timestamp) || self.last_ts.get(&node).is_some_and(|(t, _)| acc.timestamp <= *t) {
             log::debug!("Server | stale or replayed handshake from {from} ignored");
@@ -150,7 +227,6 @@ impl Server {
         let Some((session, reply)) = acc.reply(&self.keys, idx, wire_len) else { return };
         let session = Arc::new(session);
         self.by_idx.insert(idx, (node, session.clone()));
-        let new = !self.clients.contains_key(&node);
         let c = self.clients.entry(node).or_insert_with(|| Client {
             addr: from,
             current: None,
@@ -165,6 +241,13 @@ impl Server {
         }
         if new {
             log::info!("Server | New session from {from} node: {:#}", show(node));
+            self.half_open.push_back(node);
+            while self.half_open.len() > MAX_HALF_OPEN {
+                let Some(old) = self.half_open.pop_front() else { break };
+                if self.clients.get(&old).is_some_and(|c| !c.announced) {
+                    self.drop_client(out, old, false);
+                }
+            }
         }
         out.push((reply, from));
     }
@@ -224,7 +307,12 @@ impl Server {
                 }
                 Ok(()) => {
                     if let Some(jk) = c.join_key() {
-                        let first = *self.joins.entry(jk).or_insert(node);
+                        let joins = self.joins.entry(group).or_default();
+                        if joins.len() >= MAX_GROUP_RECORDS && !joins.contains_key(&jk) {
+                            log::info!("Server | {:#}: too many invites in group {}", show(node), group.short());
+                            continue;
+                        }
+                        let first = *joins.entry(jk).or_insert(node);
                         if first != node {
                             log::info!("Server | {:#}: invite already used by {:#}", show(node), show(first));
                             continue;
@@ -245,6 +333,7 @@ impl Server {
 
         let groups: Vec<GroupId> = self.clients[&node].certs.keys().copied().collect();
         for g in groups {
+            self.idle.remove(&g);
             let members = self.groups.entry(g).or_default();
             if members.insert(node) {
                 log::info!("Server | node {:#} joined group {}", show(node), g.short());
@@ -310,7 +399,9 @@ impl Server {
         let Some(len) = self.keys.obfs.open(&mut p) else { return out };
         let p = &mut p[..len];
         match p[0] {
-            HS_INIT => self.handshake(&mut out, p, packet.len(), from),
+            HS_INIT if self.handshake_allowed(from.ip(), Instant::now()) => {
+                self.handshake(&mut out, p, packet.len(), from);
+            }
             DATA => self.data(&mut out, p, from),
             _ => {}
         }
@@ -338,7 +429,31 @@ impl Server {
             }
         }
         self.last_ts.retain(|_, (_, at)| at.elapsed() < MAX_SKEW * 2);
+        // a bucket left alone this long is full again
+        let refill = Duration::from_secs_f64(HS_PER_SOURCE.1 / HS_PER_SOURCE.0);
+        self.hs_sources.retain(|_, b| b.at.elapsed() < refill);
+        let clients = &self.clients;
+        self.half_open.retain(|n| clients.get(n).is_some_and(|c| !c.announced));
+        self.forget_idle_groups(GROUP_IDLE);
         out
+    }
+
+    /// Forgets the groups idle for longer than `after`, then the longest idle ones over the
+    /// limit. Their members push the records again when they are back.
+    fn forget_idle_groups(&mut self, after: Duration) {
+        let mut gone: Vec<GroupId> = self.idle.iter().filter(|(_, t)| t.elapsed() >= after).map(|(g, _)| *g).collect();
+        let left = self.idle.len() - gone.len();
+        if left > MAX_IDLE_GROUPS {
+            let mut rest: Vec<(GroupId, Instant)> =
+                self.idle.iter().filter(|(g, _)| !gone.contains(g)).map(|(g, t)| (*g, *t)).collect();
+            rest.sort_by_key(|(_, t)| *t);
+            gone.extend(rest.iter().take(left - MAX_IDLE_GROUPS).map(|(g, _)| *g));
+        }
+        for g in gone {
+            self.idle.remove(&g);
+            self.joins.remove(&g);
+            self.store.remove_group(&g);
+        }
     }
 }
 
@@ -460,6 +575,109 @@ mod tests {
 
     fn server() -> Server {
         Server::new(Identity::generate())
+    }
+
+    #[test]
+    fn handshakes_are_limited_per_source() {
+        let mut st = server();
+        let (a, b): (IpAddr, IpAddr) = ("198.51.100.1".parse().unwrap(), "198.51.100.2".parse().unwrap());
+        let t = Instant::now();
+        let burst = HS_PER_SOURCE.1 as usize;
+        assert_eq!((0..burst + 10).filter(|_| st.handshake_allowed(a, t)).count(), burst);
+        assert!(st.handshake_allowed(b, t), "another source is not affected");
+        assert!(st.handshake_allowed(a, t + Duration::from_secs(1)), "it refills");
+        // an address of the same /64, and IPv4 as mapped by a dual-stack socket
+        assert_eq!(source("2001:db8:1:2::1".parse().unwrap()), source("2001:db8:1:2::2".parse().unwrap()));
+        assert_ne!(source("2001:db8:1:2::1".parse().unwrap()), source("2001:db8:1:3::1".parse().unwrap()));
+        assert_eq!(source("::ffff:198.51.100.1".parse().unwrap()), a);
+    }
+
+    #[test]
+    fn handshakes_are_limited_in_total() {
+        let mut st = server();
+        let t = Instant::now();
+        let ip = |i: u32| IpAddr::V4(i.into());
+        let burst = HS_TOTAL.1 as u32;
+        assert_eq!((0..burst + 10).filter(|i| st.handshake_allowed(ip(*i), t)).count(), burst as usize);
+    }
+
+    #[test]
+    fn flood_does_not_reach_the_answer() {
+        let mut st = server();
+        let keys = TrackerKeys::new(st.id());
+        let from: SocketAddr = "198.51.100.9:4000".parse().unwrap();
+        let hello = || client_hello(&keys, &Identity::generate(), rand::random()).unwrap().0.pop().unwrap();
+        assert!(!st.handle(&hello(), from).is_empty());
+        // the source used up its handshakes for the next few seconds
+        st.hs_sources.insert(source(from.ip()), Bucket { tokens: -100.0, at: Instant::now() });
+        assert!(st.handle(&hello(), from).is_empty());
+        assert!(!st.handle(&hello(), "198.51.100.10:4000".parse().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn oldest_half_open_clients_make_room() {
+        let mut st = server();
+        let announced = connect(&mut st, "198.51.100.1:4000");
+        let g = GroupSecret::generate();
+        send(&mut st, &announced, &TrackerMsg::Announce { candidates: vec![], certs: vec![cert(&g, &announced)] });
+        let old = connect(&mut st, "198.51.100.2:4000");
+        // as if a flood had come: the queue is full of others
+        let fill = MAX_HALF_OPEN - st.half_open.len();
+        st.half_open.extend(std::iter::repeat_n(Identity::generate().id(), fill));
+        let new = connect(&mut st, "198.51.100.3:4000");
+        // announced does not count, the next in the queue goes
+        assert!(st.clients.contains_key(&new.id.id()));
+        assert!(st.clients.contains_key(&announced.id.id()));
+        st.half_open.push_back(Identity::generate().id());
+        assert!(st.clients.contains_key(&old.id.id()), "only when its turn comes");
+        let _ = connect(&mut st, "198.51.100.4:4000");
+        assert!(!st.clients.contains_key(&old.id.id()));
+        assert!(st.half_open.len() <= MAX_HALF_OPEN);
+    }
+
+    #[test]
+    fn records_of_idle_groups_are_forgotten() {
+        let mut st = server();
+        let g = GroupSecret::generate();
+        let c = connect(&mut st, "198.51.100.1:4000");
+        let announce = TrackerMsg::Announce { candidates: vec![], certs: vec![cert(&g, &c)] };
+        send(&mut st, &c, &announce);
+        let member = StateStore::memory();
+        member.add(&g, Body::Revoke { key: Identity::generate().id() }, false);
+        let keys: Vec<_> = member.summary(&g.id()).iter().map(|(k, _)| *k).collect();
+        send(&mut st, &c, &TrackerMsg::Sync(SyncMsg::Records { records: member.get(&g.id(), &keys) }));
+        assert_eq!(st.store.summary(&g.id()).len(), 1);
+
+        // kept while somebody is online
+        st.forget_idle_groups(Duration::ZERO);
+        assert_eq!(st.store.summary(&g.id()).len(), 1);
+        // and for a while after the last one left, for members coming back
+        send(&mut st, &c, &TrackerMsg::Close);
+        st.forget_idle_groups(GROUP_IDLE);
+        assert_eq!(st.store.summary(&g.id()).len(), 1);
+        // a member coming back ends the waiting
+        let c = connect_as(&mut st, c.id, "198.51.100.1:4000");
+        send(&mut st, &c, &announce);
+        st.forget_idle_groups(Duration::ZERO);
+        assert_eq!(st.store.summary(&g.id()).len(), 1);
+
+        send(&mut st, &c, &TrackerMsg::Close);
+        st.forget_idle_groups(Duration::ZERO);
+        assert!(st.store.summary(&g.id()).is_empty());
+        assert!(st.idle.is_empty());
+    }
+
+    #[test]
+    fn idle_groups_are_limited() {
+        let mut st = server();
+        let t = Instant::now();
+        let groups: Vec<GroupId> = (0..MAX_IDLE_GROUPS + 3).map(|_| GroupSecret::generate().id()).collect();
+        for (i, g) in groups.iter().enumerate() {
+            st.idle.insert(*g, t + Duration::from_millis(i as u64));
+        }
+        st.forget_idle_groups(GROUP_IDLE);
+        assert_eq!(st.idle.len(), MAX_IDLE_GROUPS);
+        assert!(groups[..3].iter().all(|g| !st.idle.contains_key(g)), "the longest idle go first");
     }
 
     #[test]

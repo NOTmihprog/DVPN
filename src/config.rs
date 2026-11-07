@@ -457,8 +457,11 @@ fn parse_dns(t: &Table) -> anyhow::Result<DnsConfig> {
             }
             "domain" => {
                 d.domain = v.as_str().ok_or_else(|| anyhow!("domain: a string"))?.trim_matches('.').to_lowercase();
-                if d.domain.is_empty() {
-                    bail!("domain is empty");
+                // it also goes into a PowerShell script on Windows (NRPT)
+                let label =
+                    |l: &str| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b));
+                if !d.domain.split('.').all(label) {
+                    bail!("domain: letters, digits, '-' and '_' in labels separated by dots");
                 }
             }
             _ => bail!("unknown key {k}"),
@@ -1044,6 +1047,19 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_domains() {
+        let parse = |d: &str| {
+            let t = format!("domain = {}", toml_edit::Value::from(d));
+            parse_dns(t.parse::<DocumentMut>().unwrap().as_table()).map(|c| c.domain)
+        };
+        assert_eq!(parse("Home.Lan.").unwrap(), "home.lan");
+        assert_eq!(parse("my-net_1").unwrap(), "my-net_1");
+        for bad in ["", ".", "a..b", "x'; Remove-Item y", "a b", "домен"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn masks() {

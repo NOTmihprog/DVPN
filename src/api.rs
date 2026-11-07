@@ -120,11 +120,13 @@ impl ApiSocket {
                 Some(dir) if !dir.as_os_str().is_empty() && dir.is_dir() => {}
                 _ => anyhow::bail!("socket path {addr}: directory does not exist"),
             }
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-            }
-            let sock = UnixDatagram::bind(&path)?;
-            access::secure_socket(&path)?;
+            // it takes its name only with its final permissions: bind obeys the umask
+            let tmp = path.with_extension("new");
+            let _ = std::fs::remove_file(&tmp);
+            let sock = UnixDatagram::bind(&tmp)?;
+            access::secure_socket(&tmp).and_then(|()| std::fs::rename(&tmp, &path)).inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })?;
             Ok(ApiSocket::Unix(sock, path))
         }
         #[cfg(not(unix))]
@@ -2680,6 +2682,20 @@ mod tests {
         let tag = encode_b64(&crate::crypto::random_bytes::<9>());
         let path = std::env::temp_dir().join(format!("dvpn-api-test-{tag}.sock"));
         client_session(path.to_str().unwrap()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_is_private_from_the_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let tag = encode_b64(&crate::crypto::random_bytes::<9>());
+        let path = std::env::temp_dir().join(format!("dvpn-api-test-{tag}.sock"));
+        std::fs::write(&path, "left by a crash").unwrap();
+        let sock = ApiSocket::bind(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!path.with_extension("new").exists());
+        drop(sock);
+        let _ = std::fs::remove_file(&path);
     }
 
     const TEST_TOKEN: &str = "test-token";

@@ -43,7 +43,8 @@ fn question(q: &[u8]) -> Option<(String, u16, usize)> {
         i += 1 + len;
     }
     let ty = u16::from_be_bytes([*q.get(i)?, *q.get(i + 1)?]);
-    Some((labels.join("."), ty, i + 4))
+    let end = i + 4; // the class must be there too: the answer copies the question
+    (end <= q.len()).then(|| (labels.join("."), ty, end))
 }
 
 /// The answer to a query, `None` for what is not a query worth answering.
@@ -381,6 +382,19 @@ mod tests {
 
     fn zone() -> Zone {
         HashMap::from([("phone.dvpn".to_owned(), vec!["10.10.33.40".parse().unwrap(), "fd00::40".parse().unwrap()])])
+    }
+
+    #[test]
+    fn question_without_a_class_is_no_query() {
+        // header, root name, type, and the class cut short
+        let mut q = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let zone = Zone::new();
+        assert!(answer(&q, &zone, "dvpn").is_none());
+        assert!(!in_zone(&q, ""));
+        q.push(0);
+        assert!(answer(&q, &zone, "dvpn").is_none());
+        q.push(1);
+        assert!(answer(&q, &zone, "dvpn").is_some(), "a whole question is answered");
     }
 
     #[test]
