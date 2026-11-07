@@ -914,6 +914,15 @@ impl Config {
         true
     }
 
+    /// Sets `[net] mask` to the group's; returns whether it changed. A node without `[net]` has
+    /// no TUN of ours to apply it to.
+    pub fn set_net_prefix(&mut self, prefix: u8) -> bool {
+        let Some(net) = self.net.as_mut().filter(|n| n.prefix != prefix) else { return false };
+        net.prefix = prefix;
+        self.doc["net"]["mask"] = value(prefix.to_string());
+        true
+    }
+
     /// Adds `[[static_peers]]` for a node unless it is listed already; returns whether it was added.
     pub fn add_static_peer(&mut self, p: &StaticRef) -> bool {
         if p.key == self.identity.id() || self.static_peers.iter().any(|s| s.key == p.key) {

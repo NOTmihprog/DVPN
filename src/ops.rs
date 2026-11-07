@@ -26,12 +26,13 @@ pub struct Joined {
     /// This node's name and IPv4 address in the group, from the certificate.
     pub name: String,
     pub addr: Option<std::net::Ipv4Addr>,
-    /// Trackers and static peers added to the config.
+    /// Trackers, static peers and the network mask added to the config.
     pub added: Vec<String>,
 }
 
 /// Joins the group of `invite` (its base64url text): enrolls this node's key
-/// with the invite's join key, adds the group, its trackers and static peers, and saves.
+/// with the invite's join key, adds the group, its trackers, static peers and network mask, and
+/// saves.
 pub fn join(conf: &mut Config, invite: &str) -> anyhow::Result<Joined> {
     let inv = Invite::decode(invite.trim(), Some(now_unix()))?;
     if conf.groups.iter().any(|g| g.id == inv.group()) {
@@ -53,6 +54,9 @@ pub fn join(conf: &mut Config, invite: &str) -> anyhow::Result<Joined> {
         if conf.add_static_peer(sp) {
             added.push(format!("static {}", sp.endpoints.join(", ")));
         }
+    }
+    if conf.set_net_prefix(inv.net_prefix) {
+        added.push(format!("network mask /{}", inv.net_prefix));
     }
     conf.add_group(GroupConfig {
         name: name.clone(),
@@ -227,7 +231,7 @@ pub fn invite(conf: &Config, g: &GroupConfig, certs: &[Cert], req: &InviteReques
     let until = now_unix() + req.ttl_hours * 3600;
     let join = secret.grant_join(template, until);
     let trackers = conf.servers.iter().map(|s| s.tracker_ref()).collect();
-    let mut inv = Invite::new(&g.name, g.epoch, g.psk, g.obfs_entries.clone(), trackers, join);
+    let mut inv = Invite::new(&g.name, g.epoch, g.psk, g.obfs_entries.clone(), trackers, join, net_prefix(conf));
     if !req.statics.is_empty() {
         inv.statics.push(StaticRef { key: conf.identity.id(), endpoints: req.statics.clone() });
     }
@@ -365,9 +369,21 @@ mod tests {
     fn invite(secret: &GroupSecret, name: &str, until: u64) -> Invite {
         let template = CertBody::new(Identity::generate().id(), "phone", vec!["10.10.33.40/32".parse().unwrap()]);
         let join = secret.grant_join(template, until);
-        let mut inv = Invite::new(name, 0, secret.psk(0), Vec::new(), Vec::new(), join);
+        let mut inv = Invite::new(name, 0, secret.psk(0), Vec::new(), Vec::new(), join, 24);
         inv.statics.push(StaticRef { key: Identity::generate().id(), endpoints: vec!["192.0.2.1:8647".into()] });
         inv
+    }
+
+    #[test]
+    fn join_takes_the_network_mask() {
+        let dir = temp_dir();
+        let mut conf = Config::load(&dir).unwrap();
+        assert_eq!(net_prefix(&conf), 24);
+        let mut inv = invite(&GroupSecret::generate(), "home", now_unix() + 3600);
+        inv.net_prefix = 16;
+        let j = join(&mut conf, &inv.encode()).unwrap();
+        assert!(j.added.contains(&"network mask /16".to_owned()), "{:?}", j.added);
+        assert_eq!(net_prefix(&Config::load(&dir).unwrap()), 16, "saved to disk");
     }
 
     #[test]

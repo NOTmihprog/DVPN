@@ -306,10 +306,11 @@ pub struct StaticRef {
     pub endpoints: Vec<String>,
 }
 
-const INVITE_VERSION: u8 = 2;
+const INVITE_VERSION: u8 = 3;
 
 /// Everything a node needs to join a group (PLAN §5.3), as one base64url string: the group psk
-/// of the current epoch, the obfuscation profile, trackers, and a one-time join key with its grant.
+/// of the current epoch, the obfuscation profile, the network mask, trackers, and a one-time join
+/// key with its grant.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Invite {
     pub version: u8,
@@ -324,6 +325,8 @@ pub struct Invite {
     /// Nodes to connect to directly (the inviting admin's node, if it has a fixed address): a
     /// group can work without any tracker.
     pub statics: Vec<StaticRef>,
+    /// Prefix length of the group network (`[net] mask`), applied by the joining node.
+    pub net_prefix: u8,
 }
 
 impl fmt::Debug for Invite {
@@ -367,8 +370,19 @@ impl Invite {
         obfs: Vec<(String, String)>,
         trackers: Vec<TrackerRef>,
         join: Join,
+        net_prefix: u8,
     ) -> Self {
-        Invite { version: INVITE_VERSION, name: name.to_owned(), epoch, psk, obfs, trackers, join, statics: Vec::new() }
+        Invite {
+            version: INVITE_VERSION,
+            name: name.to_owned(),
+            epoch,
+            psk,
+            obfs,
+            trackers,
+            join,
+            statics: Vec::new(),
+            net_prefix,
+        }
     }
 
     pub fn group(&self) -> GroupId {
@@ -388,6 +402,9 @@ impl Invite {
         let inv: Invite = postcard::from_bytes(&bytes).map_err(|_| InviteError::Encoding)?;
         if inv.version != INVITE_VERSION {
             return Err(InviteError::Version(inv.version));
+        }
+        if inv.net_prefix > 32 {
+            return Err(InviteError::Encoding);
         }
         // the join key must be the granted one, and the grant the group's
         let probe = inv.join.enroll(inv.join.grant.key);
@@ -502,10 +519,11 @@ mod tests {
         let g = GroupSecret::generate();
         let join = g.grant_join(CertBody::new(NodeId::random(), "b", vec![net("10.10.0.7/32")]), now_unix() + 60);
         let tracker = TrackerRef { host: "tracker.example".into(), port: 6485, key: [3; 32] };
-        let inv = Invite::new("home", 0, g.psk(0), vec![("jc".into(), "1-2".into())], vec![tracker.clone()], join);
+        let inv = Invite::new("home", 0, g.psk(0), vec![("jc".into(), "1-2".into())], vec![tracker.clone()], join, 16);
         let text = inv.encode();
         let back = Invite::decode(&text, Some(now_unix())).unwrap();
         assert_eq!((back.group(), back.psk, back.trackers, back.obfs.len()), (g.id(), g.psk(0), vec![tracker], 1));
+        assert_eq!(back.net_prefix, 16);
         let node = Identity::generate().id();
         assert_eq!(back.join.enroll(node).verify(&g.id(), Some(now_unix())), Ok(()));
 
@@ -515,6 +533,10 @@ mod tests {
             text.as_bytes().chunks(40).map(|c| format!("  {}\r\n", std::str::from_utf8(c).unwrap())).collect();
         assert_eq!(Invite::decode(&wrapped, Some(now_unix())).unwrap().encode(), text);
         assert_eq!(Invite::decode("not an invite", None).err(), Some(InviteError::Encoding));
+        // a network mask that cannot be
+        let mut bad = inv.clone();
+        bad.net_prefix = 33;
+        assert_eq!(Invite::decode(&bad.encode(), None).err(), Some(InviteError::Encoding));
         // another join key than the granted one
         let mut bad = inv.clone();
         bad.join.key = random_bytes();
