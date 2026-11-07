@@ -615,7 +615,18 @@ impl Node {
             return;
         }
         let mut changed = Vec::new();
-        let renew = cert.grant.is_some() || cert.body.not_after < now_unix() + RENEW_BEFORE;
+        // a delegate cannot see every member: its invite ends here if the name or address is taken
+        if let Some(jk) = cert.join_key().filter(|_| cert.delegate_key().is_some())
+            && store.cert(&g, &id).is_none()
+            && let Some(taken) = crate::ops::invite_conflict(cert, &self.member_certs(), &Membership::of(store, &g))
+        {
+            log::warn!("Group | {} refused: {taken}", node(id));
+            let changed = [store.add(secret, Body::Revoke { key: jk }, false)];
+            self.apply(&changed);
+            self.spread(&changed).await;
+            return;
+        }
+        let renew = cert.from_invite() || cert.body.not_after < now_unix() + RENEW_BEFORE;
         let issued = store.cert(&g, &id).is_some_and(|c| c.body.not_after > cert.body.not_after);
         if renew && !issued {
             let mut body = cert.body.clone();

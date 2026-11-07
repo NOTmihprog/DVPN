@@ -9,7 +9,7 @@ use rand::RngExt;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::crypto::{decode_b64, decode_key32, encode_b64};
-use crate::group::{Cert, GroupId, GroupSecret, StaticRef, TrackerRef};
+use crate::group::{Cert, Delegate, GroupId, GroupSecret, IssuedDelegation, StaticRef, TrackerRef};
 use crate::identity::Identity;
 use crate::obfs::{MAX_PAD, MAX_WIRE, Profile, Template};
 
@@ -105,6 +105,10 @@ pub struct GroupConfig {
     pub obfs: Profile,
     /// `[groups.obfs]` as written, passed on in invites.
     pub obfs_entries: Vec<(String, String)>,
+    /// This node may invite into a part of the network.
+    pub delegate: Option<Delegate>,
+    /// Admins: the delegates in force.
+    pub delegations: Vec<IssuedDelegation>,
 }
 
 impl GroupConfig {
@@ -596,7 +600,26 @@ fn parse_group(t: &Table) -> anyhow::Result<GroupConfig> {
         None => Vec::new(),
     };
     let obfs = parse_obfs(&obfs_entries).map_err(|e| anyhow!("[groups.obfs] {e:#}"))?;
-    Ok(GroupConfig { name, id, secret, epoch, psk, cert, obfs, obfs_entries })
+    let delegate = match t.get("delegate") {
+        Some(_) => {
+            let d = Delegate::decode(get_str(t, "delegate")?).ok_or_else(|| anyhow!("delegate: not valid"))?;
+            if d.delegation.group != id {
+                bail!("delegate: of another group");
+            }
+            Some(d)
+        }
+        None => None,
+    };
+    let delegations = match t.get("delegations") {
+        Some(item) => item
+            .as_array()
+            .ok_or_else(|| anyhow!("delegations: expected a list"))?
+            .iter()
+            .map(|v| v.as_str().and_then(IssuedDelegation::decode).ok_or_else(|| anyhow!("delegations: not valid")))
+            .collect::<anyhow::Result<_>>()?,
+        None => Vec::new(),
+    };
+    Ok(GroupConfig { name, id, secret, epoch, psk, cert, obfs, obfs_entries, delegate, delegations })
 }
 
 pub fn parse_port_range(s: &str) -> anyhow::Result<(u16, u16)> {
@@ -886,6 +909,30 @@ impl Config {
         true
     }
 
+    /// Makes this node a delegate of the group.
+    pub fn set_group_delegate(&mut self, id: &GroupId, d: &Delegate) -> bool {
+        let Some(i) = self.groups.iter().position(|g| &g.id == id) else { return false };
+        self.groups[i].delegate = Some(d.clone());
+        if let Some(t) = self.doc.get_mut("groups").and_then(Item::as_array_of_tables_mut).and_then(|a| a.get_mut(i)) {
+            t["delegate"] = value(d.encode());
+        }
+        true
+    }
+
+    /// Replaces the list of delegates in force (kept by the admin who made them).
+    pub fn set_group_delegations(&mut self, id: &GroupId, list: Vec<IssuedDelegation>) -> bool {
+        let Some(i) = self.groups.iter().position(|g| &g.id == id) else { return false };
+        if let Some(t) = self.doc.get_mut("groups").and_then(Item::as_array_of_tables_mut).and_then(|a| a.get_mut(i)) {
+            if list.is_empty() {
+                t.remove("delegations");
+            } else {
+                t["delegations"] = value(list.iter().map(IssuedDelegation::encode).collect::<toml_edit::Array>());
+            }
+        }
+        self.groups[i].delegations = list;
+        true
+    }
+
     /// Records the psk epoch now in force (members store its psk; admins derive it).
     pub fn set_group_epoch(&mut self, id: &GroupId, epoch: u32, psk: &[u8; 32]) -> bool {
         let Some(i) = self.groups.iter().position(|g| &g.id == id) else { return false };
@@ -1025,6 +1072,8 @@ mod tests {
             cert: Some(cert),
             obfs: Profile::default(),
             obfs_entries: vec![("jc".into(), "1-2".into())],
+            delegate: None,
+            delegations: Vec::new(),
         }
     }
 

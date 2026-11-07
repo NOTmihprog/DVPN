@@ -1218,7 +1218,7 @@ impl Api {
                 map(vec![
                     ("not_after", cert.body.not_after.into()),
                     ("days", (cert.body.not_after.saturating_sub(crate::clock::now_unix()) / 86400).into()),
-                    ("invite", cert.grant.is_some().into()),
+                    ("invite", cert.from_invite().into()),
                 ]),
             ),
             ("obfs", obfs),
@@ -1261,7 +1261,7 @@ impl Api {
                     ("not_after", b.not_after.into()),
                     ("days", (b.not_after.saturating_sub(now) / 86400).into()),
                     ("expired", (b.not_after < now).into()),
-                    ("invite", c.grant.is_some().into()),
+                    ("invite", c.from_invite().into()),
                     ("revoked", gone.into()),
                     ("self", (id == me).into()),
                     ("online", (id == me || (!gone && n.reachable(&id))).into()),
@@ -1641,7 +1641,6 @@ impl Api {
 
     /// `set invite`: an invite for one new node.
     fn set_invite(&self, p: &Value) -> Reply {
-        self.secret()?;
         let name = field(p, "name").and_then(Value::as_str).ok_or_else(|| bad_param("name", "the new node's name"))?;
         let addr = match field(p, "addr") {
             None => None,
@@ -1675,7 +1674,8 @@ impl Api {
             .iter()
             .find(|g| g.id == self.node.group_id())
             .ok_or_else(|| ApiError::new("config_read", "the group is not in config.toml"))?;
-        let made = crate::ops::invite(&conf, g, &self.node.member_certs(), &req).map_err(op_error)?;
+        let revoked = self.node.group_store().revoked(&g.id);
+        let made = crate::ops::invite(&conf, g, &self.node.member_certs(), &revoked, &req).map_err(op_error)?;
         log::info!("API | invite for {} ({}) made", made.name, made.addr);
         Ok(map(vec![
             ("invite", made.invite.into()),
@@ -2197,6 +2197,8 @@ mod tests {
             cert: Some(cert.clone()),
             obfs: Default::default(),
             obfs_entries: Vec::new(),
+            delegate: None,
+            delegations: Vec::new(),
         });
         conf.save();
         let path = conf.path().to_owned();

@@ -567,17 +567,19 @@ PIDS=""
 [ -z "$(nsx c ip -6 neigh show proxy)" ] || fail "gateway c left NDP proxies behind"
 mkdir s1 s2
 "$D" --dir "$W/s1" show-key >/dev/null 2>&1
-sed -i 's/^bind_port = .*/bind_port = "7000"/' s1/config.toml
+sed -i -e 's/^bind_port = .*/bind_port = "7000"/' -e 's/^mask = .*/mask = "16"/' s1/config.toml
 "$D" --dir "$W/s1" group create solo -a 10.10.44.1 -n s1 >/dev/null || fail "s1: group create"
 inv=$("$D" --dir "$W/s1" group invite -n s2 -a 10.10.44.2 --static 203.0.113.20:7000 2>/dev/null) || fail "s1: invite"
 "$D" --dir "$W/s2" group join "$inv" >/dev/null 2>&1 || fail "s2: join"
 grep -q '^\[\[static_peers\]\]' s2/config.toml || fail "s2: no [[static_peers]] from the invite"
 ! grep -q '^\[servers' s2/config.toml || fail "s2 has a tracker configured"
+grep -q '^mask = "16"' s2/config.toml || fail "s2: no network mask from the invite"
 bg node-s1 c "$D" --dir "$W/s1" -a 127.0.0.1:9902
 bg node-s2 a "$D" --dir "$W/s2" -a 127.0.0.1:9902
 for n in a c; do wait_for 10 nsx $n ip -4 addr show dnet || fail "static: no tun in $n"; done
 reach a s1 10.10.44.1
 reach c s2 10.10.44.2
+nsx a ip -4 addr show dnet | grep -q '10.10.44.2/16' || fail "s2: the TUN did not take the group's mask"
 ok "connected by a static address, without a tracker"
 
 # ---- pure IPv6 ------------------------------------------------------------------------
@@ -726,6 +728,55 @@ before=$(direct)
 nsx ma ping -c5 -i0.2 -W1 10.10.77.3 >/dev/null || fail "ma -> mc after the path opened"
 [ $(( $(direct) - before )) -ge 5 ] || fail "ma -> mc still not direct"
 ok "direct path opened: ma <-> mc go direct"
+
+# A delegate: MC may invite into a part of the network, and nowhere else. Its invite works, and
+# the admin node replaces the new node's certificate as usual. An invite for a name that is taken
+# ends at the admin node. Taking the right back ends unused invites, not the members it brought.
+for n in me mf mg; do
+    ip netns add $n; nsx $n ip link set lo up
+    mkdir $n
+done
+wan_port me 203.0.113.35
+wan_port mf 203.0.113.36
+wan_port mg 203.0.113.37
+"$D" --dir "$W/ma" group delegate add mc --scope 10.10.77.128/25 > delegation 2>/dev/null || fail "ma: delegate add"
+! "$D" --dir "$W/mc" group invite -n x 2>/dev/null || fail "mc invites before it is a delegate"
+"$D" --dir "$W/mc" group delegate accept "$(cat delegation)" >/dev/null || fail "mc: delegate accept"
+"$D" --dir "$W/mc" group list | grep -q 'mesh.*delegate' || fail "mc: group list"
+! "$D" --dir "$W/mc" group invite -n x -a 10.10.77.50 2>/dev/null || fail "mc invites outside its scope"
+! "$D" --dir "$W/mc" group invite -n x --relay 2>/dev/null || fail "mc gives the relay role"
+"$D" --dir "$W/ma" group delegate list | grep -q '^| mc ' || fail "ma: delegate list"
+delegate_join() { # delegate_join NODE NAME ADDR: an invite from MC, used by NODE
+    inv=$("$D" --dir "$W/mc" group invite -n "$2" -a "$3" 2>/dev/null) || fail "mc: invite for $2"
+    "$D" --dir "$W/$1" group join "$inv" >/dev/null 2>&1 || fail "$1: join"
+}
+delegate_join me me 10.10.77.130
+bg node-me me "$D" --dir "$W/me" -a 127.0.0.1:9902
+reach me ma 10.10.77.1
+reach ma me 10.10.77.130
+wait_for 30 renewed me || fail "me still has its invite certificate"
+ok "a delegate invites inside its scope only, the admin node takes over the new node"
+
+delegate_join mg mb 10.10.77.131
+bg node-mg mg "$D" --dir "$W/mg" -a 127.0.0.1:9902
+MG=$!
+wait_for 30 sh -c "sed 's/\x1b\[[0-9;]*m//g' '$W/node-ma.log' | grep -q 'refused: name mb is taken'" \
+    || fail "ma did not refuse a taken name"
+wait_for 30 grep -q 'revoked in group' tracker6.log || fail "the tracker still takes the refused node"
+kill "$MG"
+ok "a name that is taken ends the invite of a delegate"
+
+delegate_join mf mf 10.10.77.132
+"$D" --dir "$W/ma" group delegate remove mc >/dev/null || fail "ma: delegate remove"
+wait_for 20 sh -c "! '$D' --dir '$W/mc' group invite -n x 2>/dev/null" || fail "mc still invites after it was removed"
+: > tracker6.log
+bg node-mf mf "$D" --dir "$W/mf" -a 127.0.0.1:9902
+MF=$!
+wait_for 30 grep -q 'revoked in group' tracker6.log || fail "the tracker takes an invite of a removed delegate"
+! nsx mf ping -c2 -W1 10.10.77.1 >/dev/null 2>&1 || fail "an unused invite of a removed delegate still works"
+kill "$MF"
+reach me ma 10.10.77.1
+ok "a removed delegate: unused invites stop working, its members stay"
 
 # Without a tracker: it goes away, the admin changes a member, the record still reaches
 # everybody through the neighbours (STATE between link sessions)

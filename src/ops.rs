@@ -5,17 +5,20 @@
 //! The admin operations only add records to a `StateStore` and return them: the CLI saves the
 //! store (a running node picks the file up), a running node applies and spreads them at once.
 
+use std::collections::HashSet;
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::bail;
 use ipnet::{IpNet, Ipv4Net};
 
 use crate::config::{Config, GroupConfig, parse_obfs};
 use crate::crypto::random_bytes;
-use crate::group::{CERT_TTL_SECS, Cert, CertBody, GroupId, GroupSecret, Invite, Roles, StaticRef, now_unix};
+use crate::group::{
+    CERT_TTL_SECS, Cert, CertBody, Delegate, GroupId, GroupSecret, Invite, IssuedDelegation, Roles, StaticRef, now_unix,
+};
 use crate::identity::NodeId;
-use crate::state::{Body, Entry, StateStore};
+use crate::state::{Body, Entry, Membership, StateStore};
 
 /// What joining gave.
 #[derive(Clone, Debug)]
@@ -67,6 +70,8 @@ pub fn join(conf: &mut Config, invite: &str) -> anyhow::Result<Joined> {
         cert: Some(cert),
         obfs,
         obfs_entries: inv.obfs.clone(),
+        delegate: None,
+        delegations: Vec::new(),
     });
     conf.save();
     Ok(Joined { group: name, id: inv.group(), name: body.name.clone(), addr: body.ipv4(), added })
@@ -150,14 +155,14 @@ pub fn net_prefix(conf: &Config) -> u8 {
     conf.net.as_ref().map_or(24, |n| n.prefix)
 }
 
-/// A random host of `net` that is none of `taken`.
-pub fn free_host(net: Ipv4Net, taken: &[Ipv4Addr]) -> Ipv4Addr {
-    loop {
-        let a = crate::config::random_host(net.network(), net.prefix_len());
-        if !taken.contains(&a) {
-            return a;
-        }
-    }
+/// A random host of `net` that is none of `taken` and in none of `avoid`, if there is one left.
+pub fn free_host(net: Ipv4Net, taken: &[Ipv4Addr], avoid: &[IpNet]) -> Option<Ipv4Addr> {
+    let free = |a: &Ipv4Addr| !taken.contains(a) && !avoid.iter().any(|n| n.contains(&IpAddr::V4(*a)));
+    let tries = if net.prefix_len() < 31 { 64 } else { 0 };
+    (0..tries)
+        .map(|_| crate::config::random_host(net.network(), net.prefix_len()))
+        .find(&free)
+        .or_else(|| net.hosts().find(&free))
 }
 
 /// The certificate prefixes: the node's address first, then the subnets behind it.
@@ -165,6 +170,10 @@ pub fn host_net(addr: Ipv4Addr, routes: &[IpNet]) -> Vec<IpNet> {
     let mut v = vec![IpNet::V4(Ipv4Net::new(addr, 32).expect("/32 is valid"))];
     v.extend(routes.iter().map(IpNet::trunc));
     v
+}
+
+fn no_free_addr() -> OpError {
+    OpError::new("no_free_addr", "no free address left")
 }
 
 /// What an invite is for.
@@ -195,10 +204,39 @@ pub struct InviteMade {
     pub warnings: Vec<String>,
 }
 
-/// An invite for one new node to group `g` (needs its secret). `certs`: the members known, so
-/// that a free address is picked. Adds no records: the invite carries a one-time join key.
-pub fn invite(conf: &Config, g: &GroupConfig, certs: &[Cert], req: &InviteRequest) -> Result<InviteMade, OpError> {
-    let secret = admin_secret(g)?;
+/// Who signs an invite: an admin anywhere in the network, a delegate inside its scope.
+enum Inviter<'a> {
+    Admin(&'a GroupSecret),
+    Delegate(&'a Delegate),
+}
+
+fn inviter<'a>(g: &'a GroupConfig, revoked: &HashSet<NodeId>) -> Result<Inviter<'a>, OpError> {
+    let Some(d) = g.secret.is_none().then_some(g.delegate.as_ref()).flatten() else {
+        return admin_secret(g).map(Inviter::Admin);
+    };
+    if revoked.contains(&d.delegation.key) {
+        return Err(OpError::new("delegate_ended", "this node's right to invite was taken back"));
+    }
+    if now_unix() >= d.delegation.until {
+        return Err(OpError::new(
+            "delegate_ended",
+            "this node's right to invite has expired: ask an admin for a new one",
+        ));
+    }
+    Ok(Inviter::Delegate(d))
+}
+
+/// An invite for one new node to group `g` (needs its secret, or a delegation that allows it).
+/// `certs`: the members known, so that a free address is picked. `revoked`: the group's revoked
+/// keys. Adds no records: the invite carries a one-time join key.
+pub fn invite(
+    conf: &Config,
+    g: &GroupConfig,
+    certs: &[Cert],
+    revoked: &HashSet<NodeId>,
+    req: &InviteRequest,
+) -> Result<InviteMade, OpError> {
+    let inviter = inviter(g, revoked)?;
     check_clock()?;
     if req.name.trim().is_empty() {
         return Err(OpError::new("bad_param", "name: the new node needs a name"));
@@ -206,14 +244,41 @@ pub fn invite(conf: &Config, g: &GroupConfig, certs: &[Cert], req: &InviteReques
     let own = g.ipv4().ok_or_else(|| OpError::new("no_address", "this node has no address in the group"))?;
     let net = Ipv4Net::new(own, net_prefix(conf)).map_err(|e| OpError::new("bad_param", e.to_string()))?.trunc();
     let taken: Vec<Ipv4Addr> = certs.iter().filter_map(|c| c.body.ipv4()).chain([own]).collect();
-    let addr = match req.addr {
-        Some(a) if taken.contains(&a) => return Err(OpError::new("addr_taken", format!("{a} is taken by a member"))),
-        Some(a) if !net.contains(&a) => {
+    let addr = match (req.addr, &inviter) {
+        (Some(a), _) if taken.contains(&a) => {
+            return Err(OpError::new("addr_taken", format!("{a} is taken by a member")));
+        }
+        (Some(a), Inviter::Admin(_)) if !net.contains(&a) => {
             return Err(OpError::new("addr_invalid", format!("{a} is outside the group network {net}")));
         }
-        Some(a) => a,
-        None => free_host(net, &taken),
+        (Some(a), Inviter::Delegate(d)) if !d.delegation.covers(&IpNet::V4(Ipv4Net::from(a))) => {
+            return Err(OpError::new("addr_invalid", format!("{a} is outside this node's scope")));
+        }
+        (Some(a), _) => a,
+        (None, Inviter::Admin(_)) => {
+            // the delegates' subnets are theirs to give out
+            let avoid: Vec<IpNet> = g.delegations.iter().flat_map(|d| d.delegation.scope.clone()).collect();
+            free_host(net, &taken, &avoid).ok_or_else(no_free_addr)?
+        }
+        (None, Inviter::Delegate(d)) => d
+            .delegation
+            .scope
+            .iter()
+            .filter_map(|s| match s {
+                IpNet::V4(n) => free_host(*n, &taken, &[]),
+                IpNet::V6(_) => None,
+            })
+            .next()
+            .ok_or_else(no_free_addr)?,
     };
+    if let Inviter::Delegate(d) = &inviter {
+        if req.relay {
+            return Err(OpError::new("delegate_limit", "a delegate cannot give the relay role"));
+        }
+        if let Some(r) = req.routes.iter().find(|r| !d.delegation.covers(&r.trunc())) {
+            return Err(OpError::new("delegate_limit", format!("{r} is outside this node's scope")));
+        }
+    }
     for e in &req.statics {
         crate::config::check_endpoint(e).map_err(|e| OpError::new("endpoint_invalid", format!("static {e:#}")))?;
     }
@@ -229,7 +294,11 @@ pub fn invite(conf: &Config, g: &GroupConfig, certs: &[Cert], req: &InviteReques
         template.roles.0 |= Roles::RELAY;
     }
     let until = now_unix() + req.ttl_hours * 3600;
-    let join = secret.grant_join(template, until);
+    let join = match inviter {
+        Inviter::Admin(secret) => secret.grant_join(template, until),
+        Inviter::Delegate(d) => d.grant_join(template, until),
+    };
+    let until = join.grant.until;
     let trackers = conf.servers.iter().map(|s| s.tracker_ref()).collect();
     let mut inv = Invite::new(&g.name, g.epoch, g.psk, g.obfs_entries.clone(), trackers, join, net_prefix(conf));
     if !req.statics.is_empty() {
@@ -246,6 +315,90 @@ pub struct NodeChange {
     pub add_routes: Vec<IpNet>,
     pub del_routes: Vec<IpNet>,
     pub relay: Option<bool>,
+}
+
+/// Why a delegate's invite certificate cannot become a regular one: the name or address is
+/// another member's. A delegate does not see the members who are not online yet.
+pub fn invite_conflict(cert: &Cert, certs: &[Cert], m: &Membership) -> Option<String> {
+    let b = &cert.body;
+    let live = |c: &&Cert| c.body.node != b.node && c.body.not_after > now_unix() && m.admits(c);
+    certs.iter().filter(live).find_map(|c| {
+        if c.body.name == b.name {
+            Some(format!("name {} is taken", b.name))
+        } else if b.ipv4().is_some() && c.body.ipv4() == b.ipv4() {
+            Some(format!("address {} is taken by {}", c.body.ipv4()?, c.body.name))
+        } else {
+            None
+        }
+    })
+}
+
+/// Lets the node holding the result invite into `scope` for `days`. `g`: the group, whose
+/// network holds the scope, which no other delegate may share.
+pub fn add_delegate(
+    conf: &Config,
+    g: &GroupConfig,
+    name: &str,
+    scope: Vec<IpNet>,
+    days: u64,
+) -> Result<(Delegate, IssuedDelegation), OpError> {
+    let secret = admin_secret(g)?;
+    check_clock()?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(OpError::new("bad_param", "name: the delegate needs a name"));
+    }
+    if g.delegations.iter().any(|d| d.name == name) {
+        return Err(OpError::new("delegate_exists", format!("delegate {name} exists: remove it first")));
+    }
+    if scope.is_empty() {
+        return Err(OpError::new("bad_param", "scope: at least one subnet"));
+    }
+    let own = g.ipv4().ok_or_else(|| OpError::new("no_address", "this node has no address in the group"))?;
+    let net = Ipv4Net::new(own, net_prefix(conf)).map_err(|e| OpError::new("bad_param", e.to_string()))?.trunc();
+    let scope: Vec<IpNet> = scope.iter().map(IpNet::trunc).collect();
+    for s in &scope {
+        if !IpNet::V4(net).contains(s) {
+            return Err(OpError::new("addr_invalid", format!("{s} is outside the group network {net}")));
+        }
+        let overlap = |o: &IpNet| o.contains(s) || s.contains(o);
+        if let Some(d) = g.delegations.iter().find(|d| d.delegation.scope.iter().any(overlap)) {
+            return Err(OpError::new("scope_taken", format!("{s} overlaps the scope of delegate {}", d.name)));
+        }
+    }
+    let delegate = secret.delegate(scope, now_unix() + days * 86400);
+    let issued = IssuedDelegation { name: name.to_owned(), delegation: delegate.delegation.clone() };
+    Ok((delegate, issued))
+}
+
+/// Takes the right to invite back from a delegate, named or by key: invites it gave and that were
+/// not used yet stop working, the members it brought in stay. Returns it and the record.
+pub fn remove_delegate(
+    secret: &GroupSecret,
+    store: &StateStore,
+    g: &GroupConfig,
+    who: &str,
+) -> Result<(IssuedDelegation, Entry), OpError> {
+    check_clock()?;
+    let d = g
+        .delegations
+        .iter()
+        .find(|d| d.name == who || d.delegation.key.to_string() == who)
+        .ok_or_else(|| OpError::new("no_delegate", format!("no delegate {who}")))?;
+    Ok((d.clone(), store.add(secret, Body::Revoke { key: d.delegation.key }, false)))
+}
+
+/// Makes this node a delegate from the text an admin gave it, and saves.
+pub fn accept_delegate(conf: &mut Config, text: &str) -> anyhow::Result<Delegate> {
+    let Some(d) = Delegate::decode(text) else { bail!("not a valid delegation") };
+    if now_unix() >= d.delegation.until {
+        bail!("this delegation has expired");
+    }
+    if !conf.set_group_delegate(&d.delegation.group, &d) {
+        bail!("this node is not in group {}", d.delegation.group);
+    }
+    conf.save();
+    Ok(d)
 }
 
 /// Issues member `node` a new certificate with `ch` applied (and a fresh validity). `certs`:
@@ -366,7 +519,7 @@ mod tests {
         dir
     }
 
-    fn invite(secret: &GroupSecret, name: &str, until: u64) -> Invite {
+    fn test_invite(secret: &GroupSecret, name: &str, until: u64) -> Invite {
         let template = CertBody::new(Identity::generate().id(), "phone", vec!["10.10.33.40/32".parse().unwrap()]);
         let join = secret.grant_join(template, until);
         let mut inv = Invite::new(name, 0, secret.psk(0), Vec::new(), Vec::new(), join, 24);
@@ -374,12 +527,188 @@ mod tests {
         inv
     }
 
+    fn net(s: &str) -> IpNet {
+        s.parse().unwrap()
+    }
+
+    /// A config in a group 10.10.0.0/16, as its admin with `secret`, or as a member with `delegate`.
+    fn group_conf(secret: &GroupSecret, admin: bool) -> (Config, GroupConfig) {
+        let mut conf = Config::load(&temp_dir()).unwrap();
+        conf.set_net_prefix(16);
+        let cert = secret.issue(CertBody::new(conf.identity.id(), "me", vec![net("10.10.0.1/32")]));
+        let g = GroupConfig {
+            name: "home".into(),
+            id: secret.id(),
+            secret: admin.then(|| secret.clone()),
+            epoch: 0,
+            psk: secret.psk(0),
+            cert: Some(cert),
+            obfs: Default::default(),
+            obfs_entries: Vec::new(),
+            delegate: None,
+            delegations: Vec::new(),
+        };
+        conf.add_group(g.clone());
+        (conf, g)
+    }
+
+    fn request(addr: Option<&str>) -> InviteRequest {
+        InviteRequest {
+            name: "phone".into(),
+            addr: addr.map(|a| a.parse().unwrap()),
+            ttl_hours: 1,
+            statics: Vec::new(),
+            routes: Vec::new(),
+            relay: false,
+        }
+    }
+
+    #[test]
+    fn free_host_ends() {
+        let net: Ipv4Net = "10.0.0.0/30".parse().unwrap();
+        let (a, b) = ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap());
+        assert_eq!(free_host(net, &[a], &[]), Some(b));
+        assert_eq!(free_host(net, &[a, b], &[]), None, "full");
+        assert_eq!(free_host(net, &[], &["10.0.0.0/30".parse().unwrap()]), None, "all avoided");
+        assert_eq!(free_host("10.0.0.5/32".parse().unwrap(), &[], &[]), Some("10.0.0.5".parse().unwrap()));
+    }
+
+    #[test]
+    fn delegate_invites_only_inside_its_scope() {
+        let secret = GroupSecret::generate();
+        let (admin_conf, admin) = group_conf(&secret, true);
+        let (d, _) = add_delegate(&admin_conf, &admin, "carol", vec![net("10.10.40.0/24")], 30).unwrap();
+        let (conf, mut g) = group_conf(&secret, false);
+        let none = HashSet::new();
+        assert_eq!(invite(&conf, &g, &[], &none, &request(None)).unwrap_err().code, "not_admin");
+        g.delegate = Some(d.clone());
+
+        let made = invite(&conf, &g, &[], &none, &request(None)).unwrap();
+        assert!(net("10.10.40.0/24").contains(&IpAddr::V4(made.addr)), "{}", made.addr);
+        let inv = Invite::decode(&made.invite, Some(now_unix())).unwrap();
+        assert_eq!(inv.join.enroll(Identity::generate().id()).delegate_key(), Some(d.delegation.key));
+
+        let code = |r: &InviteRequest, revoked: &HashSet<NodeId>| invite(&conf, &g, &[], revoked, r).unwrap_err().code;
+        assert_eq!(code(&request(Some("10.10.41.5")), &none), "addr_invalid");
+        assert_eq!(code(&InviteRequest { relay: true, ..request(None) }, &none), "delegate_limit");
+        assert_eq!(code(&InviteRequest { routes: vec![net("0.0.0.0/0")], ..request(None) }, &none), "delegate_limit");
+        assert_eq!(code(&request(None), &HashSet::from([d.delegation.key])), "delegate_ended");
+    }
+
+    #[test]
+    fn admin_invites_keep_out_of_delegates_scopes() {
+        let secret = GroupSecret::generate();
+        let (conf, mut g) = group_conf(&secret, true);
+        let (_, issued) = add_delegate(&conf, &g, "carol", vec![net("10.10.0.0/17")], 30).unwrap();
+        g.delegations.push(issued);
+        for _ in 0..50 {
+            let made = invite(&conf, &g, &[], &HashSet::new(), &request(None)).unwrap();
+            assert!(!net("10.10.0.0/17").contains(&IpAddr::V4(made.addr)), "{}", made.addr);
+        }
+        // but an admin can name one there
+        assert!(invite(&conf, &g, &[], &HashSet::new(), &request(Some("10.10.0.9"))).is_ok());
+    }
+
+    #[test]
+    fn delegates_checks() {
+        let secret = GroupSecret::generate();
+        let (conf, mut g) = group_conf(&secret, true);
+        let add = |g: &GroupConfig, name: &str, s: &str| add_delegate(&conf, g, name, vec![net(s)], 30);
+        let (_, issued) = add(&g, "carol", "10.10.40.0/24").unwrap();
+        g.delegations.push(issued);
+        assert_eq!(add(&g, "carol", "10.10.50.0/24").unwrap_err().code, "delegate_exists");
+        assert_eq!(add(&g, "dave", "10.10.40.128/25").unwrap_err().code, "scope_taken");
+        assert_eq!(add(&g, "dave", "10.10.0.0/16").unwrap_err().code, "scope_taken");
+        assert_eq!(add(&g, "dave", "10.11.0.0/24").unwrap_err().code, "addr_invalid");
+        assert_eq!(add(&g, " ", "10.10.50.0/24").unwrap_err().code, "bad_param");
+        assert_eq!(add_delegate(&conf, &g, "dave", vec![], 30).unwrap_err().code, "bad_param");
+        let (member_conf, member) = group_conf(&secret, false);
+        assert_eq!(
+            add_delegate(&member_conf, &member, "x", vec![net("10.10.60.0/24")], 30).unwrap_err().code,
+            "not_admin"
+        );
+
+        let store = StateStore::memory();
+        assert_eq!(remove_delegate(&secret, &store, &g, "nobody").unwrap_err().code, "no_delegate");
+        let (d, _) = remove_delegate(&secret, &store, &g, "carol").unwrap();
+        assert!(store.revoked(&g.id).contains(&d.delegation.key));
+    }
+
+    #[test]
+    fn removed_delegate_keeps_its_members_not_its_invites() {
+        let secret = GroupSecret::generate();
+        let d = secret.delegate(vec![net("10.10.40.0/24")], now_unix() + 3600);
+        let join = |a: &str| {
+            d.grant_join(CertBody::new(Identity::generate().id(), "n", vec![net(a)]), now_unix() + 60)
+                .enroll(Identity::generate().id())
+        };
+        let (member, pending) = (join("10.10.40.1/32"), join("10.10.40.2/32"));
+        let store = StateStore::memory();
+        let body = CertBody { group: secret.id(), ..member.body.clone() };
+        store.add(&secret, Body::Cert(Box::new(secret.issue(body))), false);
+        store.add(&secret, Body::Revoke { key: d.delegation.key }, false);
+        let m = Membership::of(&store, &secret.id());
+        assert!(m.admits(&member), "has a regular certificate, not picked up yet");
+        assert!(!m.admits(&pending));
+    }
+
+    #[test]
+    fn invite_conflicts() {
+        let secret = GroupSecret::generate();
+        let d = secret.delegate(vec![net("10.10.40.0/24")], now_unix() + 3600);
+        let id = || Identity::generate().id();
+        let new = d.grant_join(CertBody::new(id(), "bob", vec![net("10.10.40.1/32")]), now_unix() + 60).enroll(id());
+        let cert = |name: &str, a: &str| secret.issue(CertBody::new(id(), name, vec![net(a)]));
+        let m = Membership::default();
+        assert_eq!(invite_conflict(&new, &[new.clone(), cert("alice", "10.10.40.2/32")], &m), None);
+        assert!(invite_conflict(&new, &[cert("bob", "10.10.0.9/32")], &m).unwrap().contains("name"));
+        assert!(invite_conflict(&new, &[cert("alice", "10.10.40.1/32")], &m).unwrap().contains("address"));
+        // a member who is gone gives its name and address back
+        let gone = cert("bob", "10.10.40.1/32");
+        let m = Membership { revoked: HashSet::from([gone.body.node]), ..Default::default() };
+        assert_eq!(invite_conflict(&new, &[gone], &m), None);
+    }
+
+    #[test]
+    fn delegate_survives_the_config() {
+        let secret = GroupSecret::generate();
+        let dir = temp_dir();
+        let mut conf = Config::load(&dir).unwrap();
+        let inv = invite_for(&secret);
+        join(&mut conf, &inv.encode()).unwrap();
+        let d = secret.delegate(vec![net("10.10.33.0/24")], now_unix() + 3600);
+        assert!(accept_delegate(&mut conf, "nonsense").is_err());
+        let other = GroupSecret::generate().delegate(vec![net("10.10.33.0/24")], now_unix() + 3600);
+        assert!(accept_delegate(&mut conf, &other.encode()).unwrap_err().to_string().contains("not in group"));
+        let late = secret.delegate(vec![net("10.10.33.0/24")], now_unix() - 1);
+        assert!(accept_delegate(&mut conf, &late.encode()).unwrap_err().to_string().contains("expired"));
+        accept_delegate(&mut conf, &d.encode()).unwrap();
+
+        let mut back = Config::load(&dir).unwrap();
+        let g = back.group("home").unwrap();
+        assert_eq!(g.delegate.as_ref().unwrap().delegation, d.delegation);
+
+        let issued = IssuedDelegation { name: "carol".into(), delegation: d.delegation };
+        let id = secret.id();
+        back.set_group_delegations(&id, vec![issued.clone()]);
+        back.save();
+        let mut again = Config::load(&dir).unwrap();
+        assert_eq!(again.group("home").unwrap().delegations, vec![issued]);
+        again.set_group_delegations(&id, Vec::new());
+        again.save();
+        assert!(Config::load(&dir).unwrap().group("home").unwrap().delegations.is_empty());
+    }
+
+    fn invite_for(secret: &GroupSecret) -> Invite {
+        test_invite(secret, "home", now_unix() + 3600)
+    }
+
     #[test]
     fn join_takes_the_network_mask() {
         let dir = temp_dir();
         let mut conf = Config::load(&dir).unwrap();
         assert_eq!(net_prefix(&conf), 24);
-        let mut inv = invite(&GroupSecret::generate(), "home", now_unix() + 3600);
+        let mut inv = test_invite(&GroupSecret::generate(), "home", now_unix() + 3600);
         inv.net_prefix = 16;
         let j = join(&mut conf, &inv.encode()).unwrap();
         assert!(j.added.contains(&"network mask /16".to_owned()), "{:?}", j.added);
@@ -391,7 +720,7 @@ mod tests {
         let dir = temp_dir();
         let mut conf = Config::load(&dir).unwrap();
         let secret = GroupSecret::generate();
-        let inv = invite(&secret, "home", now_unix() + 3600);
+        let inv = test_invite(&secret, "home", now_unix() + 3600);
 
         let j = join(&mut conf, &format!("  {}\n", inv.encode())).unwrap();
         assert_eq!((j.group.as_str(), j.id, j.name.as_str()), ("home", secret.id(), "phone"));
@@ -405,7 +734,7 @@ mod tests {
 
         let again = join(&mut conf, &inv.encode()).unwrap_err().to_string();
         assert!(again.contains("already in group"), "{again}");
-        let other = join(&mut conf, &invite(&GroupSecret::generate(), "work", now_unix() + 3600).encode());
+        let other = join(&mut conf, &test_invite(&GroupSecret::generate(), "work", now_unix() + 3600).encode());
         assert!(other.unwrap_err().to_string().contains("already in a group"));
 
         assert!(leave(&mut conf, "nope").is_err());
@@ -419,7 +748,7 @@ mod tests {
         let dir = temp_dir();
         let mut conf = Config::load(&dir).unwrap();
         assert!(join(&mut conf, "not an invite").is_err());
-        let expired = invite(&GroupSecret::generate(), "home", now_unix() - 1).encode();
+        let expired = test_invite(&GroupSecret::generate(), "home", now_unix() - 1).encode();
         assert!(join(&mut conf, &expired).unwrap_err().to_string().contains("expired"));
         assert!(conf.groups.is_empty());
         std::fs::remove_dir_all(dir).unwrap();

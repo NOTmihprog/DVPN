@@ -206,6 +206,45 @@ enum NodeCommand {
 }
 
 #[derive(Subcommand)]
+enum DelegateCommand {
+    /// Print a delegation for a member: it may then invite into its subnets (admins only)
+    Add {
+        /// Group name or id (default: the only group)
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+        /// A name for the delegate
+        name: String,
+        /// A subnet of the group network it may give addresses in (repeatable)
+        #[arg(long, required = true, value_name = "PREFIX")]
+        scope: Vec<IpNet>,
+        /// Days it is valid
+        #[arg(long, default_value_t = 365, value_parser = clap::value_parser!(u64).range(1..=3650))]
+        days: u64,
+    },
+    /// Take the right to invite back (admins only): its unused invites stop working, the members
+    /// it brought in stay; a running node of this admin spreads it within seconds
+    Remove {
+        /// Group name or id (default: the only group)
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+        /// Delegate's name or key
+        name: String,
+    },
+    /// Delegates in force (admins), or this node's delegation
+    List {
+        /// Group name or id (default: the only group)
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+    },
+    /// Make this node a delegate, with the text from `delegate add`
+    Accept {
+        // base64url may start with '-'
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum GroupCommand {
     /// Create a group; this node becomes its admin and first member
     Create {
@@ -251,6 +290,11 @@ enum GroupCommand {
         /// (a node with a public address or a good connection)
         #[arg(long)]
         relay: bool,
+    },
+    /// Let a member invite into a part of the network, and take it back
+    Delegate {
+        #[command(subcommand)]
+        cmd: DelegateCommand,
     },
     /// Join a group by invite (from the argument, a file or stdin)
     Join {
@@ -574,6 +618,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             | GroupCommand::Revoke { .. }
             | GroupCommand::Rotate { .. }
             | GroupCommand::Restore { .. }
+            | GroupCommand::Delegate { cmd: DelegateCommand::Add { .. } | DelegateCommand::Remove { .. } }
     );
     if signs && !dvpn::clock::trusted() {
         die("the clock is earlier than this build: set it (NTP) before signing group records or certificates");
@@ -588,7 +633,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
             }
             let prefix = ops::net_prefix(conf);
             let net = Ipv4Net::new(Ipv4Addr::new(10, 10, 33, 0), prefix).unwrap_or_else(|e| die(e)).trunc();
-            let addr = addr.unwrap_or_else(|| ops::free_host(net, &[]));
+            let addr = addr.or_else(|| ops::free_host(net, &[], &[])).unwrap_or_else(|| die("no free address"));
             let id = conf.identity.id();
             let secret = GroupSecret::generate();
             let node_name = node_name.unwrap_or_else(|| id.short());
@@ -604,6 +649,8 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
                 cert: Some(cert),
                 obfs: Default::default(),
                 obfs_entries: Vec::new(),
+                delegate: None,
+                delegations: Vec::new(),
             };
             println!("Group {name}: {}\nThis node: {node_name}, {addr}/{prefix}, admin", g.id);
             conf.add_group(g);
@@ -614,15 +661,56 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
         }
         GroupCommand::Invite { group, name, addr, ttl, statics, routes, relay } => {
             let g = pick_group(conf, &group).clone();
-            let certs = member_certs(conf, &g, &state());
+            let store = state();
+            let certs = member_certs(conf, &g, &store);
             let req = ops::InviteRequest { name, addr, ttl_hours: ttl, statics, routes, relay };
-            let made = ops::invite(conf, &g, &certs, &req).unwrap_or_else(|e| die(e));
+            let made = ops::invite(conf, &g, &certs, &store.revoked(&g.id), &req).unwrap_or_else(|e| die(e));
             for w in &made.warnings {
                 log::warn!("{w}");
             }
             eprintln!("Invite for {} ({}) to {}, valid {ttl} h, for one node:", made.name, made.addr, g.name);
             println!("{}", made.invite);
         }
+        GroupCommand::Delegate { cmd } => match cmd {
+            DelegateCommand::Add { group, name, scope, days } => {
+                let g = pick_group(conf, &group).clone();
+                let (delegate, issued) = ops::add_delegate(conf, &g, &name, scope, days).unwrap_or_else(|e| die(e));
+                let mut list = g.delegations.clone();
+                list.push(issued);
+                conf.set_group_delegations(&g.id, list);
+                conf.save();
+                eprintln!("Delegation for {name}, valid {days} d; on its node: dvpn group delegate accept <text>");
+                println!("{}", delegate.encode());
+            }
+            DelegateCommand::Remove { group, name } => {
+                let g = pick_group(conf, &group).clone();
+                let secret = ops::admin_secret(&g).unwrap_or_else(|e| die(e));
+                let store = state();
+                let (d, _) = ops::remove_delegate(secret, &store, &g, &name).unwrap_or_else(|e| die(e));
+                store.save();
+                let list = g.delegations.iter().filter(|o| **o != d).cloned().collect();
+                conf.set_group_delegations(&g.id, list);
+                conf.save();
+                println!("Delegate {} removed from group {}", d.name, g.name);
+                println!("A running node of this admin spreads it to the trackers and members within seconds.");
+            }
+            DelegateCommand::List { group } => {
+                let g = pick_group(conf, &group);
+                let row = |name: &str, d: &dvpn::group::Delegation| {
+                    let scope: Vec<String> = d.scope.iter().map(ToString::to_string).collect();
+                    let days = d.until.saturating_sub(now_unix()) / 86400;
+                    vec![name.to_owned(), d.key.to_string(), scope.join(", "), format!("{days} d")]
+                };
+                let mut rows: Vec<Vec<String>> = g.delegations.iter().map(|d| row(&d.name, &d.delegation)).collect();
+                rows.extend(g.delegate.iter().map(|d| row("this node", &d.delegation)));
+                println!("\n{}\n", github_table(&["Name", "Key", "Scope", "Valid"], &rows));
+            }
+            DelegateCommand::Accept { text } => {
+                let d = ops::accept_delegate(conf, &text).unwrap_or_else(|e| die(format!("{e:#}")));
+                let scope: Vec<String> = d.delegation.scope.iter().map(ToString::to_string).collect();
+                println!("This node may invite into {}", scope.join(", "));
+            }
+        },
         GroupCommand::Join { invite, inp } => {
             let text = match (invite, inp) {
                 (Some(t), _) => t,
@@ -653,12 +741,16 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
                     vec![
                         g.name.clone(),
                         g.id.to_string(),
-                        if g.secret.is_some() { "admin".into() } else { "member".into() },
+                        match (&g.secret, &g.delegate) {
+                            (Some(_), _) => "admin".into(),
+                            (None, Some(_)) => "delegate".into(),
+                            (None, None) => "member".into(),
+                        },
                         cert.map_or_else(String::new, |c| c.body.name.clone()),
                         g.ipv4().map_or_else(String::new, |a| a.to_string()),
                         cert.map_or_else(String::new, |c| {
                             let days = c.body.not_after.saturating_sub(now_unix()) / 86400;
-                            if c.grant.is_some() { format!("{days} d (invite)") } else { format!("{days} d") }
+                            if c.from_invite() { format!("{days} d (invite)") } else { format!("{days} d") }
                         }),
                     ]
                 })
@@ -809,6 +901,8 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
                 cert: Some(cert),
                 obfs,
                 obfs_entries: b.obfs,
+                delegate: None,
+                delegations: Vec::new(),
             });
             conf.save();
             println!(

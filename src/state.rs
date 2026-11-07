@@ -190,9 +190,14 @@ pub fn record_key(group: &GroupId, id: &str) -> RecordKey {
     h[..16].try_into().unwrap()
 }
 
-/// Whether `cert` is revoked: its node, or the join key it was enrolled with.
+/// Whether `cert` is revoked: its node, the join key it was enrolled with or the delegate that
+/// invited it.
 pub fn cert_revoked(revoked: &HashSet<NodeId>, cert: &Cert) -> bool {
-    revoked.contains(&cert.body.node) || cert.join_key().is_some_and(|k| revoked.contains(&k))
+    revoked.contains(&cert.body.node) || invite_revoked(revoked, cert)
+}
+
+fn invite_revoked(revoked: &HashSet<NodeId>, cert: &Cert) -> bool {
+    cert.join_key().into_iter().chain(cert.delegate_key()).any(|k| revoked.contains(&k))
 }
 
 /// Who may be in a group according to its records: a snapshot for the packet path and trackers.
@@ -211,12 +216,14 @@ impl Membership {
     /// Whether a (verified) certificate still admits its node. When an admin turns an invite
     /// certificate into a regular one, it revokes the join key; until the node picks up its new
     /// certificate it still presents the old one, which stays good because a regular one exists.
+    /// The same goes for the invite certificates of a delegate that was removed: the members it
+    /// brought in stay, the invites not used yet do not.
     pub fn admits(&self, cert: &Cert) -> bool {
         let node = cert.body.node;
         if self.revoked.contains(&node) {
             return false;
         }
-        cert.join_key().is_none_or(|k| !self.revoked.contains(&k) || self.issued.contains(&node))
+        !invite_revoked(&self.revoked, cert) || self.issued.contains(&node)
     }
 }
 
@@ -663,6 +670,11 @@ mod tests {
         let g = GroupSecret::generate();
         let join = g.grant_join(CertBody::new(Identity::generate().id(), "n", vec![]), u64::MAX);
         let cert = join.enroll(Identity::generate().id());
+        let delegate = g.delegate(vec!["10.0.0.0/8".parse().unwrap()], u64::MAX);
+        let invited = delegate
+            .grant_join(CertBody::new(Identity::generate().id(), "n", vec![]), u64::MAX)
+            .enroll(Identity::generate().id());
+        assert!(cert_revoked(&HashSet::from([delegate.delegation.key]), &invited));
         assert!(!cert_revoked(&HashSet::new(), &cert));
         assert!(cert_revoked(&HashSet::from([join.grant.key]), &cert));
         assert!(cert_revoked(&HashSet::from([cert.body.node]), &cert));

@@ -102,6 +102,7 @@ UDP `127.0.0.1:9902`.
 | `member_unknown`, `member_ambiguous`, `member_not_seen` | участник не найден, имя подходит нескольким, сертификата ещё нет |
 | `addr_taken`, `addr_invalid`, `route_invalid`, `endpoint_invalid`, `no_address`, `config_read` | `set invite`, `set node` |
 | `revoke_self`, `acl_parse` | `set revoke`, `set acl` |
+| `delegate_ended`, `delegate_limit`, `no_free_addr` | `set invite`: право приглашать забрали или оно истекло; relay или подсеть вне прав делегата; нет свободных адресов |
 
 Узлы везде обозначаются полем `key` — публичным ключом узла (base64url). В запросах можно передать однозначное
 начало ключа или имя участника.
@@ -292,7 +293,8 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 
 Только на узле с секретом группы (иначе `not_admin`) — то же, что `dvpn group invite/revoke/rotate`, `dvpn node
 set`, `dvpn acl set/clear`. Узел сразу применяет новые записи группы и рассылает их серверам обнаружения и
-соседям. Участник в `key` — ключ, начало ключа или имя.
+соседям. Участник в `key` — ключ, начало ключа или имя. `set invite` работает и на узле делегата, в пределах его
+подсети ([groups.md](groups.md#делегаты-приглашения-в-часть-сети)).
 
 ```
 {"type": "set", "req": "invite", "name": "carol",          # имя нового узла (обязательно)

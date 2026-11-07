@@ -10,6 +10,11 @@
 //! either signed by the group key directly, or delegated: the group signs a [`JoinGrant`] for a
 //! one-time join key carried in an invite, and the join key signs the cert of whichever node
 //! enrolls with it. Trackers and admins bind a join key to the first node seen using it.
+//!
+//! An admin can hand the right to invite into a part of the network to a [`Delegate`]: the group
+//! signs a [`Delegation`] for a key of its own, and that key signs join grants instead of the
+//! group. Such a cert stays inside the delegation's scope and has no roles; it only lasts until
+//! an admin replaces it with a regular one, so a delegate signs nothing that outlives it.
 
 use std::fmt;
 
@@ -33,6 +38,8 @@ pub const JOIN_TTL_SECS: u64 = 24 * 3600;
 
 const CERT_CTX: &[u8] = b"dvpn/4 cert\0";
 const GRANT_CTX: &[u8] = b"dvpn/4 join grant\0";
+const DELEGATION_CTX: &[u8] = b"dvpn/4 delegation\0";
+const DELEGATE_VERSION: u8 = 1;
 
 pub use crate::clock::now_unix;
 
@@ -88,7 +95,7 @@ impl GroupSecret {
     pub fn issue(&self, mut body: CertBody) -> Cert {
         body.group = self.id();
         let sig = self.signing_key().sign(&body.signed_message(CERT_CTX));
-        Cert { body, sig, grant: None }
+        Cert { body, sig, grant: Grant::None }
     }
 
     /// A one-time join key for an invite. `template.node` is ignored (it becomes the join key);
@@ -100,7 +107,20 @@ impl GroupSecret {
         template.roles.0 &= !Roles::ADMIN;
         template.node = join_key.verifying_key().into();
         let sig = self.signing_key().sign(&grant_message(&template, until));
-        Join { key: join_key.to_bytes(), grant: JoinGrant { key: template.node, until, sig }, template }
+        Join {
+            key: join_key.to_bytes(),
+            grant: JoinGrant { key: template.node, until, sig },
+            template,
+            delegation: None,
+        }
+    }
+
+    /// Lets a new key invite into `scope` until `until` (`Delegate::grant_join`).
+    pub fn delegate(&self, scope: Vec<IpNet>, until: u64) -> Delegate {
+        let key = SigningKey::from_bytes(&random_bytes());
+        let (group, public) = (self.id(), key.verifying_key().into());
+        let sig = self.signing_key().sign(&delegation_message(&group, &public, &scope, until));
+        Delegate { key: key.to_bytes(), delegation: Delegation { group, key: public, scope, until, sig } }
     }
 }
 
@@ -180,6 +200,100 @@ fn grant_message(template: &CertBody, until: u64) -> Vec<u8> {
     m
 }
 
+fn delegation_message(group: &GroupId, key: &NodeId, scope: &[IpNet], until: u64) -> Vec<u8> {
+    let mut m = DELEGATION_CTX.to_vec();
+    m.extend(postcard::to_stdvec(&(group, key, scope, until)).expect("delegation serializes"));
+    m
+}
+
+/// The group's signature allowing `key` to sign join grants for addresses inside `scope` until
+/// `until`. Revoked like a node, by `key`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Delegation {
+    pub group: GroupId,
+    pub key: NodeId,
+    pub scope: Vec<IpNet>,
+    pub until: u64,
+    pub sig: Signature,
+}
+
+impl Delegation {
+    fn verify(&self) -> bool {
+        let m = delegation_message(&self.group, &self.key, &self.scope, self.until);
+        self.group.verifying_key().verify_strict(&m, &self.sig).is_ok()
+    }
+
+    /// Whether `prefix` lies inside the scope.
+    pub fn covers(&self, prefix: &IpNet) -> bool {
+        self.scope.iter().any(|s| s.contains(prefix))
+    }
+}
+
+/// What the delegate holds: the delegation and its private key.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Delegate {
+    pub key: [u8; 32],
+    pub delegation: Delegation,
+}
+
+impl fmt::Debug for Delegate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Delegate").field("delegation", &self.delegation).finish_non_exhaustive()
+    }
+}
+
+impl Delegate {
+    /// A one-time join key for an invite, like `GroupSecret::grant_join`, signed by this
+    /// delegate. Nothing it grants outlives the delegation; roles are not its to give.
+    pub fn grant_join(&self, mut template: CertBody, until: u64) -> Join {
+        let d = &self.delegation;
+        let until = until.min(d.until);
+        let join_key = SigningKey::from_bytes(&random_bytes());
+        template.group = d.group;
+        template.roles = Roles::default();
+        template.not_after = template.not_after.min(d.until);
+        template.node = join_key.verifying_key().into();
+        let sig = SigningKey::from_bytes(&self.key).sign(&grant_message(&template, until));
+        let grant = JoinGrant { key: template.node, until, sig };
+        Join { key: join_key.to_bytes(), grant, template, delegation: Some(Box::new(d.clone())) }
+    }
+
+    /// The text an admin passes to the delegate (a secret, like an invite).
+    pub fn encode(&self) -> String {
+        let mut b = vec![DELEGATE_VERSION];
+        b.extend(postcard::to_stdvec(self).expect("delegate serializes"));
+        crate::crypto::encode_b64(&b)
+    }
+
+    /// Reads a delegate's text: it must be signed by its group and hold the delegation's key.
+    pub fn decode(s: &str) -> Option<Self> {
+        let s: String = s.split_whitespace().collect();
+        let b = crate::crypto::decode_b64(&s).ok()?;
+        let (&version, rest) = b.split_first()?;
+        let d: Delegate = postcard::from_bytes(rest).ok()?;
+        let public: NodeId = SigningKey::from_bytes(&d.key).verifying_key().into();
+        (version == DELEGATE_VERSION && public == d.delegation.key && d.delegation.verify()).then_some(d)
+    }
+}
+
+/// A delegation as the admin who made it remembers it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuedDelegation {
+    pub name: String,
+    pub delegation: Delegation,
+}
+
+impl IssuedDelegation {
+    pub fn encode(&self) -> String {
+        crate::crypto::encode_b64(&postcard::to_stdvec(self).expect("delegation serializes"))
+    }
+
+    pub fn decode(s: &str) -> Option<Self> {
+        let d: Self = postcard::from_bytes(&crate::crypto::decode_b64(s).ok()?).ok()?;
+        d.delegation.verify().then_some(d)
+    }
+}
+
 /// The group's signature allowing `key` to sign one member certificate with the fields of the
 /// template (all but `node`) until `until`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +309,8 @@ pub struct Join {
     pub key: [u8; 32],
     pub grant: JoinGrant,
     pub template: CertBody,
+    /// Present when a delegate signed the grant.
+    pub delegation: Option<Box<Delegation>>,
 }
 
 impl fmt::Debug for Join {
@@ -208,16 +324,31 @@ impl Join {
     pub fn enroll(&self, node: NodeId) -> Cert {
         let body = CertBody { node, ..self.template.clone() };
         let sig = SigningKey::from_bytes(&self.key).sign(&body.signed_message(CERT_CTX));
-        Cert { body, sig, grant: Some(self.grant.clone()) }
+        let grant = match &self.delegation {
+            None => Grant::Join(self.grant.clone()),
+            Some(d) => Grant::Delegated(self.grant.clone(), d.clone()),
+        };
+        Cert { body, sig, grant }
     }
+}
+
+/// Who signed a cert. The first two variants encode like the `Option<JoinGrant>` this used to
+/// be, so regular and invite certificates, and the records holding them, keep their bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Grant {
+    /// The group key.
+    None,
+    /// The join key of the grant, which the group signed.
+    Join(JoinGrant),
+    /// The join key of the grant, which a delegate signed.
+    Delegated(JoinGrant, Box<Delegation>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cert {
     pub body: CertBody,
     pub sig: Signature,
-    /// Present for a delegated cert: `sig` is then by `grant.key`, not by the group.
-    pub grant: Option<JoinGrant>,
+    pub grant: Grant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -227,6 +358,10 @@ pub enum CertError {
     BadGrant,
     /// A delegated cert claiming the admin role.
     DelegatedAdmin,
+    /// A delegate's cert with a role, which delegates cannot give.
+    DelegateRole,
+    /// A delegate's cert for prefixes outside its scope.
+    OutOfScope,
     Expired,
 }
 
@@ -237,6 +372,8 @@ impl fmt::Display for CertError {
             CertError::BadSignature => "bad certificate signature",
             CertError::BadGrant => "bad join grant",
             CertError::DelegatedAdmin => "delegated certificate with the admin role",
+            CertError::DelegateRole => "delegate's certificate with a role",
+            CertError::OutOfScope => "delegate's certificate outside its scope",
             CertError::Expired => "certificate expired",
         })
     }
@@ -252,17 +389,32 @@ impl Cert {
         if &b.group != group {
             return Err(CertError::WrongGroup);
         }
+        if self.grant != Grant::None && b.roles.has(Roles::ADMIN) {
+            return Err(CertError::DelegatedAdmin);
+        }
+        let check_grant = |g: &JoinGrant, by: &NodeId| {
+            let template = CertBody { node: g.key, ..b.clone() };
+            by.verifying_key()
+                .verify_strict(&grant_message(&template, g.until), &g.sig)
+                .map_err(|_| CertError::BadGrant)
+        };
         let signer = match &self.grant {
-            None => *group,
-            Some(g) => {
-                if b.roles.has(Roles::ADMIN) {
-                    return Err(CertError::DelegatedAdmin);
+            Grant::None => *group,
+            Grant::Join(g) => {
+                check_grant(g, group)?;
+                g.key
+            }
+            Grant::Delegated(g, d) => {
+                if &d.group != group || !d.verify() || g.until > d.until || b.not_after > d.until {
+                    return Err(CertError::BadGrant);
                 }
-                let template = CertBody { node: g.key, ..b.clone() };
-                group
-                    .verifying_key()
-                    .verify_strict(&grant_message(&template, g.until), &g.sig)
-                    .map_err(|_| CertError::BadGrant)?;
+                if b.roles != Roles::default() {
+                    return Err(CertError::DelegateRole);
+                }
+                if !b.prefixes.iter().all(|p| d.covers(p)) {
+                    return Err(CertError::OutOfScope);
+                }
+                check_grant(g, &d.key)?;
                 g.key
             }
         };
@@ -278,7 +430,23 @@ impl Cert {
 
     /// The join key a delegated cert was enrolled with.
     pub fn join_key(&self) -> Option<NodeId> {
-        self.grant.as_ref().map(|g| g.key)
+        match &self.grant {
+            Grant::None => None,
+            Grant::Join(g) | Grant::Delegated(g, _) => Some(g.key),
+        }
+    }
+
+    /// The key of the delegate that invited this node, while this is its invite cert.
+    pub fn delegate_key(&self) -> Option<NodeId> {
+        match &self.grant {
+            Grant::Delegated(_, d) => Some(d.key),
+            _ => None,
+        }
+    }
+
+    /// Whether this is still the certificate from an invite.
+    pub fn from_invite(&self) -> bool {
+        self.grant != Grant::None
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -501,12 +669,12 @@ mod tests {
         // a forged grant from a non-member key
         let mut c = cert.clone();
         let fake = GroupSecret::generate().grant_join(join.template.clone(), join.grant.until);
-        c.grant = Some(fake.grant.clone());
+        c.grant = Grant::Join(fake.grant.clone());
         c.sig = SigningKey::from_bytes(&fake.key).sign(&c.body.signed_message(CERT_CTX));
         assert_eq!(c.verify(&g.id(), None), Err(CertError::BadGrant));
         // a direct-looking cert signed by the join key
         let mut c = cert.clone();
-        c.grant = None;
+        c.grant = Grant::None;
         assert_eq!(c.verify(&g.id(), None), Err(CertError::BadSignature));
         // the admin bit on a delegated cert is refused before any signature check
         let mut c = cert;
@@ -545,6 +713,119 @@ mod tests {
         let mut bad = inv;
         bad.join.template.group = GroupSecret::generate().id();
         assert!(matches!(Invite::decode(&bad.encode(), None), Err(InviteError::Grant(_))));
+    }
+
+    fn delegated(g: &GroupSecret, scope: &str, addr: &str) -> (Delegate, Cert) {
+        let d = g.delegate(vec![net(scope)], now_unix() + 3600);
+        let join = d.grant_join(CertBody::new(NodeId::random(), "n", vec![net(addr)]), now_unix() + 60);
+        let cert = join.enroll(Identity::generate().id());
+        (d, cert)
+    }
+
+    #[test]
+    fn grant_keeps_the_bytes_of_an_option() {
+        let g = GroupSecret::generate();
+        let join = g.grant_join(CertBody::new(NodeId::random(), "n", vec![]), 60);
+        let old: Option<JoinGrant> = None;
+        assert_eq!(postcard::to_stdvec(&Grant::None).unwrap(), postcard::to_stdvec(&old).unwrap());
+        let old = Some(join.grant.clone());
+        assert_eq!(postcard::to_stdvec(&Grant::Join(join.grant)).unwrap(), postcard::to_stdvec(&old).unwrap());
+    }
+
+    #[test]
+    fn delegate_invites_inside_its_scope() {
+        let g = GroupSecret::generate();
+        let (d, cert) = delegated(&g, "10.10.40.0/24", "10.10.40.7/32");
+        assert_eq!(cert.verify(&g.id(), Some(now_unix())), Ok(()));
+        assert_eq!(cert.delegate_key(), Some(d.delegation.key));
+        assert!(cert.from_invite());
+        assert_eq!(Cert::decode(&cert.encode()), Some(cert.clone()));
+        // no longer than the delegation
+        assert!(cert.body.not_after <= d.delegation.until);
+        // of this group only
+        assert_eq!(cert.verify(&GroupSecret::generate().id(), None), Err(CertError::WrongGroup));
+        // the group did not sign this grant
+        let Grant::Delegated(jg, _) = &cert.grant else { panic!() };
+        let forged = Cert { grant: Grant::Join(jg.clone()), ..cert.clone() };
+        assert_eq!(forged.verify(&g.id(), None), Err(CertError::BadGrant));
+    }
+
+    #[test]
+    fn delegate_cannot_leave_its_limits() {
+        let g = GroupSecret::generate();
+        // the signatures are all right, the delegation does not allow it
+        let (_, out) = delegated(&g, "10.10.40.0/24", "10.10.41.7/32");
+        assert_eq!(out.verify(&g.id(), None), Err(CertError::OutOfScope));
+        let (_, wide) = delegated(&g, "10.10.40.0/24", "0.0.0.0/0");
+        assert_eq!(wide.verify(&g.id(), None), Err(CertError::OutOfScope));
+
+        let d = g.delegate(vec![net("10.10.40.0/24")], now_unix() + 2 * CERT_TTL_SECS);
+        let sign = |body: CertBody, until: u64| {
+            let (jk, node) = (SigningKey::from_bytes(&random_bytes()), Identity::generate().id());
+            let template = CertBody { node: jk.verifying_key().into(), group: g.id(), ..body };
+            let sig = SigningKey::from_bytes(&d.key).sign(&grant_message(&template, until));
+            let join = Join {
+                key: jk.to_bytes(),
+                grant: JoinGrant { key: template.node, until, sig },
+                template,
+                delegation: Some(Box::new(d.delegation.clone())),
+            };
+            join.enroll(node)
+        };
+        let body = || CertBody::new(NodeId::random(), "n", vec![net("10.10.40.7/32")]);
+        let mut relay = body();
+        relay.roles.0 = Roles::RELAY;
+        assert_eq!(sign(relay, now_unix()).verify(&g.id(), None), Err(CertError::DelegateRole));
+        let mut admin = body();
+        admin.roles.0 = Roles::ADMIN;
+        assert_eq!(sign(admin, now_unix()).verify(&g.id(), None), Err(CertError::DelegatedAdmin));
+        let mut long = body();
+        long.not_after = d.delegation.until + 1;
+        assert_eq!(sign(long, now_unix()).verify(&g.id(), None), Err(CertError::BadGrant));
+        assert_eq!(sign(body(), d.delegation.until + 1).verify(&g.id(), None), Err(CertError::BadGrant));
+        // grant_join itself keeps inside: no roles, no longer than the delegation
+        let mut t = body();
+        t.roles.0 = Roles::RELAY;
+        t.not_after = d.delegation.until + 100;
+        let join = d.grant_join(t, d.delegation.until + 100);
+        assert_eq!(join.enroll(Identity::generate().id()).verify(&g.id(), None), Ok(()));
+
+        // a delegation the group did not sign
+        let other = GroupSecret::generate().delegate(vec![net("10.10.40.0/24")], now_unix() + 3600);
+        let mut fake = other.clone();
+        fake.delegation.group = g.id();
+        let cert = fake.grant_join(body(), now_unix() + 60).enroll(Identity::generate().id());
+        assert_eq!(cert.verify(&g.id(), None), Err(CertError::BadGrant));
+    }
+
+    #[test]
+    fn delegate_text_round_trip_and_checks() {
+        let g = GroupSecret::generate();
+        let d = g.delegate(vec![net("10.10.40.0/24")], now_unix() + 3600);
+        let back = Delegate::decode(&format!("  {}\n", d.encode())).unwrap();
+        assert_eq!((back.key, back.delegation), (d.key, d.delegation.clone()));
+        assert!(Delegate::decode("not a delegate").is_none());
+        // the key must be the delegated one
+        let mut bad = d.clone();
+        bad.key = random_bytes();
+        assert!(Delegate::decode(&bad.encode()).is_none());
+        // a wider scope than was signed
+        let mut bad = d.clone();
+        bad.delegation.scope = vec![net("0.0.0.0/0")];
+        assert!(Delegate::decode(&bad.encode()).is_none());
+        let issued = IssuedDelegation { name: "carol".into(), delegation: d.delegation };
+        assert_eq!(IssuedDelegation::decode(&issued.encode()), Some(issued));
+    }
+
+    #[test]
+    fn invite_from_a_delegate() {
+        let g = GroupSecret::generate();
+        let d = g.delegate(vec![net("10.10.40.0/24")], now_unix() + 3600);
+        let join = d.grant_join(CertBody::new(NodeId::random(), "b", vec![net("10.10.40.7/32")]), now_unix() + 60);
+        let inv = Invite::new("home", 0, g.psk(0), vec![], vec![], join, 16);
+        let back = Invite::decode(&inv.encode(), Some(now_unix())).unwrap();
+        assert_eq!(back.group(), g.id());
+        assert_eq!(back.join.enroll(Identity::generate().id()).verify(&g.id(), Some(now_unix())), Ok(()));
     }
 
     proptest! {
