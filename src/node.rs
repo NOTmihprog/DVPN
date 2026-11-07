@@ -104,6 +104,9 @@ pub struct GroupCtx {
     pub tun_dns: bool,
     /// `[exit]` as at start; the node follows later changes in `config_path`.
     pub exits: crate::config::Exits,
+    /// `[[gateway.forward]]`, and whether an admin may forward ports here too.
+    pub forwards: Vec<crate::forward::Forward>,
+    pub allow_remote: bool,
     pub config_path: std::path::PathBuf,
 }
 
@@ -199,6 +202,8 @@ pub struct Node {
     reports: parking_lot::Mutex<(Instant, u32)>,
     /// `[exit]` and the config file's mtime it was read at; the chosen IPv4 / IPv6 gateways.
     exits: parking_lot::Mutex<(crate::config::Exits, Option<std::time::SystemTime>)>,
+    /// `[[gateway.forward]]` as in use, followed together with `[exit]`.
+    forwards: parking_lot::Mutex<Vec<crate::forward::Forward>>,
     exit4: parking_lot::Mutex<crate::exit::ExitChooser>,
     exit6: parking_lot::Mutex<crate::exit::ExitChooser>,
     /// Kill switch on for IPv4 / IPv6: gateways configured, none alive.
@@ -225,6 +230,7 @@ impl Node {
         group: GroupCtx,
     ) -> Arc<Self> {
         let group_id = group.id;
+        let forwards = group.forwards.clone();
         let exits = (group.exits.clone(), std::fs::metadata(&group.config_path).and_then(|m| m.modified()).ok());
         let clients: Vec<_> = clients.into_iter().map(Arc::new).collect();
         let clients_by_addr = clients.iter().flat_map(|c| c.addrs().iter().map(move |a| (*a, c.clone()))).collect();
@@ -278,6 +284,7 @@ impl Node {
             reports: parking_lot::Mutex::new((Instant::now(), 0)),
             pings: parking_lot::Mutex::new(HashMap::new()),
             exits: parking_lot::Mutex::new(exits),
+            forwards: parking_lot::Mutex::new(forwards),
             exit4: parking_lot::Mutex::new(Default::default()),
             exit6: parking_lot::Mutex::new(Default::default()),
             kill: parking_lot::Mutex::new((false, false)),
@@ -389,6 +396,10 @@ impl Node {
             let e = &self.exits.lock().0;
             (e.dns.clone(), e.table, e.sources())
         };
+        let forwards = {
+            let (local, remote) = self.forward_rules();
+            crate::forward::merge(&local, if self.group.allow_remote { &remote } else { &[] })
+        };
         let plan = crate::plan::compute(&crate::plan::Inputs {
             me,
             group: self.group.id,
@@ -405,6 +416,7 @@ impl Node {
             acl: acl.as_ref(),
             dns_domain: self.group.dns.as_ref().map(|(d, _)| d.as_str()),
             dns_forward: &dns_forward,
+            forwards: &forwards,
         });
         // one replan at a time, so the system follows the plans in order
         let mut current = self.plan.lock();
@@ -1315,6 +1327,26 @@ impl Node {
         Ok(())
     }
 
+    /// The ports forwarded here: this node's own rules, and the ones an admin set for it.
+    pub fn forward_rules(&self) -> (Vec<crate::forward::Forward>, Vec<crate::forward::Forward>) {
+        let me = self.storage.self_id();
+        (self.forwards.lock().clone(), self.group.store.forwards(&self.group.id, &me))
+    }
+
+    /// Whether an admin's rules are applied here.
+    pub fn allows_remote_forwards(&self) -> bool {
+        self.group.allow_remote
+    }
+
+    /// Writes `[[gateway.forward]]` to the config file and applies it at once.
+    pub fn set_forwards(&self, rules: &[crate::forward::Forward]) -> anyhow::Result<()> {
+        crate::config::write_forwards(&self.group.config_path, rules)?;
+        // re-read the file now, even if its mtime did not change
+        self.exits.lock().1 = None;
+        self.exit_tick();
+        Ok(())
+    }
+
     /// Our certificate as now in use.
     pub fn own_cert(&self) -> Cert {
         self.cert.read().clone()
@@ -1354,6 +1386,16 @@ impl Node {
                     }
                     Ok(_) => {}
                     Err(err) => log::warn!("Exit | [exit] in {}: {err:#}", path.display()),
+                }
+                match crate::config::read_forwards(path) {
+                    Ok(new) => {
+                        let mut f = self.forwards.lock();
+                        if new != *f {
+                            *f = new;
+                            config_changed = true;
+                        }
+                    }
+                    Err(err) => log::warn!("Gateway | [[gateway.forward]] in {}: {err:#}", path.display()),
                 }
             }
             e.0.clone()

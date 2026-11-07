@@ -105,7 +105,17 @@ table = 445                 # таблица для маршрутов в инт
 wan = ["ens3"]              # интерфейсы в интернет
 ndp_proxy = "ens3"          # необязательно: публичные IPv6 участников по NDP proxy
 manage_sysctl = true        # включать пересылку и proxy_ndp
+allow_remote = false        # применять проброс портов, заданный админом
+
+[[gateway.forward]]         # проброс порта участнику, можно несколько
+proto = "tcp"               # tcp, udp или both
+port = 8080
+to = "server"               # имя или ключ участника
+to_port = 80                # по умолчанию тот же порт
+keep_ip = false             # участник видит адрес клиента (шлюз должен быть его exit)
 ```
+
+Подробно — [exit.md](exit.md#проброс-портов-dvpn-forward).
 
 См. [exit.md](exit.md#узел-шлюз-gateway).
 

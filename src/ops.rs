@@ -500,6 +500,28 @@ pub fn set_acl(
     Ok((acl, entry))
 }
 
+/// Makes `rules` the ports forwarded on gateway `node` by admins. It applies them if it allows
+/// that (`allow_remote`). Members are named by key from here on: a rule survives a new name.
+pub fn set_forwards(
+    secret: &GroupSecret,
+    store: &StateStore,
+    certs: &[Cert],
+    node: NodeId,
+    mut rules: Vec<crate::forward::Forward>,
+) -> Result<Entry, OpError> {
+    check_clock()?;
+    crate::forward::check(&rules).map_err(|e| OpError::new("forward_invalid", e))?;
+    for r in &mut rules {
+        r.to = find_member(certs, &r.to)?.to_string();
+    }
+    let body = Body::Forward { node, rules };
+    // the entry around the body: the group, id, time, signature
+    if postcard::to_stdvec(&body).expect("body serializes").len() + 200 > crate::state::MAX_RECORD_LEN {
+        return Err(OpError::new("forward_invalid", "too many rules for one gateway"));
+    }
+    Ok(store.add(secret, body, false))
+}
+
 /// Removes the group's access rules: everybody may reach everybody.
 pub fn clear_acl(secret: &GroupSecret, store: &StateStore) -> Result<Entry, OpError> {
     check_clock()?;
@@ -561,6 +583,30 @@ mod tests {
             routes: Vec::new(),
             relay: false,
         }
+    }
+
+    #[test]
+    fn forwards_set_by_an_admin() {
+        use crate::forward::{Forward, Proto};
+        let secret = GroupSecret::generate();
+        let store = StateStore::memory();
+        let (gw, server) = (Identity::generate().id(), Identity::generate().id());
+        let certs = [secret.issue(CertBody::new(server, "server", vec![]))];
+        let rule = |port, to: &str| Forward { proto: Proto::Tcp, port, to: to.into(), to_port: 80, keep_ip: false };
+        let set = |rules| set_forwards(&secret, &store, &certs, gw, rules);
+
+        set(vec![rule(8080, "server")]).unwrap();
+        assert_eq!(store.forwards(&secret.id(), &gw), vec![rule(8080, &server.to_string())]);
+        assert_eq!(store.forwards(&secret.id(), &server), vec![], "of that gateway only");
+        assert_eq!(set(vec![rule(1, "nobody")]).unwrap_err().code, "member_unknown");
+        assert_eq!(set(vec![rule(0, "server")]).unwrap_err().code, "forward_invalid");
+        let many: Vec<_> = (1..40).map(|p| rule(p, "server")).collect();
+        assert_eq!(set(many).unwrap_err().code, "forward_invalid");
+        // the most that passes is a valid record
+        let fit: Vec<_> = (1..=14).map(|p| rule(p, "server")).collect();
+        set(fit).unwrap();
+        set(Vec::new()).unwrap();
+        assert_eq!(store.forwards(&secret.id(), &gw), vec![]);
     }
 
     #[test]

@@ -369,6 +369,31 @@ impl Client {
         self.get("acl", Vec::new()).await
     }
 
+    /// The ports forwarded on this node, or what admins set for gateway `on`.
+    pub async fn forwards(&self, on: Option<&str>) -> Result<Forwards, Error> {
+        self.get("forward", on.map(|o| ("on", Value::from(o))).into_iter().collect()).await
+    }
+
+    /// Makes `rules` the ports forwarded on this node. With `on`: on that gateway, which needs
+    /// `allow_remote`, and the node must hold the group secret. Answers the new state.
+    pub async fn set_forwards(&self, on: Option<&str>, rules: &[ForwardRule]) -> Result<Forwards, Error> {
+        let list = rules
+            .iter()
+            .map(|r| {
+                Value::Map(vec![
+                    ("proto".into(), r.proto.as_str().into()),
+                    ("port".into(), r.port.into()),
+                    ("to".into(), r.to.as_str().into()),
+                    ("to_port".into(), r.to_port.into()),
+                    ("keep_ip".into(), r.keep_ip.into()),
+                ])
+            })
+            .collect();
+        let mut f = vec![("rules", Value::Array(list))];
+        f.extend(on.map(|o| ("on", Value::from(o))));
+        from_value(self.raw("set", "forward", f).await?)
+    }
+
     // ---- admin operations (the node must hold the group secret, else `ErrorCode::NotAdmin`) ----
 
     /// An invite for one new node.

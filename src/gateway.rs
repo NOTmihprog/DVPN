@@ -11,6 +11,8 @@
 //!   answers neighbour discovery for it on the WAN (`ip -6 neigh proxy`) and routes it into the
 //!   tunnel (a /128 in the main table, so the on-link /64 does not win).
 //!
+//! - forwarded ports (`forward.rs`): a port of the WAN interfaces leads to a member.
+//!
 //! Everything is removed again on exit (sysctls stay as they are).
 
 use std::collections::BTreeSet;
@@ -20,6 +22,13 @@ use std::process::{Command, Stdio};
 use ipnet::{IpNet, Ipv6Net};
 
 const TABLE: &str = "dvpn_gw";
+
+/// What a gateway does with forwarded ports.
+pub struct Options {
+    pub manage_sysctl: bool,
+    /// This node's own UDP ports (`[peer] bind_port`).
+    pub own_ports: (u16, u16),
+}
 
 fn run(cmd: &str, args: &[&str]) -> bool {
     match Command::new(cmd).args(args).output() {
@@ -82,17 +91,26 @@ pub struct Gateway {
     wan: Vec<String>,
     ndp: Option<String>,
     proxied: BTreeSet<Ipv6Addr>,
+    own_ports: (u16, u16),
+    forwards: Vec<crate::forward::Target>,
 }
 
 impl Gateway {
     /// Sets the gateway up: sysctls (if `manage_sysctl`), NAT and MSS clamping.
-    pub fn start(tun: &str, wan: &[String], ndp: Option<String>, ula: Ipv6Net, manage_sysctl: bool) -> Self {
-        let g = Gateway { tun: tun.to_owned(), wan: wan.to_vec(), ndp, proxied: BTreeSet::new() };
+    pub fn start(tun: &str, wan: &[String], ndp: Option<String>, ula: Ipv6Net, opts: Options) -> Self {
+        let g = Gateway {
+            tun: tun.to_owned(),
+            wan: wan.to_vec(),
+            ndp,
+            proxied: BTreeSet::new(),
+            own_ports: opts.own_ports,
+            forwards: Vec::new(),
+        };
         if !cfg!(target_os = "linux") {
             log::warn!("Gateway | [gateway] is supported on Linux only");
             return g;
         }
-        if manage_sysctl {
+        if opts.manage_sysctl {
             for w in g.wan.iter().chain(g.ndp.iter()) {
                 sysctl(&format!("net.ipv6.conf.{w}.accept_ra"), "2");
             }
@@ -113,6 +131,12 @@ impl Gateway {
         type nat hook postrouting priority 100;
         iifname \"{tun}\" oifname {{ {wan_set} }} meta nfproto ipv4 masquerade
         iifname \"{tun}\" oifname {{ {wan_set} }} ip6 saddr {ula} masquerade
+    }}
+    chain fwd_pre {{
+        type nat hook prerouting priority -100;
+    }}
+    chain fwd_post {{
+        type nat hook postrouting priority 90;
     }}
     chain clamp {{
         type filter hook forward priority -10;
@@ -157,6 +181,17 @@ impl Gateway {
             }
         }
         self.proxied = wanted;
+    }
+
+    /// Makes `targets` the forwarded ports.
+    pub fn forward(&mut self, targets: &[crate::forward::Target]) {
+        if !cfg!(target_os = "linux") || self.forwards == targets {
+            return;
+        }
+        if nft(&crate::forward::script(TABLE, &self.wan, &self.tun, self.own_ports, targets)) {
+            log::info!("Gateway | {} ports forwarded", targets.len());
+            self.forwards = targets.to_vec();
+        }
     }
 
     /// Removes NAT, NDP proxies and their routes (on exit).

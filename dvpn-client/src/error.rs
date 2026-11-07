@@ -129,6 +129,8 @@ codes! {
     DelegateEnded = "delegate_ended",
     DelegateLimit = "delegate_limit",
     NoFreeAddr = "no_free_addr",
+    NoGateway = "no_gateway",
+    ForwardInvalid = "forward_invalid",
     ClockUntrusted = "clock_untrusted",
     MemberUnknown = "member_unknown",
     MemberAmbiguous = "member_ambiguous",

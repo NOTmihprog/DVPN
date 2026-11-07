@@ -183,7 +183,7 @@ join() { # join NAME ADDR [invite options]
 }
 join b 10.10.33.2 --route 2001:db8::50/128
 join c 10.10.33.3 --route 192.168.30.0/24
-printf '\n[gateway]\nwan = ["wan0"]\nndp_proxy = "wan0"\n' >> c/config.toml
+printf '\n[gateway]\nwan = ["wan0"]\nndp_proxy = "wan0"\nallow_remote = true\n' >> c/config.toml
 printf '\n[gateway]\nwan = ["up0"]\n' >> a/config.toml
 # B sends its internet traffic through C, or A if C is down (gateways by priority)
 "$D" --dir "$W/b" exit --v4 c,a --v6 c >/dev/null || fail "b: exit"
@@ -437,6 +437,52 @@ renewed() { ! "$D" --dir "$W/$1" group list | grep -q '(invite)'; }
 for n in b c; do wait_for 30 renewed $n || fail "$n still has its invite certificate"; done
 "$D" --dir "$W/a" group members | grep -q 'b .*10.10.33.2' || fail "a: b missing from group members"
 ok "invite certificates replaced by regular ones"
+
+# Port forwarding on gateway C (203.0.113.20), tested from the wan: by default the member sees
+# C's group address, with --keep-ip the client's, which B can take because C is its exit. An admin
+# can set rules for a gateway that allows it (allow_remote), a gateway that does not stays as it is.
+cat > whoami.py <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], int(sys.argv[2])))
+s.listen(8)
+while True:
+    c, a = s.accept()
+    c.sendall(a[0].encode())
+    c.close()
+PY
+cat > ask.py <<'PY'
+import socket, sys
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+print(s.recv(100).decode())
+PY
+bg whoami-a a python3 "$W/whoami.py" 10.10.33.1 7001
+bg whoami-b b python3 "$W/whoami.py" 10.10.33.2 7001
+asked() { nsx wan python3 "$W/ask.py" 203.0.113.20 "$1" 2>/dev/null; } # who the member saw
+sees() { [ "$(asked "$1")" = "$2" ]; }
+"$D" --dir "$W/c" forward add 8080 a --to-port 7001 >/dev/null || fail "c: forward add"
+"$D" --dir "$W/c" forward add 8081 b --to-port 7001 --keep-ip >/dev/null || fail "c: forward add --keep-ip"
+! "$D" --dir "$W/c" forward add 8080 b 2>/dev/null || fail "c: a port forwarded twice"
+grep -q '^\[\[gateway.forward\]\]' c/config.toml || fail "c: no [[gateway.forward]]"
+wait_for 20 sees 8080 10.10.33.3 || fail "forward to a: not through, or the client not hidden: '$(asked 8080)'"
+wait_for 20 sees 8081 203.0.113.1 || fail "forward to b: not through, or the client's address lost: '$(asked 8081)'"
+ok "forwarded ports: hidden behind the gateway, and with the client's address to a member using it"
+
+! "$D" --dir "$W/b" forward add 8082 a --on c 2>/dev/null || fail "b sets rules on c, not being an admin"
+! "$D" --dir "$W/a" forward add 9 nobody --on c 2>/dev/null || fail "a: forward to an unknown member"
+"$D" --dir "$W/a" forward add 8082 a --to-port 7001 --on c >/dev/null || fail "a: forward add --on c"
+"$D" --dir "$W/a" forward add 8083 c --on a --to-port 7001 >/dev/null || fail "a: forward add on its own gateway"
+nsx a nft list chain inet dvpn_gw fwd_pre | grep -q 8083 && "$D" --dir "$W/a" forward del 8083 >/dev/null
+wait_for 20 sees 8082 10.10.33.3 || fail "the admin's rule did not reach c: '$(asked 8082)'"
+"$D" --dir "$W/c" forward list | grep -q '8082.*admin' || fail "c: forward list"
+"$D" --dir "$W/a" forward del 8082 --on c >/dev/null || fail "a: forward del --on c"
+"$D" --dir "$W/c" forward del 8080 >/dev/null || fail "c: forward del"
+wait_for 20 sh -c "! ip netns exec wan python3 '$W/ask.py' 203.0.113.20 8082" || fail "the admin's rule is still there"
+wait_for 20 sh -c "! ip netns exec wan python3 '$W/ask.py' 203.0.113.20 8080" || fail "the removed rule is still there"
+sees 8081 203.0.113.1 || fail "forward to b lost with the others"
+"$D" --dir "$W/c" forward del 8081 >/dev/null
+ok "an admin forwards ports on a gateway that allows it, and rules go away again"
 
 # The admin changes members on the fly (new certificates in the group records): C gets one more
 # subnet, B a new address; everybody follows within seconds, B moves the address on its TUN.

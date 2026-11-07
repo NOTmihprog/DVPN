@@ -45,6 +45,8 @@ pub struct Inputs<'a> {
     /// `[dns] domain` if the node serves names, and `[exit] dns`.
     pub dns_domain: Option<&'a str>,
     pub dns_forward: &'a [IpAddr],
+    /// The ports forwarded on this gateway.
+    pub forwards: &'a [crate::forward::Forward],
 }
 
 /// What should be in place on this node.
@@ -71,6 +73,8 @@ pub struct Plan {
     /// Names of members for the DNS server, and where it forwards other names.
     pub zone: Zone,
     pub dns_upstream: Vec<IpAddr>,
+    /// Forwarded ports whose member is known.
+    pub forwards: Vec<crate::forward::Target>,
 }
 
 impl Plan {
@@ -104,6 +108,19 @@ fn public_v6(c: &Cert) -> impl Iterator<Item = std::net::Ipv6Addr> + '_ {
         IpNet::V6(n) if n.prefix_len() == 128 => Some(n.addr()),
         _ => None,
     })
+}
+
+/// The rules with the addresses of their members; the others wait for their member.
+fn forward_targets(i: &Inputs) -> Vec<crate::forward::Target> {
+    i.forwards
+        .iter()
+        .filter_map(|f| {
+            let named = |c: &&Cert| c.body.name == f.to || c.body.node.to_string() == f.to;
+            let c = i.members.values().filter(named).min_by_key(|c| c.body.node)?;
+            let (proto, port, to_port, keep_ip) = (f.proto, f.port, f.to_port, f.keep_ip);
+            Some(crate::forward::Target { proto, port, addr: c.body.ipv4()?, to_port, keep_ip })
+        })
+        .collect()
 }
 
 pub fn compute(i: &Inputs) -> Plan {
@@ -164,6 +181,7 @@ pub fn compute(i: &Inputs) -> Plan {
     let dns_upstream = if i.exit4.is_some() && i.dns_domain.is_some() { i.dns_forward.to_vec() } else { Vec::new() };
 
     Plan {
+        forwards: forward_targets(i),
         addrs,
         connected,
         ckr,
@@ -250,6 +268,7 @@ mod tests {
             acl: None,
             dns_domain: Some("dvpn"),
             dns_forward: &[],
+            forwards: &[],
         }
     }
 

@@ -11,6 +11,7 @@
 //! cert/<node>      Cert(cert)        a certificate an admin issued or renewed for `node`
 //! epoch            Epoch             psk epoch `epoch` is used from `active_from` on (PLAN §4.4, §5.2)
 //! epochkey/<node>  EpochKey          that epoch's psk, sealed to `node`'s key
+//! forward/<node>   Forward           the ports an admin forwards on gateway `node`
 //! ```
 //!
 //! The psk of a new epoch is sealed to each member separately (X25519 with the node key), so a
@@ -61,6 +62,11 @@ pub enum Body {
     },
     /// The group's access rules (PLAN §7.4).
     Acl(Box<crate::acl::Acl>),
+    /// The ports an admin forwards on gateway `node`, if it allows that (`forward.rs`).
+    Forward {
+        node: NodeId,
+        rules: Vec<crate::forward::Forward>,
+    },
 }
 
 impl Body {
@@ -71,6 +77,7 @@ impl Body {
             Body::Epoch { .. } => "epoch".into(),
             Body::EpochKey { node, .. } => format!("epochkey/{node}"),
             Body::Acl(_) => "acl".into(),
+            Body::Forward { node, .. } => format!("forward/{node}"),
         }
     }
 }
@@ -176,7 +183,11 @@ impl Record {
             && match &e.body {
                 // signed by the group anyway, but must be a valid certificate of this group
                 Body::Cert(c) => c.verify(&e.group, None).is_ok(),
-                Body::Revoke { .. } | Body::Epoch { .. } | Body::EpochKey { .. } | Body::Acl(_) => true,
+                Body::Revoke { .. }
+                | Body::Epoch { .. }
+                | Body::EpochKey { .. }
+                | Body::Acl(_)
+                | Body::Forward { .. } => true,
             };
         if !consistent {
             return Err(RecordError::Inconsistent);
@@ -392,6 +403,16 @@ impl StateStore {
             Body::Acl(a) => Some((**a).clone()),
             _ => None,
         })
+    }
+
+    /// The ports an admin forwards on gateway `node`.
+    pub fn forwards(&self, group: &GroupId, node: &NodeId) -> Vec<crate::forward::Forward> {
+        let inner = self.inner.lock();
+        let key = record_key(group, &format!("forward/{node}"));
+        match inner.groups.get(group).and_then(|r| r.get(&key)).map(|s| &s.entry) {
+            Some(Entry { body: Body::Forward { rules, .. }, deleted: false, .. }) => rules.clone(),
+            _ => Vec::new(),
+        }
     }
 
     /// The newest psk epoch and its switch time (unix ms), if one was announced.

@@ -9,6 +9,7 @@ use rand::RngExt;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::crypto::{decode_b64, decode_key32, encode_b64};
+use crate::forward::{Forward, Proto};
 use crate::group::{Cert, Delegate, GroupId, GroupSecret, IssuedDelegation, StaticRef, TrackerRef};
 use crate::identity::Identity;
 use crate::obfs::{MAX_PAD, MAX_WIRE, Profile, Template};
@@ -384,6 +385,75 @@ pub struct GatewayConfig {
     pub wan: Vec<String>,
     pub ndp_proxy: Option<String>,
     pub manage_sysctl: bool,
+    /// `[[gateway.forward]]`: ports of `wan` that lead to members.
+    pub forward: Vec<Forward>,
+    /// Admins may forward ports here too (the record `forward/<this node>`).
+    pub allow_remote: bool,
+}
+
+fn parse_forward(t: &Table) -> anyhow::Result<Forward> {
+    let port_of = |k: &str| -> anyhow::Result<Option<u16>> {
+        t.get(k)
+            .map(|v| v.as_integer().and_then(|p| u16::try_from(p).ok()).ok_or_else(|| anyhow!("{k}: a port number")))
+            .transpose()
+    };
+    for (k, _) in t.iter() {
+        if !["proto", "port", "to", "to_port", "keep_ip"].contains(&k) {
+            bail!("unknown key {k}");
+        }
+    }
+    let port = port_of("port")?.ok_or_else(|| anyhow!("port not found"))?;
+    let proto = match t.get("proto") {
+        Some(_) => Proto::parse(get_str(t, "proto")?).ok_or_else(|| anyhow!("proto: tcp, udp or both"))?,
+        None => Proto::Tcp,
+    };
+    let keep_ip = match t.get("keep_ip") {
+        Some(v) => v.as_bool().ok_or_else(|| anyhow!("keep_ip: expected true or false"))?,
+        None => false,
+    };
+    Ok(Forward { proto, port, to: get_str(t, "to")?.to_owned(), to_port: port_of("to_port")?.unwrap_or(port), keep_ip })
+}
+
+fn parse_forwards(t: &dyn toml_edit::TableLike) -> anyhow::Result<Vec<Forward>> {
+    let Some(item) = t.get("forward") else { return Ok(Vec::new()) };
+    let arr = item.as_array_of_tables().ok_or_else(|| anyhow!("forward: expected [[gateway.forward]]"))?;
+    let rules: Vec<Forward> = arr.iter().map(parse_forward).collect::<anyhow::Result<_>>().context("forward")?;
+    crate::forward::check(&rules).map_err(|e| anyhow!("forward: {e}"))?;
+    Ok(rules)
+}
+
+/// Writes `[[gateway.forward]]` to a config file, which must have a `[gateway]`.
+pub fn write_forwards(path: &Path, rules: &[Forward]) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut doc: DocumentMut = text.parse().with_context(|| format!("parse {}", path.display()))?;
+    let gw =
+        doc.get_mut("gateway").and_then(Item::as_table_mut).ok_or_else(|| anyhow!("this node has no [gateway]"))?;
+    gw.remove("forward");
+    if !rules.is_empty() {
+        let mut arr = toml_edit::ArrayOfTables::new();
+        for r in rules {
+            let mut t = Table::new();
+            t["proto"] = value(r.proto.as_str());
+            t["port"] = value(i64::from(r.port));
+            t["to"] = value(r.to.as_str());
+            t["to_port"] = value(i64::from(r.to_port));
+            if r.keep_ip {
+                t["keep_ip"] = value(true);
+            }
+            arr.push(t);
+        }
+        gw.insert("forward", Item::ArrayOfTables(arr));
+    }
+    write_private(path, &doc.to_string()).with_context(|| format!("write {}", path.display()))
+}
+
+/// Reads only `[[gateway.forward]]` from a config file: a running node follows changes to it.
+pub fn read_forwards(path: &Path) -> anyhow::Result<Vec<Forward>> {
+    let doc: DocumentMut = std::fs::read_to_string(path)?.parse()?;
+    match doc.get("gateway") {
+        Some(item) => parse_forwards(item.as_table_like().ok_or_else(|| anyhow!("[gateway] is not a table"))?),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn parse_gateway(t: &Table) -> anyhow::Result<GatewayConfig> {
@@ -408,11 +478,15 @@ fn parse_gateway(t: &Table) -> anyhow::Result<GatewayConfig> {
         None => true,
     };
     for (k, _) in t.iter() {
-        if !["wan", "ndp_proxy", "manage_sysctl"].contains(&k) {
+        if !["wan", "ndp_proxy", "manage_sysctl", "forward", "allow_remote"].contains(&k) {
             bail!("unknown key {k}");
         }
     }
-    Ok(GatewayConfig { wan, ndp_proxy, manage_sysctl })
+    let allow_remote = match t.get("allow_remote") {
+        Some(v) => v.as_bool().ok_or_else(|| anyhow!("allow_remote: expected true or false"))?,
+        None => false,
+    };
+    Ok(GatewayConfig { wan, ndp_proxy, manage_sysctl, forward: parse_forwards(t)?, allow_remote })
 }
 
 /// `[dns]`: `enable`, `domain` (default "dvpn"), `manage_resolved` (split DNS via systemd-resolved).
@@ -1049,6 +1123,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn forwards_in_the_config() {
+        let dir =
+            std::env::temp_dir().join(format!("dvpn-conf-test-{}", encode_b64(&crate::crypto::random_bytes::<9>())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let rule = Forward { proto: Proto::Both, port: 8080, to: "server".into(), to_port: 80, keep_ip: true };
+        std::fs::write(&path, "[peer]\n").unwrap();
+        assert!(write_forwards(&path, std::slice::from_ref(&rule)).unwrap_err().to_string().contains("[gateway]"));
+        assert_eq!(read_forwards(&path).unwrap(), vec![]);
+
+        std::fs::write(&path, "[gateway]\nwan = [\"eth0\"] # the uplink\nallow_remote = true\n").unwrap();
+        write_forwards(&path, std::slice::from_ref(&rule)).unwrap();
+        assert_eq!(read_forwards(&path).unwrap(), vec![rule.clone()]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# the uplink") && text.contains("[[gateway.forward]]"), "{text}");
+        let doc: DocumentMut = text.parse().unwrap();
+        let gw = parse_gateway(doc["gateway"].as_table().unwrap()).unwrap();
+        assert_eq!((gw.forward, gw.allow_remote), (vec![rule], true));
+        write_forwards(&path, &[]).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("forward"));
+
+        let bad = |s: &str| {
+            let t = format!("[gateway]\nwan = [\"e\"]\n[[gateway.forward]]\n{s}\n");
+            parse_gateway(t.parse::<DocumentMut>().unwrap()["gateway"].as_table().unwrap()).is_err()
+        };
+        assert!(!bad("port = 80\nto = \"a\""), "tcp and the same port by default");
+        assert!(bad("to = \"a\""));
+        assert!(bad("port = 70000\nto = \"a\""));
+        assert!(bad("port = 80"));
+        assert!(bad("port = 80\nto = \"a\"\nproto = \"icmp\""));
+        assert!(bad("port = 80\nto = \"a\"\nnope = 1"));
+        assert!(bad("port = 80\nto = \"a\"\n[[gateway.forward]]\nport = 80\nto = \"b\""));
+    }
+
+    #[test]
     fn dns_domains() {
         let parse = |d: &str| {
             let t = format!("domain = {}", toml_edit::Value::from(d));
@@ -1316,7 +1425,13 @@ mod tests {
         let c = with_group("[gateway]\nwan = [\"eth0\"]\nndp_proxy = \"eth0\"\n").unwrap();
         assert_eq!(
             c.gateway,
-            Some(GatewayConfig { wan: vec!["eth0".into()], ndp_proxy: Some("eth0".into()), manage_sysctl: true })
+            Some(GatewayConfig {
+                wan: vec!["eth0".into()],
+                ndp_proxy: Some("eth0".into()),
+                manage_sysctl: true,
+                forward: Vec::new(),
+                allow_remote: false,
+            })
         );
         assert!(with_group("[gateway]\n").is_err(), "wan is required");
         assert!(with_group("[gateway]\nwan = [\"eth0\"]\nnat = true\n").is_err());

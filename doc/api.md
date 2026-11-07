@@ -102,6 +102,7 @@ UDP `127.0.0.1:9902`.
 | `member_unknown`, `member_ambiguous`, `member_not_seen` | участник не найден, имя подходит нескольким, сертификата ещё нет |
 | `addr_taken`, `addr_invalid`, `route_invalid`, `endpoint_invalid`, `no_address`, `config_read` | `set invite`, `set node` |
 | `revoke_self`, `acl_parse` | `set revoke`, `set acl` |
+| `no_gateway`, `forward_invalid` | `set forward`: у узла нет `[gateway]`; правила противоречат друг другу или их слишком много |
 | `delegate_ended`, `delegate_limit`, `no_free_addr` | `set invite`: право приглашать забрали или оно истекло; relay или подсеть вне прав делегата; нет свободных адресов |
 
 Узлы везде обозначаются полем `key` — публичным ключом узла (base64url). В запросах можно передать однозначное
@@ -288,6 +289,24 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 Поля, которых нет, не меняются. Ошибки: `gateway_unknown` (не ключ и не имя ровно одного участника, или
 исключённый), `gateway_self`, `dns_invalid`, `sources_invalid`, `table_invalid` (0, 253–255 и таблица DVPN
 заняты), `bad_param`, `config_write` (не удалось записать `config.toml`). При ошибке ничего не меняется.
+
+### get / set forward
+
+Проброс портов шлюза ([exit.md](exit.md#проброс-портов-dvpn-forward)), то же, что `dvpn forward`.
+
+```
+{"type": "get", "id": 8, "req": "forward"}                  # "on": "vps1" — что админ задал для шлюза
+→ {"allow_remote": true,
+   "local": [{"proto": "tcp", "port": 8080, "to": "server", "name": null, "to_port": 80, "keep_ip": false}],
+   "remote": [{"proto": "udp", "port": 53, "to": "<ключ>", "name": "dns", "to_port": 53, "keep_ip": true}]}
+
+{"type": "set", "id": 9, "req": "forward", "rules": [...]}   # список целиком заменяет старый
+```
+
+Без `on` правила пишутся в `[[gateway.forward]]` этого узла и сразу применяются (`no_gateway`, если у узла нет
+`[gateway]`). С `on` — запись группы для этого шлюза: нужен секрет группы (`not_admin`), шлюз применит правила, если
+у него `allow_remote`. Участник в `to` — имя или ключ (`member_unknown`, `member_ambiguous`). Ошибки правил —
+`forward_invalid`.
 
 ### Операции админа
 

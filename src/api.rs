@@ -1580,6 +1580,89 @@ impl Api {
         Ok(self.exit_info())
     }
 
+    /// `on`: the gateway a forward request is about, if not this node.
+    fn forward_on(&self, p: &Value) -> Result<Option<NodeId>, ApiError> {
+        let Some(v) = field(p, "on") else { return Ok(None) };
+        let s = v.as_str().ok_or_else(|| bad_param("on", "a member key or name"))?;
+        let id = crate::ops::find_member(&self.node.member_certs(), s).map_err(op_error)?;
+        Ok(Some(id).filter(|i| *i != self.node.storage.self_id()))
+    }
+
+    /// `get forward`: the ports forwarded on this node, or what admins set for gateway `on`.
+    fn forward_info(&self, p: &Value) -> Reply {
+        let n = &self.node;
+        let names = self.names();
+        let rules = |l: &[crate::forward::Forward]| {
+            Value::Array(
+                l.iter()
+                    .map(|r| {
+                        let name = r.to.parse().ok().and_then(|k: NodeId| names.get(&k).cloned());
+                        map(vec![
+                            ("proto", r.proto.as_str().into()),
+                            ("port", r.port.into()),
+                            ("to", r.to.as_str().into()),
+                            ("name", opt_str(name)),
+                            ("to_port", r.to_port.into()),
+                            ("keep_ip", r.keep_ip.into()),
+                        ])
+                    })
+                    .collect(),
+            )
+        };
+        let (local, remote, allow) = match self.forward_on(p)? {
+            Some(on) => (Vec::new(), n.group_store().forwards(&n.group_id(), &on), false),
+            None => {
+                let (local, remote) = n.forward_rules();
+                (local, remote, n.allows_remote_forwards())
+            }
+        };
+        Ok(map(vec![("allow_remote", allow.into()), ("local", rules(&local)), ("remote", rules(&remote))]))
+    }
+
+    /// `set forward`: makes `rules` the ports forwarded on this node (`[[gateway.forward]]`), or
+    /// with `on` the ones admins set for that gateway. Answers like `get forward`.
+    async fn set_forward(&self, p: &Value) -> Reply {
+        use crate::forward::{Forward, Proto};
+        let list = field(p, "rules").and_then(Value::as_array).ok_or_else(|| bad_param("rules", "a list of rules"))?;
+        let port = |v: &Value, k: &str| field(v, k).and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
+        let mut rules = Vec::new();
+        for r in list {
+            let number = port(r, "port").ok_or_else(|| bad_param("port", "a port number"))?;
+            rules.push(Forward {
+                proto: match field(r, "proto") {
+                    None => Proto::Tcp,
+                    Some(v) => {
+                        v.as_str().and_then(Proto::parse).ok_or_else(|| bad_param("proto", "tcp, udp or both"))?
+                    }
+                },
+                port: number,
+                to: field(r, "to").and_then(Value::as_str).ok_or_else(|| bad_param("to", "a member"))?.to_owned(),
+                to_port: match field(r, "to_port") {
+                    None => number,
+                    Some(_) => port(r, "to_port").ok_or_else(|| bad_param("to_port", "a port number"))?,
+                },
+                keep_ip: bool_arg(r, "keep_ip")?.unwrap_or(false),
+            });
+        }
+        let certs = self.node.member_certs();
+        match self.forward_on(p)? {
+            Some(on) => {
+                let secret = self.secret()?;
+                let entry =
+                    crate::ops::set_forwards(secret, self.node.group_store(), &certs, on, rules).map_err(op_error)?;
+                self.node.publish(&[entry]).await;
+            }
+            None => {
+                crate::forward::check(&rules).map_err(|e| ApiError::new("forward_invalid", e))?;
+                for r in &rules {
+                    crate::ops::find_member(&certs, &r.to).map_err(op_error)?;
+                }
+                self.node.set_forwards(&rules).map_err(|e| ApiError::new("no_gateway", format!("{e:#}")))?;
+            }
+        }
+        self.forward_info(p)
+    }
+
     /// `get acl`: the group's access rules, as TOML (`dvpn acl show`) and taken apart.
     fn acl_info(&self) -> Value {
         use crate::acl::{Proto, Who};
@@ -1949,6 +2032,7 @@ impl Api {
                 other => other,
             },
             "exit" => self.exit_info(),
+            "forward" => self.forward_info(p)?,
             "acl" => self.acl_info(),
             // nil: no path known now (not an error)
             "path" => match self.node.path(&self.peer_arg(p)?) {
@@ -1967,6 +2051,7 @@ impl Api {
         match field(p, "req").and_then(Value::as_str) {
             Some("peer") => self.set_peer(p),
             Some("exit") => self.set_exit(p),
+            Some("forward") => self.set_forward(p).await,
             Some("invite") => self.set_invite(p),
             Some("node") => self.set_node(p).await,
             Some("revoke") => self.set_revoke(p).await,
@@ -2163,6 +2248,8 @@ mod tests {
             resolved_tun: None,
             tun_dns: false,
             exits: Default::default(),
+            forwards: Vec::new(),
+            allow_remote: false,
             config_path: test_config(&identity, admin.then_some(&secret), &cert),
         };
         let node = Node::new(storage, transport, (links, e2e), Vec::new(), None, cert.body.ipv4(), ctx);

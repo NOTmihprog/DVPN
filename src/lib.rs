@@ -13,6 +13,7 @@ pub mod crypto;
 pub mod dns;
 pub mod elligator;
 pub mod exit;
+pub mod forward;
 pub mod gateway;
 pub mod group;
 pub mod identity;

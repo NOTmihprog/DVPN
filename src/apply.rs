@@ -72,6 +72,7 @@ impl System {
         if let Some(gw) = self.gateway.as_mut() {
             // also when members did not change: the gateway's own prefix may have come since
             gw.apply(&new.member_prefixes);
+            gw.forward(&new.forwards);
         }
         if self.tun.is_some() {
             let chain = new.acl.as_ref().and_then(|a| a.render(me, &new.members.clone().into_iter().collect()));

@@ -66,6 +66,9 @@ enum Command {
     /// Access rules inside the group (admins set them; every node enforces them)
     #[command(subcommand)]
     Acl(AclCommand),
+    /// Ports of this gateway, or of another one with --on, that lead to members
+    #[command(subcommand)]
+    Forward(ForwardCommand),
     /// The running node: key, group, addresses, trackers, gateway (asks its API)
     Status,
     /// Direct neighbours of the running node: endpoint, RTT, session
@@ -146,6 +149,46 @@ enum ServiceCommand {
     /// What the service manager runs (not by hand)
     #[command(hide = true)]
     Run,
+}
+
+#[derive(Subcommand)]
+enum ForwardCommand {
+    /// The ports forwarded here, or set by admins for a gateway
+    List {
+        /// The gateway, if not this node
+        #[arg(long, value_name = "MEMBER")]
+        on: Option<String>,
+    },
+    /// Forward a port to a member; a running node follows within seconds
+    Add {
+        /// The port on the gateway
+        port: u16,
+        /// The member: name or key
+        to: String,
+        /// The port on the member (default: the same)
+        #[arg(long)]
+        to_port: Option<u16>,
+        /// tcp, udp or both
+        #[arg(long, default_value = "tcp")]
+        proto: String,
+        /// The member sees the client's address: needs this gateway as its exit
+        #[arg(long)]
+        keep_ip: bool,
+        /// Another gateway (admins only; it must have allow_remote)
+        #[arg(long, value_name = "MEMBER")]
+        on: Option<String>,
+    },
+    /// Stop forwarding a port
+    Del {
+        /// The port on the gateway
+        port: u16,
+        /// tcp, udp or both
+        #[arg(long, default_value = "both")]
+        proto: String,
+        /// Another gateway (admins only)
+        #[arg(long, value_name = "MEMBER")]
+        on: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -492,6 +535,84 @@ fn human_bytes(n: u64) -> String {
         u += 1;
     }
     if u == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
+fn cmd_forward(conf: &Config, dir: &Path, cmd: ForwardCommand) {
+    use dvpn::forward::{Forward, Proto};
+    let proto_arg = |s: &str| Proto::parse(s).unwrap_or_else(|| die("--proto: tcp, udp or both"));
+    let on = match &cmd {
+        ForwardCommand::List { on } | ForwardCommand::Add { on, .. } | ForwardCommand::Del { on, .. } => on.clone(),
+    };
+    let store = StateStore::open(dir.join(STATE_FILE_NAME));
+    let group = conf.groups.first();
+    let certs = group.map_or_else(Vec::new, |g| member_certs(conf, g, &store));
+    let me = conf.identity.id();
+    // the gateway, unless it is this node
+    let gateway = on.map(|s| ops::find_member(&certs, &s).unwrap_or_else(|e| die(e))).filter(|k| *k != me);
+    let remote_of = |k: &dvpn::identity::NodeId| group.map_or_else(Vec::new, |g| store.forwards(&g.id, k));
+    let local = || match config::read_forwards(conf.path()) {
+        Ok(l) => l,
+        Err(e) => die(format!("{e:#}")),
+    };
+    let mut rules = match gateway {
+        Some(k) => remote_of(&k),
+        None => local(),
+    };
+    match cmd {
+        ForwardCommand::List { .. } => {
+            let name = |to: &str| {
+                certs.iter().find(|c| c.body.node.to_string() == to).map_or(to.to_owned(), |c| c.body.name.clone())
+            };
+            let row = |r: &Forward, from: &str| {
+                vec![
+                    r.proto.as_str().to_owned(),
+                    r.port.to_string(),
+                    format!("{}:{}", name(&r.to), r.to_port),
+                    yes_no(r.keep_ip).to_owned(),
+                    from.to_owned(),
+                ]
+            };
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            match gateway {
+                Some(_) => rows.extend(rules.iter().map(|r| row(r, "admin"))),
+                None => {
+                    rows.extend(rules.iter().map(|r| row(r, "config")));
+                    let allowed = conf.gateway.as_ref().is_some_and(|g| g.allow_remote);
+                    let from = if allowed { "admin" } else { "admin (not allowed here)" };
+                    rows.extend(remote_of(&me).iter().map(|r| row(r, from)));
+                }
+            }
+            println!("\n{}\n", github_table(&["Proto", "Port", "To", "Keeps IP", "From"], &rows));
+            return;
+        }
+        ForwardCommand::Add { port, to, to_port, proto, keep_ip, .. } => {
+            // this node's rules name members as the running node knows them, not all are on disk
+            let proto = proto_arg(&proto);
+            rules.push(Forward { proto, port, to, to_port: to_port.unwrap_or(port), keep_ip });
+        }
+        ForwardCommand::Del { port, proto, .. } => {
+            let proto = proto_arg(&proto);
+            let before = rules.len();
+            rules.retain(|r| r.port != port || !r.proto.overlaps(proto));
+            if rules.len() == before {
+                die(format!("port {port} is not forwarded"));
+            }
+        }
+    }
+    dvpn::forward::check(&rules).unwrap_or_else(|e| die(e));
+    match gateway {
+        Some(k) => {
+            let g = group.unwrap_or_else(|| die("this node is in no group"));
+            let secret = ops::admin_secret(g).unwrap_or_else(|e| die(e));
+            ops::set_forwards(secret, &store, &certs, k, rules).unwrap_or_else(|e| die(e));
+            store.save();
+            println!("A running node of this admin spreads it within seconds; the gateway needs allow_remote.");
+        }
+        None => {
+            config::write_forwards(conf.path(), &rules).unwrap_or_else(|e| die(format!("{e:#}")));
+            println!("A running node follows within seconds.");
+        }
+    }
 }
 
 fn cmd_acl(conf: &Config, dir: &Path, cmd: AclCommand) {
@@ -1050,6 +1171,7 @@ fn main() {
         Some(Command::Group(cmd)) => cmd_group(&mut conf, &dir, cmd),
         Some(Command::Node(cmd)) => cmd_node(&mut conf, &dir, cmd),
         Some(Command::Acl(cmd)) => cmd_acl(&conf, &dir, cmd),
+        Some(Command::Forward(cmd)) => cmd_forward(&conf, &dir, cmd),
         Some(Command::Status) => {
             let c = api_client(&rt, &conf, cli.api_addr);
             let s = ask(&rt, c.status());

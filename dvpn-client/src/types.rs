@@ -332,6 +332,34 @@ pub struct ExitUpdate {
     pub table: Option<Option<u32>>,
 }
 
+/// One forwarded port of a gateway.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct ForwardRule {
+    /// `tcp`, `udp` or `both`.
+    pub proto: String,
+    /// The port on the gateway.
+    pub port: u16,
+    /// The member: name or key.
+    pub to: String,
+    /// The member's name, when `to` is a key of a known one.
+    #[serde(default)]
+    pub name: Option<String>,
+    pub to_port: u16,
+    /// The member sees the client's address (needs this gateway as its exit).
+    pub keep_ip: bool,
+}
+
+/// `get forward`: the ports forwarded on a gateway.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct Forwards {
+    /// An admin's rules are applied on this node.
+    pub allow_remote: bool,
+    /// `[[gateway.forward]]` of this node.
+    pub local: Vec<ForwardRule>,
+    /// Set by admins (with `on`: for that gateway).
+    pub remote: Vec<ForwardRule>,
+}
+
 /// `get acl`: the group's access rules.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Acl {

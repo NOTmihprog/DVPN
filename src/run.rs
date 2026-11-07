@@ -209,6 +209,8 @@ pub async fn start(mut conf: Config, dir: &Path, opts: Options) -> anyhow::Resul
         statics: conf.static_peers.clone(),
         routes: conf.remote_subnets.clone(),
         exits: conf.exits.clone(),
+        forwards: conf.gateway.as_ref().map_or_else(Vec::new, |g| g.forward.clone()),
+        allow_remote: conf.gateway.as_ref().is_some_and(|g| g.allow_remote),
         tun_prefix: conf.net.as_ref().map_or(24, |n| n.prefix),
         group_name: group.name.clone(),
         dns: dns.clone(),
@@ -246,7 +248,8 @@ pub async fn start(mut conf: Config, dir: &Path, opts: Options) -> anyhow::Resul
         if let (Some(gw), Some(net)) = (&conf.gateway, &conf.net) {
             let ula = crate::ckr::ula_prefix(&group.id);
             let g = tokio::task::block_in_place(|| {
-                crate::gateway::Gateway::start(&net.tun_name, &gw.wan, gw.ndp_proxy.clone(), ula, gw.manage_sysctl)
+                let opts = crate::gateway::Options { manage_sysctl: gw.manage_sysctl, own_ports: conf.peer.port_range };
+                crate::gateway::Gateway::start(&net.tun_name, &gw.wan, gw.ndp_proxy.clone(), ula, opts)
             });
             node.set_gateway(g);
         }
