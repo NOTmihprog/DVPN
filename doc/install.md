@@ -2,45 +2,102 @@
 
 [← к содержанию](../README.md#документация)
 
-1. [Установщик](#установщик)
-2. [Сборка](#сборка)
-3. [Установка узла на Linux](#установка-узла-на-linux)
-4. [Служба узла (systemd)](#служба-узла-systemd)
-5. [Сервер обнаружения как служба](#сервер-обнаружения-как-служба)
-6. [Файрвол](#файрвол)
-7. [Каталог данных](#каталог-данных)
-8. [Обновление и удаление](#обновление-и-удаление)
-9. [Windows](#windows)
+1. [Три способа](#три-способа)
+2. [Установщик](#установщик)
+3. [Готовые сборки вручную](#готовые-сборки-вручную)
+4. [Сборка из исходников](#сборка-из-исходников)
+5. [Установка узла на Linux](#установка-узла-на-linux)
+6. [Служба узла (systemd)](#служба-узла-systemd)
+7. [Сервер обнаружения как служба](#сервер-обнаружения-как-служба)
+8. [Файрвол](#файрвол)
+9. [Каталог данных](#каталог-данных)
+10. [Обновление и удаление](#обновление-и-удаление)
+11. [Windows](#windows)
 
-Один бинарник `dvpn` — это и узел, и сервер обнаружения, и все команды управления. Готовые сборки — на странице
-[релизов](https://git.mihprog.com/DVPN/DVPN/releases): статические `dvpn-linux-amd64` и `dvpn-linux-arm64`
-(работают на любом Linux) и `dvpn-windows-amd64.zip` (`dvpn.exe` вместе с `wintun.dll`); суммы — в `SHA256SUMS`.
-Их собирает CI из тега `vX.Y.Z` ([release.yml](../.gitea/workflows/release.yml)) и подписывает `SHA256SUMS` ключом
-ed25519 (`SHA256SUMS.sig`, [sign.sh](../.gitea/sign.sh)). Ниже — установщик, затем сборка из исходников и установка
-вручную.
+Один бинарник `dvpn` — это и узел, и сервер обнаружения, и все команды управления.
+
+## Три способа
+
+| Способ | Кому | Что делать |
+|---|---|---|
+| [Установщик](#установщик) | почти всем: Linux и Windows, рабочий стол и серверы | запустить, отметить нужное, вставить invite; дальше он обновляет сам |
+| [Готовые сборки вручную](#готовые-сборки-вручную) | своя раскладка, свои юниты, системы без systemd | скачать бинарник, проверить, [разложить](#установка-узла-на-linux) и [оформить службой](#служба-узла-systemd) |
+| [Сборка из исходников](#сборка-из-исходников) | другая архитектура, свои изменения, разработка | собрать `cargo build --release`, дальше как с готовой сборкой |
+
+Все три дают одну и ту же раскладку (`/opt/dvpn`, `dvpn.service`), так что способ можно сменить: например, поставить
+установщиком поверх ручной установки — свой `dvpn.service` он оставит. Ключ узла и группы живут в `config.toml` и
+`state.bin` и при этом не теряются.
 
 ## Установщик
 
 [dvpn-installer](https://git.mihprog.com/DVPN/DVPN-installer) ставит всё описанное ниже сам — на Linux и Windows: узел
 (службой или без), по выбору TUI, GUI и сервер обнаружения (Linux), вход в группу по invite, ежедневное
 автообновление; обновляет и удаляет. Он ставит только файлы, чьи суммы подписаны ключом релизов, и возвращает узел на
-прежнюю версию, если новая не запустилась.
+прежнюю версию, если новая не запустилась. Файлы — на странице
+[релизов установщика](https://git.mihprog.com/DVPN/DVPN-installer/releases).
 
-* **С окном** — `dvpn-installer-windows-amd64.exe`, `dvpn-installer-gui-linux-amd64` (права спросит сам: UAC или
-  `pkexec`).
-* **Сервер, любой Linux** — статические `dvpn-installer-linux-amd64` / `-arm64`:
+* **С окном** — `dvpn-installer-windows-amd64.exe`, `dvpn-installer-gui-linux-amd64` (glibc из Ubuntu 24.04 и
+  новее). Запустите без аргументов, отметьте компоненты, вставьте invite и нажмите «Установить»; права он спросит сам
+  (UAC или `pkexec`). Windows SmartScreen может предупредить о неизвестном издателе: «Подробнее» → «Выполнить в любом
+  случае».
+* **Без окна, любой Linux** — статические `dvpn-installer-linux-amd64` / `-arm64`:
 
 ```shell
+chmod +x dvpn-installer-linux-amd64
 sudo ./dvpn-installer-linux-amd64 install --tui --auto-update --invite-file invite.txt
+sudo ./dvpn-installer-linux-amd64 install --server --auto-update        # VPS: сервер обнаружения
+sudo dvpn-installer status
 sudo dvpn-installer update            # или --check
 sudo dvpn-installer uninstall         # ключ и группа остаются; всё — --purge
 ```
+
+После установки сам установщик лежит в `/usr/local/bin/dvpn-installer` (Windows — в `%ProgramFiles%\DVPN`). Узел без
+invite он настраивает, но не запускает: узел без группы не работает. После `dvpn group create` или `group join` —
+`sudo systemctl start dvpn`.
 
 Раскладка — та же, что ниже: `/opt/dvpn`, ссылка `/usr/local/bin/dvpn`, юниты `dvpn.service`, `dvpn-server.service`
 (со своей копией бинарника в `/opt/dvpn-server`), `dvpn-update.timer`; юниты, написанные не установщиком, он не
 трогает. Подробно — [README установщика](https://git.mihprog.com/DVPN/DVPN-installer#readme).
 
-## Сборка
+## Готовые сборки вручную
+
+Файлы — на странице [релизов](https://git.mihprog.com/DVPN/DVPN/releases):
+
+| Файл | Где |
+|---|---|
+| `dvpn-linux-amd64`, `dvpn-linux-arm64` | любой Linux x86_64 / ARM64, статические |
+| `dvpn-windows-amd64.zip` | Windows 10/11: `dvpn.exe` вместе с `wintun.dll` ([ниже](#windows)) |
+
+Их собирает CI из тега `vX.Y.Z` ([release.yml](../.gitea/workflows/release.yml)). Проверьте файл по суммам:
+
+```shell
+V=v4.3.1; B=https://git.mihprog.com/DVPN/DVPN/releases/download/$V
+curl -fLO $B/dvpn-linux-amd64 -fLO $B/SHA256SUMS -fLO $B/SHA256SUMS.sig
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+`SHA256SUMS` подписан ключом ed25519 релизов ([sign.sh](../.gitea/sign.sh)). Подписано не только содержимое, но и
+репозиторий с тегом: `dvpn-release\n<владелец/репозиторий>\n<тег>\n` + `SHA256SUMS`. Проверить подпись можно
+OpenSSL 3:
+
+```shell
+cat > dvpn-release.pem <<'KEY'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAc6RLjUx1WIc6ANCfEkMzLX/pqMt2VK3Q0w9C23yqnds=
+-----END PUBLIC KEY-----
+KEY
+{ printf 'dvpn-release\nDVPN/DVPN\n%s\n' "$V"; cat SHA256SUMS; } > signed.txt
+openssl pkeyutl -verify -pubin -inkey dvpn-release.pem -rawin -in signed.txt -sigfile SHA256SUMS.sig
+# Signature Verified Successfully
+```
+
+Это тот же ключ, что вшит в установщик (`dvpn-installer release-keys` печатает его в hex:
+`73a44b8d…9ddb`). Дальше — [установка узла на Linux](#установка-узла-на-linux) с `dvpn-linux-amd64` вместо
+`target/release/dvpn`, или [Windows](#windows).
+
+## Сборка из исходников
+
+Для другой архитектуры, своих изменений или если не хочется доверять готовым файлам.
 
 ### Зависимости
 
@@ -110,7 +167,7 @@ cargo build --release --target x86_64-pc-windows-gnu   # нужен mingw-w64
 
 ```shell
 sudo install -d -m 700 /opt/dvpn
-sudo install -m 755 target/release/dvpn /opt/dvpn/dvpn
+sudo install -m 755 dvpn-linux-amd64 /opt/dvpn/dvpn          # или target/release/dvpn
 sudo ln -sf /opt/dvpn/dvpn /usr/local/bin/dvpn
 ```
 
@@ -316,23 +373,27 @@ sudo nft add rule inet filter input udp dport 6485 accept  # nftables (своя 
 
 ## Обновление и удаление
 
-**Обновление:**
+**Обновление.** Если DVPN поставлен [установщиком](#установщик) — `sudo dvpn-installer update` (или
+`dvpn-installer auto-update on`). Вручную — скачайте и [проверьте](#готовые-сборки-вручную) новый
+`dvpn-linux-amd64` или соберите заново (`cd DVPN && git pull && cargo build --release`), затем:
 
 ```shell
-cd DVPN && git pull && cargo build --release
 sudo systemctl stop dvpn
-sudo install -m 755 target/release/dvpn /opt/dvpn/dvpn
+sudo install -m 755 dvpn-linux-amd64 /opt/dvpn/dvpn       # или target/release/dvpn
 sudo systemctl start dvpn
+# если сервер обнаружения — служба:
+sudo install -m 755 /opt/dvpn/dvpn /opt/dvpn-server/dvpn && sudo systemctl restart dvpn-server
 ```
 
 Ключи, группа и записи хранятся в `config.toml` и `state.bin` и при обновлении не меняются. Переход с 3.x —
 [migration.md](migration.md).
 
-**Удаление:**
+**Удаление.** Поставленное установщиком — `sudo dvpn-installer uninstall` (с `--purge` — вместе с ключами). Вручную:
 
 ```shell
 sudo systemctl disable --now dvpn dvpn-server
 sudo rm /etc/systemd/system/dvpn.service /etc/systemd/system/dvpn-server.service /usr/local/bin/dvpn
+sudo rm -r /opt/dvpn-server
 sudo systemctl daemon-reload
 sudo rm -r /opt/dvpn            # вместе с ключами! у админа — сначала group backup
 ```

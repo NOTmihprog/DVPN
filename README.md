@@ -61,7 +61,7 @@ ping alice.dvpn
 
 | Раздел | О чём |
 |---|---|
-| [Установка](doc/install.md) | установщик (с автообновлением), сборка, права, Windows, файлы, запуск как службы |
+| [Установка](doc/install.md) | три способа: установщик (с автообновлением), готовые сборки, сборка из исходников; права, Windows, файлы, служба |
 | [Быстрый старт](doc/quickstart.md) | своя сеть шаг за шагом |
 | [Как это устроено](doc/architecture.md) | узел, сессии, обнаружение, пакеты на проводе |
 | [Группы и участники](doc/groups.md) | invite, сертификаты, роли, `node set`, исключение, смена psk, резервная копия |
@@ -102,8 +102,10 @@ DVPN не анонимизирует. Если нужна именно анон�
 | Шлюз `[gateway]` (раздавать интернет) | да (nftables) | нет | нет |
 | Служба | systemd | да (`dvpn service install`) | нет |
 
-Готовые сборки для Linux (x86_64, aarch64) и Windows — на странице [релизов](https://git.mihprog.com/DVPN/DVPN/releases).
-Android и мобильные клиенты — этап 7 [плана](PLAN.md).
+Установить можно тремя способами ([install.md](doc/install.md#три-способа)): [установщиком](https://git.mihprog.com/DVPN/DVPN-installer)
+(Linux и Windows, с автообновлением), готовыми сборками для Linux (x86_64, aarch64) и Windows со страницы
+[релизов](https://git.mihprog.com/DVPN/DVPN/releases) или сборкой из исходников.
+Android — приложение [DVPN-android](https://git.mihprog.com/DVPN/DVPN-android) (Android 12+), iOS-клиента нет.
 
 ## Лицензия
 
