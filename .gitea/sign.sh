@@ -17,4 +17,10 @@ printf '%s\n' "$RELEASE_SIGNING_KEY" >"$tmp/key.pem"
 openssl pkeyutl -sign -inkey "$tmp/key.pem" -rawin -in "$tmp/msg" -out dist/SHA256SUMS.sig
 openssl pkey -in "$tmp/key.pem" -pubout -out "$tmp/pub.pem"
 openssl pkeyutl -verify -pubin -inkey "$tmp/pub.pem" -rawin -in "$tmp/msg" -sigfile dist/SHA256SUMS.sig
-echo "signed by $(openssl pkey -in "$tmp/key.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 -v | tr -d ' \n')"
+pub=$(openssl pkey -in "$tmp/key.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 -v | tr -d ' \n')
+echo "signed by $pub"
+# RELEASE_PUBLIC_KEY (what the installer is built with) must hold the key that signs
+if [[ -n ${RELEASE_PUBLIC_KEY:-} ]] && ! tr ', ' '\n\n' <<<"$RELEASE_PUBLIC_KEY" | grep -qx "$pub"; then
+	echo "RELEASE_SIGNING_KEY is not one of RELEASE_PUBLIC_KEY: the installer would refuse this release"
+	exit 1
+fi

@@ -63,6 +63,7 @@ jobs:
       - name: sign
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_PUBLIC_KEY: ${{ secrets.RELEASE_PUBLIC_KEY }}
         run: bash .gitea/sign.sh
       - name: publish
         env:
