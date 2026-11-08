@@ -59,6 +59,11 @@ jobs:
           cp LICENSE* README.md dvpn-windows-amd64/ 2>/dev/null || true
           zip -qr dist/dvpn-windows-amd64.zip dvpn-windows-amd64
           (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+      # for dvpn-installer: it installs and updates only what this key signed
+      - name: sign
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: bash .gitea/sign.sh
       - name: publish
         env:
           GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}

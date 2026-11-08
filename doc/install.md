@@ -2,19 +2,43 @@
 
 [← к содержанию](../README.md#документация)
 
-1. [Сборка](#сборка)
-2. [Установка узла на Linux](#установка-узла-на-linux)
-3. [Служба узла (systemd)](#служба-узла-systemd)
-4. [Сервер обнаружения как служба](#сервер-обнаружения-как-служба)
-5. [Файрвол](#файрвол)
-6. [Каталог данных](#каталог-данных)
-7. [Обновление и удаление](#обновление-и-удаление)
-8. [Windows](#windows)
+1. [Установщик](#установщик)
+2. [Сборка](#сборка)
+3. [Установка узла на Linux](#установка-узла-на-linux)
+4. [Служба узла (systemd)](#служба-узла-systemd)
+5. [Сервер обнаружения как служба](#сервер-обнаружения-как-служба)
+6. [Файрвол](#файрвол)
+7. [Каталог данных](#каталог-данных)
+8. [Обновление и удаление](#обновление-и-удаление)
+9. [Windows](#windows)
 
 Один бинарник `dvpn` — это и узел, и сервер обнаружения, и все команды управления. Готовые сборки — на странице
 [релизов](https://git.mihprog.com/DVPN/DVPN/releases): статические `dvpn-linux-amd64` и `dvpn-linux-arm64`
 (работают на любом Linux) и `dvpn-windows-amd64.zip` (`dvpn.exe` вместе с `wintun.dll`); суммы — в `SHA256SUMS`.
-Их собирает CI из тега `vX.Y.Z` ([release.yml](../.gitea/workflows/release.yml)). Ниже — сборка из исходников.
+Их собирает CI из тега `vX.Y.Z` ([release.yml](../.gitea/workflows/release.yml)) и подписывает `SHA256SUMS` ключом
+ed25519 (`SHA256SUMS.sig`, [sign.sh](../.gitea/sign.sh)). Ниже — установщик, затем сборка из исходников и установка
+вручную.
+
+## Установщик
+
+[dvpn-installer](https://git.mihprog.com/DVPN/DVPN-installer) ставит всё описанное ниже сам — на Linux и Windows: узел
+(службой или без), по выбору TUI, GUI и сервер обнаружения (Linux), вход в группу по invite, ежедневное
+автообновление; обновляет и удаляет. Он ставит только файлы, чьи суммы подписаны ключом релизов, и возвращает узел на
+прежнюю версию, если новая не запустилась.
+
+* **С окном** — `dvpn-installer-windows-amd64.exe`, `dvpn-installer-gui-linux-amd64` (права спросит сам: UAC или
+  `pkexec`).
+* **Сервер, любой Linux** — статические `dvpn-installer-linux-amd64` / `-arm64`:
+
+```shell
+sudo ./dvpn-installer-linux-amd64 install --tui --auto-update --invite-file invite.txt
+sudo dvpn-installer update            # или --check
+sudo dvpn-installer uninstall         # ключ и группа остаются; всё — --purge
+```
+
+Раскладка — та же, что ниже: `/opt/dvpn`, ссылка `/usr/local/bin/dvpn`, юниты `dvpn.service`, `dvpn-server.service`
+(со своей копией бинарника в `/opt/dvpn-server`), `dvpn-update.timer`; юниты, написанные не установщиком, он не
+трогает. Подробно — [README установщика](https://git.mihprog.com/DVPN/DVPN-installer#readme).
 
 ## Сборка
 
@@ -207,7 +231,12 @@ start_pre() { checkpath -d -m 0755 /run/dvpn; }
 ## Сервер обнаружения как служба
 
 Серверу не нужны root и TUN. Удобно запустить его от отдельного непривилегированного пользователя с собственным
-каталогом данных — systemd создаст и то, и другое сам:
+каталогом данных — systemd создаст и то, и другое сам. В закрытый `/opt/dvpn` (0700) такой пользователь не войдёт,
+поэтому серверу — своя копия бинарника:
+
+```shell
+sudo install -D -m 755 /opt/dvpn/dvpn /opt/dvpn-server/dvpn      # и так же после каждого обновления
+```
 
 ```ini
 # /etc/systemd/system/dvpn-server.service
@@ -217,7 +246,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/opt/dvpn/dvpn --dir /var/lib/dvpn-server server
+ExecStart=/opt/dvpn-server/dvpn --dir /var/lib/dvpn-server server
 # временный пользователь и каталог /var/lib/dvpn-server, который переживает перезапуски
 DynamicUser=yes
 StateDirectory=dvpn-server
