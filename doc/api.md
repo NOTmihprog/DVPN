@@ -210,6 +210,9 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
   "dns": ["1.1.1.1"],                           # DNS через шлюз
   "sources": ["10.10.33.2/32"],                 # через шлюз только эти источники (v4 и v6 вместе)
   "table": 100 | nil,                           # своя таблица маршрутизации
+  "only_file": "/etc/dvpn/via-vps.txt" | nil,   # через шлюз только адреса из файла (nil — весь интернет)
+  "only_count": 3,                              # сколько адресов из него сейчас в ходу
+  "only_error": "line 2: ..." | nil,            # почему файл не прочитался (в ходу прежний список)
   "active": {"v4": {"key", "name"} | nil, "v6": ...},   # шлюз, через который идёт интернет сейчас
   "blocked": {"v4": false, "v6": false}         # kill switch блокирует интернет: шлюзы есть, живых нет
 }
@@ -283,12 +286,13 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
  "kill_switch": false,                          # nil — по умолчанию (включён)
  "dns": ["1.1.1.1"], "sources": ["10.10.33.2"], # списки целиком заменяют старые
  "table": 100,                                  # nil — убрать
+ "only_file": "/etc/dvpn/via-vps.txt",          # полный путь, узел читает его сам; nil — убрать
  "clear": true}                                 # сначала убрать весь [exit]
 ```
 
 Поля, которых нет, не меняются. Ошибки: `gateway_unknown` (не ключ и не имя ровно одного участника, или
 исключённый), `gateway_self`, `dns_invalid`, `sources_invalid`, `table_invalid` (0, 253–255 и таблица DVPN
-заняты), `bad_param`, `config_write` (не удалось записать `config.toml`). При ошибке ничего не меняется.
+заняты), `only_invalid` (путь не полный, файл не читается узлом или в нём ошибка), `bad_param`, `config_write` (не удалось записать `config.toml`). При ошибке ничего не меняется.
 
 ### get / set forward
 

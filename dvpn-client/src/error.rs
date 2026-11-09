@@ -123,6 +123,7 @@ codes! {
     DnsInvalid = "dns_invalid",
     SourcesInvalid = "sources_invalid",
     TableInvalid = "table_invalid",
+    OnlyInvalid = "only_invalid",
     ConfigWrite = "config_write",
     ConfigRead = "config_read",
     NotAdmin = "not_admin",

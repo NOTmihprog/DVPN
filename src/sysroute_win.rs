@@ -30,6 +30,8 @@ pub struct SysRoutes {
     /// What each wanted route became (a default route is two).
     installed: BTreeMap<(u32, SysRoute), Vec<Route>>,
     wanted: BTreeSet<(u32, SysRoute)>,
+    /// `Wanted::exit_only`: pin the socket although no default route goes into the overlay.
+    exit_only: [bool; 2],
     underlay: Underlay,
     warned: bool,
 }
@@ -54,7 +56,14 @@ impl SysRoutes {
     pub fn new(_tun: &str, tun_index: u32) -> Self {
         winnet::remove_tagged(); // leftovers of a crashed run
         let underlay = Self::current_underlay(tun_index);
-        SysRoutes { tun_index, installed: BTreeMap::new(), wanted: BTreeSet::new(), underlay, warned: false }
+        SysRoutes {
+            tun_index,
+            installed: BTreeMap::new(),
+            wanted: BTreeSet::new(),
+            exit_only: [false; 2],
+            underlay,
+            warned: false,
+        }
     }
 
     fn current_underlay(tun_index: u32) -> Underlay {
@@ -118,6 +127,7 @@ impl SysRoutes {
             self.install(k);
         }
         self.wanted = ours;
+        self.exit_only = wanted.exit_only;
     }
 
     /// Looks at the physical network again; when its default route moved, the holes follow it.
@@ -137,12 +147,17 @@ impl SysRoutes {
     }
 
     /// The interfaces DVPN's own socket goes out of, per family (0: as the routes say). Only
-    /// while the overlay takes that family's default route: then nothing but the physical
+    /// while the overlay takes that family's default route, or internet destinations from
+    /// `[exit] only_file` (one may be a peer's endpoint): then nothing but the physical
     /// interface keeps our own packets out of the tunnel. Otherwise the socket stays free, so
     /// that peers behind other interfaces (a second LAN) are still reached.
     pub fn pin(&self) -> [u32; 2] {
         let takes_default = |fam6: bool| {
-            self.installed.keys().any(|(_, r)| matches!(r, SysRoute::Dev(n) if n.prefix_len() == 0 && v6(n) == fam6))
+            self.exit_only[fam6 as usize]
+                || self
+                    .installed
+                    .keys()
+                    .any(|(_, r)| matches!(r, SysRoute::Dev(n) if n.prefix_len() == 0 && v6(n) == fam6))
         };
         [false, true].map(
             |fam6| {

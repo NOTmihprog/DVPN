@@ -146,6 +146,18 @@ impl Tasks {
     }
 }
 
+/// `[exit] only_file` as read (see [`crate::config::parse_only_list`]).
+#[derive(Default)]
+struct OnlyList {
+    /// The file and its mtime when it was read last.
+    seen: Option<(std::path::PathBuf, Option<std::time::SystemTime>)>,
+    list: Arc<Vec<ipnet::IpNet>>,
+    /// Why the file could not be read last time.
+    error: Option<String>,
+    /// Read the file again even if its mtime is the same.
+    reread: bool,
+}
+
 pub struct Node {
     pub storage: Arc<PeerStorage>,
     pub transport: Arc<Transport>,
@@ -202,6 +214,8 @@ pub struct Node {
     reports: parking_lot::Mutex<(Instant, u32)>,
     /// `[exit]` and the config file's mtime it was read at; the chosen IPv4 / IPv6 gateways.
     exits: parking_lot::Mutex<(crate::config::Exits, Option<std::time::SystemTime>)>,
+    /// `[exit] only_file` as read, followed together with `[exit]`.
+    exit_only: parking_lot::Mutex<OnlyList>,
     /// `[[gateway.forward]]` as in use, followed together with `[exit]`.
     forwards: parking_lot::Mutex<Vec<crate::forward::Forward>>,
     exit4: parking_lot::Mutex<crate::exit::ExitChooser>,
@@ -284,6 +298,7 @@ impl Node {
             reports: parking_lot::Mutex::new((Instant::now(), 0)),
             pings: parking_lot::Mutex::new(HashMap::new()),
             exits: parking_lot::Mutex::new(exits),
+            exit_only: parking_lot::Mutex::new(OnlyList::default()),
             forwards: parking_lot::Mutex::new(forwards),
             exit4: parking_lot::Mutex::new(Default::default()),
             exit6: parking_lot::Mutex::new(Default::default()),
@@ -392,10 +407,11 @@ impl Node {
         }
         let own = self.cert.read().clone();
         let acl = self.group.store.acl(&self.group.id);
-        let (dns_forward, exit_table, exit_sources) = {
+        let (dns_forward, exit_table, exit_sources, only) = {
             let e = &self.exits.lock().0;
-            (e.dns.clone(), e.table, e.sources())
+            (e.dns.clone(), e.table, e.sources(), e.only_file.is_some())
         };
+        let exit_only = only.then(|| self.exit_only.lock().list.clone());
         let forwards = {
             let (local, remote) = self.forward_rules();
             crate::forward::merge(&local, if self.group.allow_remote { &remote } else { &[] })
@@ -412,6 +428,7 @@ impl Node {
             kill: *self.kill.lock(),
             exit_table,
             exit_sources: &exit_sources,
+            exit_only: exit_only.as_deref().map(|l| l.as_slice()),
             manual: &self.group.routes,
             acl: acl.as_ref(),
             dns_domain: self.group.dns.as_ref().map(|(d, _)| d.as_str()),
@@ -1321,10 +1338,57 @@ impl Node {
     /// and the internet routes follow (without waiting for the file to be noticed).
     pub fn set_exits(&self, exits: &crate::config::Exits) -> anyhow::Result<()> {
         crate::config::write_exits(&self.group.config_path, exits)?;
-        // re-read the file now, even if its mtime did not change
+        // re-read the files now, even if their mtimes did not change
         self.exits.lock().1 = None;
+        self.exit_only.lock().reread = true;
         self.exit_tick();
         Ok(())
+    }
+
+    /// `[exit] only_file` as in use: how many destinations it lists, and why it could not be
+    /// read last time (the list read before stays in use).
+    pub fn exit_only_state(&self) -> (usize, Option<String>) {
+        let o = self.exit_only.lock();
+        (o.list.len(), o.error.clone())
+    }
+
+    /// Follows `[exit] only_file`: reads it again when it or its mtime changed. Returns whether
+    /// the list in use changed.
+    fn refresh_only(&self, file: Option<&std::path::Path>) -> bool {
+        let mut o = self.exit_only.lock();
+        let Some(path) = file else {
+            let had = o.seen.is_some();
+            *o = OnlyList::default();
+            return had;
+        };
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let new_file = o.seen.as_ref().is_none_or(|(p, _)| p != path);
+        if !new_file && !o.reread && o.seen.as_ref().is_some_and(|(_, t)| *t == mtime) {
+            return false;
+        }
+        o.reread = false;
+        o.seen = Some((path.to_owned(), mtime));
+        let mut changed = false;
+        if new_file && !o.list.is_empty() {
+            // nothing of another file stays
+            o.list = Arc::new(Vec::new());
+            changed = true;
+        }
+        match crate::config::read_only_list(path) {
+            Ok(list) => {
+                o.error = None;
+                if *o.list != list {
+                    log::info!("Exit | {} destinations through the gateway from {}", list.len(), path.display());
+                    o.list = Arc::new(list);
+                    changed = true;
+                }
+            }
+            Err(e) => {
+                log::warn!("Exit | only_file: {e:#}; {} destinations from before stay in use", o.list.len());
+                o.error = Some(format!("{e:#}"));
+            }
+        }
+        changed
     }
 
     /// The ports forwarded here: this node's own rules, and the ones an admin set for it.
@@ -1370,7 +1434,7 @@ impl Node {
 
     /// Follows `[exit]` changes in the config, picks the gateways (first alive by priority, see
     /// `exit.rs`) and moves the internet routes when they change.
-    fn exit_tick(&self) {
+    pub(crate) fn exit_tick(&self) {
         let path = &self.group.config_path;
         let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         let mut config_changed = false;
@@ -1404,11 +1468,12 @@ impl Node {
         let resolve = |l: &[String]| -> Vec<NodeId> {
             l.iter().filter_map(|s| self.resolve_member(s)).filter(|g| *g != me).collect()
         };
+        let only_changed = self.refresh_only(exits.only_file.as_deref());
         let (p4, p6) = (resolve(&exits.v4), resolve(&exits.v6));
         let now = Instant::now();
         let alive = |g: &NodeId| self.next_hop(g).is_some();
         // `[exit] dns` may have changed: the plan forwards names accordingly
-        let mut changed = config_changed;
+        let mut changed = config_changed || only_changed;
         for (chooser, prio, fam) in [(&self.exit4, &p4, "IPv4"), (&self.exit6, &p6, "IPv6")] {
             let mut ch = chooser.lock();
             let old = ch.current;

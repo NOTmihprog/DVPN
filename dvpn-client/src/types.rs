@@ -287,6 +287,14 @@ pub struct Exit {
     /// Only these sources go through the gateway (both families).
     pub sources: Vec<String>,
     pub table: Option<u32>,
+    /// Only the destinations listed in this file go through the gateway (None: the whole
+    /// internet); how many it lists as in use, and why it could not be read last time.
+    #[serde(default)]
+    pub only_file: Option<String>,
+    #[serde(default)]
+    pub only_count: usize,
+    #[serde(default)]
+    pub only_error: Option<String>,
     /// The gateway in use now.
     pub active: PerFamily<Option<ActiveGateway>>,
     /// The kill switch blocks the internet: gateways configured, none alive.
@@ -330,6 +338,8 @@ pub struct ExitUpdate {
     pub sources: Option<Vec<String>>,
     /// `Some(None)`: no table of its own.
     pub table: Option<Option<u32>>,
+    /// A full path, read by the node; `Some(None)`: the whole internet again.
+    pub only_file: Option<Option<String>>,
 }
 
 /// One forwarded port of a gateway.

@@ -119,6 +119,11 @@ enum Command {
         /// adds no rule to it: your own rules (fwmark, iif) steer traffic there
         #[arg(long)]
         table: Option<String>,
+        /// Only the destinations listed in this file go through the gateway, the rest of the
+        /// internet directly ("none": the whole internet). Networks or addresses, separated by
+        /// commas, spaces or new lines; the node re-reads the file when it changes
+        #[arg(long, value_name = "FILE")]
+        only: Option<PathBuf>,
     },
     /// Start peer discovery server
     Server {
@@ -1306,7 +1311,7 @@ fn main() {
                 _ => die(format!("no route to {node}")),
             }
         }
-        Some(Command::Exit { v4, v6, none, kill_switch, dns, sources, table }) => {
+        Some(Command::Exit { v4, v6, none, kill_switch, dns, sources, table, only }) => {
             let mut e = conf.exits.clone();
             if none {
                 e = config::Exits::default();
@@ -1348,6 +1353,17 @@ fn main() {
                     Some(config::check_table(n).unwrap_or_else(|err| die(format!("--{err}"))))
                 };
             }
+            if let Some(f) = only {
+                e.only_file = if f.as_os_str() == "none" {
+                    None
+                } else {
+                    // the node may run from another directory (a service): keep the full path
+                    let f =
+                        std::fs::canonicalize(&f).unwrap_or_else(|err| die(format!("--only {}: {err}", f.display())));
+                    config::read_only_list(&f).unwrap_or_else(|err| die(format!("--only {err:#}")));
+                    Some(f)
+                };
+            }
             if e != conf.exits {
                 conf.set_exits(&e);
                 conf.save();
@@ -1365,6 +1381,16 @@ fn main() {
                 } else {
                     let s: Vec<String> = src.iter().map(|n| n.to_string()).collect();
                     println!("only from {} (table {table}); this node itself goes direct", s.join(", "));
+                }
+            }
+            if let Some(f) = &e.only_file {
+                match config::read_only_list(f) {
+                    Ok(l) => println!(
+                        "only to the {} destinations in {}; the rest of the internet goes direct",
+                        l.len(),
+                        f.display()
+                    ),
+                    Err(err) => println!("only to the destinations in {}: cannot read it now ({err:#})", f.display()),
                 }
             }
             if !e.dns.is_empty() {

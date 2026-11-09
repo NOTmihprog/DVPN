@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -302,6 +303,10 @@ pub struct Exits {
     /// own. Without `*_sources` DVPN adds no rule for it: the system's own rules (a fwmark, an
     /// interface) decide what goes there.
     pub table: Option<u32>,
+    /// Only the destinations listed in this file go through the gateway (and only they are
+    /// blocked by the kill switch); everything else reaches the internet directly. The node
+    /// re-reads the file when it changes. Format: [`parse_only_list`].
+    pub only_file: Option<PathBuf>,
 }
 
 impl Exits {
@@ -340,7 +345,7 @@ fn parse_exits(t: &dyn toml_edit::TableLike) -> anyhow::Result<Exits> {
             .collect()
     };
     for (k, _) in t.iter() {
-        if !["v4", "v6", "kill_switch", "dns", "v4_sources", "v6_sources", "table"].contains(&k) {
+        if !["v4", "v6", "kill_switch", "dns", "v4_sources", "v6_sources", "table", "only_file"].contains(&k) {
             bail!("unknown key {k}");
         }
     }
@@ -370,7 +375,48 @@ fn parse_exits(t: &dyn toml_edit::TableLike) -> anyhow::Result<Exits> {
         Some(v) => Some(check_table(v.as_integer().ok_or_else(|| anyhow!("table: expected a number"))?)?),
         None => None,
     };
-    Ok(Exits { v4: list("v4")?, v6: list("v6")?, kill_switch, dns, v4_sources, v6_sources, table })
+    let only_file = match t.get("only_file") {
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| anyhow!("only_file: expected a path"))?.trim();
+            (!s.is_empty()).then(|| PathBuf::from(s))
+        }
+        None => None,
+    };
+    Ok(Exits { v4: list("v4")?, v6: list("v6")?, kill_switch, dns, v4_sources, v6_sources, table, only_file })
+}
+
+/// The most entries `[exit] only_file` may list.
+pub const MAX_ONLY: usize = 100_000;
+
+/// The destinations of `[exit] only_file`: networks or single addresses (/32, /128), IPv4 and
+/// IPv6, separated by commas, spaces or new lines; `#` starts a comment to the end of the line.
+/// `1.1.1.1/32, 8.8.8.8` and `9.9.9.0/24` on lines of their own are the same list. Host bits
+/// are cleared (`9.9.9.9/24` is `9.9.9.0/24`), repeats dropped. Any entry that is not a network
+/// fails the whole list, so that a broken file does not silently route less.
+pub fn parse_only_list(text: &str) -> anyhow::Result<Vec<ipnet::IpNet>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or_default();
+        for item in line.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).filter(|s| !s.is_empty()) {
+            let net = parse_source::<ipnet::IpNet, std::net::IpAddr>(item)
+                .map_err(|_| anyhow!("line {}: {item} is not an IP address or network", n + 1))?
+                .trunc();
+            if seen.insert(net) {
+                out.push(net);
+            }
+            if out.len() > MAX_ONLY {
+                bail!("more than {MAX_ONLY} entries");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Reads and parses `[exit] only_file`.
+pub fn read_only_list(path: &Path) -> anyhow::Result<Vec<ipnet::IpNet>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    parse_only_list(&text).with_context(|| format!("{}", path.display()))
 }
 
 /// A network, or an address alone (/32, /128).
@@ -582,6 +628,9 @@ fn put_exits(doc: &mut DocumentMut, exits: &Exits) {
         }
         if let Some(n) = exits.table {
             t["table"] = value(i64::from(n));
+        }
+        if let Some(f) = &exits.only_file {
+            t["only_file"] = value(f.to_string_lossy().as_ref());
         }
         t.decor_mut()
             .set_prefix("\n# gateways to the internet by priority (names or keys); the first alive one is used\n");
@@ -1397,6 +1446,11 @@ mod tests {
         assert!(!with_group("[exit]\nv4 = [\"vps1\"]\n").unwrap().exits.split());
         assert!(with_group("[exit]\nv4_sources = [\"fd00::/64\"]\n").is_err(), "IPv6 in v4_sources");
         assert!(with_group("[exit]\nv6_sources = [\"10.0.0.0/8\"]\n").is_err());
+        let c = with_group("[exit]\nv4 = [\"vps1\"]\nonly_file = \"/etc/dvpn/only.txt\"\n").unwrap();
+        assert_eq!(c.exits.only_file, Some(PathBuf::from("/etc/dvpn/only.txt")));
+        assert!(!c.exits.split(), "a list of destinations is not a table of its own");
+        assert_eq!(with_group("[exit]\nonly_file = \" \"\n").unwrap().exits.only_file, None);
+        assert!(with_group("[exit]\nonly_file = 1\n").is_err());
         for bad in ["0", "254", "7347", "-1", "\"main\""] {
             assert!(with_group(&format!("[exit]\ntable = {bad}\n")).is_err(), "table = {bad}");
         }
@@ -1410,6 +1464,7 @@ mod tests {
             v4_sources: vec!["10.10.11.0/24".parse().unwrap()],
             v6_sources: vec!["fd00::/64".parse().unwrap()],
             table: Some(445),
+            only_file: Some("/etc/dvpn/only.txt".into()),
         };
         c.set_exits(&e);
         c.save();
@@ -1417,6 +1472,40 @@ mod tests {
         c.set_exits(&Exits::default());
         c.save();
         assert_eq!(read_exits(&dir.join(CONFIG_FILE_NAME)).unwrap(), Exits::default());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_list() {
+        let n = |s: &str| s.parse::<ipnet::IpNet>().unwrap();
+        let want = vec![n("1.1.1.1/32"), n("8.8.8.8/32"), n("9.9.9.0/24")];
+        // the same list, however it is written
+        for text in [
+            "1.1.1.1/32, 8.8.8.8, 9.9.9.9/24",
+            "1.1.1.1\n 8.8.8.8/32\n 9.9.9.9/24",
+            "1.1.1.1\r\n8.8.8.8/32\r\n9.9.9.9/24\r\n",
+            "# blocked\n1.1.1.1 # cloudflare\n\n8.8.8.8;9.9.9.0/24\t9.9.9.9/24\n1.1.1.1/32\n",
+        ] {
+            assert_eq!(parse_only_list(text).unwrap(), want, "{text:?}");
+        }
+        assert_eq!(
+            parse_only_list("2001:db8::1, 2001:db8:1::5/48").unwrap(),
+            vec![n("2001:db8::1/128"), n("2001:db8:1::/48")]
+        );
+        assert!(parse_only_list("").unwrap().is_empty());
+        assert!(parse_only_list("# nothing yet\n").unwrap().is_empty());
+        let err = format!("{:#}", parse_only_list("1.1.1.1\n8.8.8.8/33\n").unwrap_err());
+        assert!(err.contains("line 2") && err.contains("8.8.8.8/33"), "{err}");
+        assert!(parse_only_list("example.com").is_err());
+        assert!(parse_only_list("1.1.1.1-1.1.1.9").is_err());
+        let many: String = (0..=MAX_ONLY as u32).map(|i| format!("{}\n", std::net::Ipv4Addr::from(i))).collect();
+        assert!(parse_only_list(&many).is_err());
+
+        let dir = temp_dir();
+        let f = dir.join("only.txt");
+        std::fs::write(&f, "1.1.1.1, 8.8.8.8").unwrap();
+        assert_eq!(read_only_list(&f).unwrap(), want[..2]);
+        assert!(read_only_list(&dir.join("missing.txt")).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

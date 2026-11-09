@@ -12,7 +12,7 @@
 | [Группы и участники](groups.md) | invite, сертификаты, роли, `node set`, исключение, смена psk, резервная копия |
 | [Обнаружение узлов](discovery.md) | сервер обнаружения, статические узлы, IPv4/IPv6, порты, NAT |
 | [Адреса и маршруты](routing.md) | IPv4 и ULA, CKR, site-to-site, системные маршруты |
-| [Выход в интернет](exit.md) | шлюзы, kill switch, DNS через шлюз, `[gateway]`, публичный IPv6 |
+| [Выход в интернет](exit.md) | шлюзы, kill switch, только адреса из списка (`--only`), DNS через шлюз, `[gateway]`, публичный IPv6 |
 | [Ретрансляторы (mesh)](mesh.md) | link-state, сквозные сессии, traceroute, ICMP и MTU, защита рассылки |
 | [Доступ (ACL)](acl.md) | правила доступа внутри группы |
 | [Имена (DNS и mDNS)](dns.md) | `.dvpn`, `.local`, systemd-resolved |

@@ -73,6 +73,9 @@ pub struct Wanted {
     pub routes: BTreeSet<(u32, SysRoute)>,
     /// `from <source> lookup <table>`.
     pub sources: BTreeSet<(IpNet, u32)>,
+    /// Per family: internet destinations in the tunnel by narrower routes than a default one
+    /// (`Plan::exit_only`); Windows pins DVPN's socket then.
+    pub exit_only: [bool; 2],
 }
 
 impl Wanted {
@@ -83,6 +86,7 @@ impl Wanted {
         Wanted {
             routes: main.chain(exit).collect(),
             sources: plan.exit_sources.iter().map(|s| (s.trunc(), exit_table)).collect(),
+            exit_only: plan.exit_only,
         }
     }
 
@@ -110,6 +114,63 @@ fn ip(args: &[String]) -> bool {
             false
         }
     }
+}
+
+/// More route changes than this at once go through one `ip -batch`.
+#[cfg(not(windows))]
+const BATCH_FROM: usize = 16;
+
+/// Runs `lines` (`ip` commands without the `ip`) through `ip -force -batch -`, which goes on
+/// after a failing line. Returns the indexes of the lines that failed (all, if `ip` did not run).
+#[cfg(not(windows))]
+fn ip_batch(lines: &[String]) -> std::collections::HashSet<usize> {
+    use std::io::Write;
+    let all = || (0..lines.len()).collect();
+    let child = Command::new("ip")
+        .args(["-force", "-batch", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Routes | cannot run ip: {e}");
+            return all();
+        }
+    };
+    let mut input = lines.join("\n");
+    input.push('\n');
+    // written from another thread: `ip` may fill stderr before it read all of stdin
+    let stdin = child.stdin.take();
+    let writer = std::thread::spawn(move || stdin.map(|mut s| s.write_all(input.as_bytes())));
+    let out = child.wait_with_output();
+    let _ = writer.join();
+    match out {
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let failed = batch_failures(&err, lines.len());
+            if !failed.is_empty() {
+                log::debug!("Routes | ip -batch: {}", err.trim());
+            }
+            failed
+        }
+        Err(e) => {
+            log::warn!("Routes | ip -batch: {e}");
+            all()
+        }
+    }
+}
+
+/// The failed lines (0-based) in `ip -batch -` output: `Command failed -:<line>`.
+#[cfg(not(windows))]
+fn batch_failures(stderr: &str, count: usize) -> std::collections::HashSet<usize> {
+    stderr
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("Command failed -:")?.trim().parse::<usize>().ok())
+        .filter(|n| (1..=count).contains(n))
+        .map(|n| n - 1)
+        .collect()
 }
 
 #[cfg(not(windows))]
@@ -154,13 +215,38 @@ impl SysRoutes {
         ip(&args(&[fam, "rule", op, "priority", &p, "from", &src, "lookup", &table]))
     }
 
-    fn route(&self, add: bool, (table, r): (u32, SysRoute)) -> bool {
-        let (n, t, fam) = (r.net().to_string(), table.to_string(), family(&r.net()));
+    /// `ip` arguments (after the family) to add or remove a route.
+    fn route_args(&self, add: bool, (table, r): (u32, SysRoute)) -> Vec<String> {
+        let (n, t) = (r.net().to_string(), table.to_string());
         let op = if add { "replace" } else { "del" };
         match r {
-            SysRoute::Dev(_) => ip(&args(&[fam, "route", op, &n, "dev", &self.tun, "table", &t, "proto", PROTO])),
-            SysRoute::Throw(_) => ip(&args(&[fam, "route", op, "throw", &n, "table", &t, "proto", PROTO])),
+            SysRoute::Dev(_) => args(&["route", op, &n, "dev", &self.tun, "table", &t, "proto", PROTO]),
+            SysRoute::Throw(_) => args(&["route", op, "throw", &n, "table", &t, "proto", PROTO]),
         }
+    }
+
+    fn route(&self, add: bool, r: (u32, SysRoute)) -> bool {
+        let mut a = vec![family(&r.1.net()).to_owned()];
+        a.extend(self.route_args(add, r));
+        ip(&a)
+    }
+
+    /// Adds or removes `routes`, logging each, or with many (`[exit] only_file`) all through one
+    /// `ip -batch` and a summary. Returns those that took.
+    fn routes(&self, add: bool, routes: Vec<(u32, SysRoute)>) -> Vec<(u32, SysRoute)> {
+        if routes.len() <= BATCH_FROM {
+            return routes.into_iter().filter(|r| self.route(add, *r)).collect();
+        }
+        let lines: Vec<String> = routes.iter().map(|r| self.route_args(add, *r).join(" ")).collect();
+        let failed = ip_batch(&lines);
+        let ok: Vec<_> = routes.into_iter().enumerate().filter(|(i, _)| !failed.contains(i)).map(|(_, r)| r).collect();
+        log::info!(
+            "Routes | {} routes {}{}",
+            ok.len(),
+            if add { "installed" } else { "removed" },
+            if failed.is_empty() { String::new() } else { format!(", {} failed", failed.len()) }
+        );
+        ok
     }
 
     fn remove_all(&self) {
@@ -199,19 +285,23 @@ impl SysRoutes {
             self.source_rule(false, s);
             self.sources.remove(&s);
         }
-        for r in self.installed.difference(&wanted.routes).copied().collect::<Vec<_>>() {
-            self.route(false, r);
+        let gone: Vec<_> = self.installed.difference(&wanted.routes).copied().collect();
+        // removed whether `ip` agreed or not (a route someone else deleted)
+        self.routes(false, gone.clone());
+        for r in gone {
             self.installed.remove(&r);
         }
-        for r in wanted.routes.difference(&self.installed.clone()) {
-            if self.route(true, *r) {
+        let new: Vec<_> = wanted.routes.difference(&self.installed).copied().collect();
+        let few = new.len() <= BATCH_FROM;
+        for r in self.routes(true, new) {
+            if few {
                 log::info!(
                     "Routes | {:?} installed{}",
                     r.1,
                     if r.0 == TABLE { String::new() } else { format!(" in table {}", r.0) }
                 );
-                self.installed.insert(*r);
             }
+            self.installed.insert(r);
         }
         for s in wanted.sources.difference(&self.sources.clone()) {
             if self.source_rule(true, *s) {
@@ -253,6 +343,19 @@ mod tests {
         assert!(w.contains(&SysRoute::Throw("10.0.0.0/8".parse().unwrap())), "inetv4 holes");
         assert!(!w.iter().any(|r| r.net() == "10.10.33.2/32".parse::<IpNet>().unwrap()), "on the TUN subnet already");
         assert!(!w.iter().any(|r| r.net() == "10.99.0.0/16".parse::<IpNet>().unwrap()), "~ entry");
+    }
+
+    #[test]
+    fn batch_failures_by_line() {
+        let err = "Error: Nexthop has invalid gateway.\nCommand failed -:2\nRTNETLINK answers: No such process\nCommand failed -:5\nCommand failed -:99\n";
+        assert_eq!(batch_failures(err, 5), [1, 4].into());
+        assert!(batch_failures("", 5).is_empty());
+    }
+
+    #[test]
+    fn exit_only_reaches_wanted() {
+        let plan = crate::plan::Plan { exit_only: [true, false], ..Default::default() };
+        assert_eq!(Wanted::of(&plan).exit_only, [true, false]);
     }
 
     #[test]

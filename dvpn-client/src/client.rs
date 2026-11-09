@@ -362,6 +362,9 @@ impl Client {
         if let Some(t) = u.table {
             f.push(("table", t.map_or(Value::Nil, Value::from)));
         }
+        if let Some(o) = &u.only_file {
+            f.push(("only_file", o.as_deref().map_or(Value::Nil, Value::from)));
+        }
         from_value(self.raw("set", "exit", f).await?)
     }
 

@@ -1476,6 +1476,7 @@ impl Api {
     fn exit_info(&self) -> Value {
         let n = &self.node;
         let (e, gw4, gw6, (block4, block6)) = n.exit_detail();
+        let (only_count, only_error) = n.exit_only_state();
         let names = self.names();
         let list = |l: &[String]| {
             Value::Array(
@@ -1505,6 +1506,9 @@ impl Api {
             ("dns", strings(e.dns.iter().map(|d| d.to_string()).collect())),
             ("sources", strings(e.sources().iter().map(|s| s.to_string()).collect())),
             ("table", e.table.map_or(Value::Nil, Value::from)),
+            ("only_file", opt_str(e.only_file.as_ref().map(|f| f.to_string_lossy().into_owned()))),
+            ("only_count", only_count.into()),
+            ("only_error", opt_str(only_error)),
             ("active", map(vec![("v4", active(gw4)), ("v6", active(gw6))])),
             ("blocked", map(vec![("v4", block4.into()), ("v6", block6.into())])),
         ])
@@ -1577,6 +1581,25 @@ impl Api {
                 let t = v.as_i64().ok_or_else(|| bad_param("table", "expected a table number or nil"))?;
                 e.table =
                     Some(crate::config::check_table(t).map_err(|err| ApiError::new("table_invalid", err.to_string()))?);
+            }
+        }
+        match raw_field(p, "only_file") {
+            None => {}
+            Some(Value::Nil) => e.only_file = None,
+            Some(v) => {
+                let f = std::path::PathBuf::from(
+                    v.as_str().ok_or_else(|| bad_param("only_file", "expected a path or nil"))?,
+                );
+                // the node may run elsewhere than the client: no relative paths
+                if !f.is_absolute() {
+                    return Err(ApiError::new(
+                        "only_invalid",
+                        format!("only_file: {} is not a full path", f.display()),
+                    ));
+                }
+                // read as the node, which will follow it
+                crate::config::read_only_list(&f).map_err(|err| ApiError::new("only_invalid", format!("{err:#}")))?;
+                e.only_file = Some(f);
             }
         }
         n.set_exits(&e).map_err(|err| ApiError::new("config_write", format!("{err:#}")))?;
@@ -2607,6 +2630,9 @@ mod tests {
             ("dns", list(&["one.one"]), "dns_invalid"),
             ("sources", list(&["10.10.33.0/99"]), "sources_invalid"),
             ("table", 254.into(), "table_invalid"),
+            ("only_file", "only.txt".into(), "only_invalid"),
+            ("only_file", "/nonexistent/only.txt".into(), "only_invalid"),
+            ("only_file", 5.into(), "bad_param"),
             ("table", "main".into(), "bad_param"),
             ("kill_switch", "on".into(), "bad_param"),
         ];
@@ -2643,6 +2669,54 @@ mod tests {
         let blocked = field(get_ok(&r), "blocked").unwrap().clone();
         assert_eq!(field(&blocked, "v4").and_then(Value::as_bool), Some(true), "{blocked}");
         assert_eq!(field(&blocked, "v6").and_then(Value::as_bool), Some(false), "{blocked}");
+
+        // only the destinations listed in a file: followed by the node, a broken file keeps the
+        // list from before
+        let only = path.parent().unwrap().join("only.txt");
+        std::fs::write(&only, "1.1.1.1/32, 8.8.8.8\n9.9.9.9/24 # quad9\n").unwrap();
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let only_state = |e: &Value| {
+            (
+                s(e, "only_file").map(str::to_owned),
+                field(e, "only_count").and_then(Value::as_u64),
+                s(e, "only_error").map(str::to_owned),
+            )
+        };
+        let f = only.to_string_lossy().into_owned();
+        let r = request(
+            &api,
+            "set",
+            vec![("req", "exit".into()), ("v4", list(&["bob"])), ("only_file", f.as_str().into())],
+        )
+        .await;
+        let e = get_ok(&r);
+        assert_eq!(only_state(e), (Some(f.clone()), Some(3), None));
+        assert_eq!(crate::config::read_exits(&path).unwrap().only_file.as_deref(), Some(only.as_path()));
+        // bob is not alive: the kill switch blocks the listed destinations only
+        let ckr = api.node.ckr();
+        assert_eq!(ckr.target(ip("9.9.9.200")), Some(crate::ckr::Target::Blackhole));
+        assert_eq!(ckr.target(ip("4.4.4.4")), None, "the rest of the internet is direct");
+        std::fs::write(&only, "4.4.4.4").unwrap();
+        let r = request(&api, "set", vec![("req", "exit".into())]).await;
+        assert_eq!(only_state(get_ok(&r)), (Some(f.clone()), Some(1), None), "the file read again");
+        assert_eq!(api.node.ckr().target(ip("4.4.4.4")), Some(crate::ckr::Target::Blackhole));
+        assert_eq!(api.node.ckr().target(ip("9.9.9.200")), None);
+        // a changed file is noticed by its mtime, no request needed
+        std::fs::write(&only, "4.4.4.4\n5.5.5.0/24\n").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&only).unwrap().set_modified(later).unwrap();
+        api.node.exit_tick();
+        assert_eq!(api.node.exit_only_state(), (2, None));
+        assert_eq!(api.node.ckr().target(ip("5.5.5.5")), Some(crate::ckr::Target::Blackhole));
+        std::fs::write(&only, "4.4.4.4\nnot-an-address\n").unwrap();
+        let r = request(&api, "set", vec![("req", "exit".into())]).await;
+        let (_, count, err) = only_state(get_ok(&r));
+        assert_eq!(count, Some(2), "the list from before stays");
+        assert!(err.is_some_and(|e| e.contains("line 2")));
+        assert_eq!(api.node.ckr().target(ip("4.4.4.4")), Some(crate::ckr::Target::Blackhole));
+        let r = request(&api, "set", vec![("req", "exit".into()), ("only_file", Value::Nil)]).await;
+        assert_eq!(only_state(get_ok(&r)), (None, Some(0), None));
+        assert_eq!(api.node.ckr().target(ip("4.4.4.4")), Some(crate::ckr::Target::Blackhole), "all of it again");
 
         let r = request(&api, "set", vec![("req", "exit".into()), ("clear", true.into())]).await;
         assert_eq!(field(get_ok(&r), "v4"), Some(&Value::Array(Vec::new())));
@@ -2739,6 +2813,18 @@ mod tests {
         assert!(!e.kill_switch && !e.blocked.v4);
         let bad = ExitUpdate { v4: Some(vec!["nobody".into()]), ..Default::default() };
         assert_eq!(code(c.set_exit(&bad).await), Some(ErrorCode::GatewayUnknown));
+        let bad = ExitUpdate { only_file: Some(Some("/nonexistent/only.txt".into())), ..Default::default() };
+        assert_eq!(code(c.set_exit(&bad).await), Some(ErrorCode::OnlyInvalid));
+        // client_session runs for several tests at once: a file of its own
+        let only =
+            std::env::temp_dir().join(format!("dvpn-only-{}.txt", encode_b64(&crate::crypto::random_bytes::<9>())));
+        std::fs::write(&only, "1.1.1.1, 8.8.8.8\n9.9.9.9/24\n").unwrap();
+        let set = ExitUpdate { only_file: Some(Some(only.to_string_lossy().into_owned())), ..Default::default() };
+        let e = c.set_exit(&set).await.unwrap();
+        assert_eq!((e.only_file.as_deref(), e.only_count, e.only_error), (only.to_str(), 3, None));
+        let e = c.set_exit(&ExitUpdate { only_file: Some(None), ..Default::default() }).await.unwrap();
+        assert_eq!((e.only_file, e.only_count), (None, 0));
+        std::fs::remove_file(&only).unwrap();
         let e = c.set_exit(&ExitUpdate { clear: true, ..Default::default() }).await.unwrap();
         assert!(e.v4.is_empty() && e.kill_switch);
         let acl = c.acl().await.unwrap();

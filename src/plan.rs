@@ -38,6 +38,9 @@ pub struct Inputs<'a> {
     /// (with `from <source>` rules), not to the whole node.
     pub exit_table: Option<u32>,
     pub exit_sources: &'a [IpNet],
+    /// `[exit] only_file`, as read: only these destinations go through the gateway (and only
+    /// they are blocked by the kill switch). `None`: the whole internet.
+    pub exit_only: Option<&'a [IpNet]>,
     /// `[ckr.remote_subnets]`: over everything else.
     pub manual: &'a [Route],
     /// The group's access rules, if any.
@@ -65,6 +68,11 @@ pub struct Plan {
     pub exit: Vec<Route>,
     pub exit_table: Option<u32>,
     pub exit_sources: Vec<IpNet>,
+    /// Per family (IPv4, IPv6): internet destinations go into the tunnel by routes narrower
+    /// than a default one (`[exit] only_file`). Where nothing like Linux's fwmark keeps DVPN's
+    /// own packets out of the tunnel (Windows), its socket is then pinned to the physical
+    /// interface, in case a listed destination is a peer's endpoint.
+    pub exit_only: [bool; 2],
     /// The group's access rules and every member's addresses and subnets (whom they apply to).
     pub acl: Option<Acl>,
     pub members: BTreeMap<NodeId, Vec<IpNet>>,
@@ -139,19 +147,37 @@ pub fn compute(i: &Inputs) -> Plan {
         let ula = ula_addr(&i.group, &c.body.node);
         ckr.push(Route { net: IpNet::from(IpAddr::V6(ula)), target, system: false });
     }
-    // the chosen gateways get the internet (private ranges stay local)
+    // the chosen gateways get the internet (private ranges stay local), or only the listed
+    // destinations of it
     let mut inet = Vec::new();
-    for (gw, kill, spec) in [(i.exit4, i.kill.0, "inetv4"), (i.exit6, i.kill.1, "inetv6")] {
-        if let Some(gw) = gw {
-            inet.extend(parse_spec(spec, gw).expect("valid spec"));
-        } else if kill {
-            // kill switch: the internet stays in the tunnel, where nothing carries it
-            inet.extend(parse_spec(spec, i.me).expect("valid spec").into_iter().map(|mut r| {
+    let mut exit_only = [false; 2];
+    for (fam6, gw, kill, spec) in [(false, i.exit4, i.kill.0, "inetv4"), (true, i.exit6, i.kill.1, "inetv6")] {
+        let target = match (gw, kill) {
+            (Some(gw), _) => Target::Node(gw),
+            (None, true) => Target::Blackhole, // the internet stays in the tunnel, where nothing carries it
+            (None, false) => continue,
+        };
+        match i.exit_only {
+            Some(only) => {
+                // a member's own prefix stays the member's (the table keeps the later of equal
+                // prefixes; a narrower one wins anyway)
+                let before = inet.len();
+                inet.extend(
+                    only.iter()
+                        .filter(|n| {
+                            matches!(n, IpNet::V6(_)) == fam6
+                                && !members.iter().any(|c| c.body.prefixes.iter().any(|p| p.trunc() == **n))
+                        })
+                        .map(|n| Route { net: n.trunc(), target, system: true }),
+                );
+                exit_only[fam6 as usize] = inet.len() > before;
+            }
+            None => inet.extend(parse_spec(spec, gw.unwrap_or(i.me)).expect("valid spec").into_iter().map(|mut r| {
                 if matches!(r.target, Target::Node(_)) {
-                    r.target = Target::Blackhole;
+                    r.target = target;
                 }
                 r
-            }));
+            })),
         }
     }
     let split = i.exit_table.is_some() || !i.exit_sources.is_empty();
@@ -178,7 +204,12 @@ pub fn compute(i: &Inputs) -> Plan {
 
     let zone = i.dns_domain.map(|d| zone(i, d, &members)).unwrap_or_default();
     // other names through the gateway while it carries our IPv4 internet
-    let dns_upstream = if i.exit4.is_some() && i.dns_domain.is_some() { i.dns_forward.to_vec() } else { Vec::new() };
+    // (not with a list of destinations: the rest of the internet, the resolvers too, is direct)
+    let dns_upstream = if i.exit4.is_some() && i.exit_only.is_none() && i.dns_domain.is_some() {
+        i.dns_forward.to_vec()
+    } else {
+        Vec::new()
+    };
 
     Plan {
         forwards: forward_targets(i),
@@ -188,6 +219,7 @@ pub fn compute(i: &Inputs) -> Plan {
         exit,
         exit_table: i.exit_table,
         exit_sources: i.exit_sources.to_vec(),
+        exit_only,
         acl: i.acl.cloned(),
         members: acl_members,
         member_prefixes,
@@ -264,6 +296,7 @@ mod tests {
             kill: (false, false),
             exit_table: None,
             exit_sources: &[],
+            exit_only: None,
             manual: &[],
             acl: None,
             dns_domain: Some("dvpn"),
@@ -354,6 +387,63 @@ mod tests {
     }
 
     #[test]
+    fn exit_for_listed_destinations_only() {
+        let w = world();
+        let office = by_name(&w, "office");
+        let mut i = inputs(&w);
+        let only = [net("1.1.1.1/32"), net("8.8.8.8/32"), net("9.9.9.0/24"), net("2001:db8:1::/48")];
+        i.exit_only = Some(&only);
+        assert!(compute(&i).ckr.iter().all(|r| !only.contains(&r.net)), "no gateway, no kill switch: all direct");
+        assert_eq!(compute(&i).exit_only, [false, false]);
+        i.exit4 = Some(office);
+        let p = compute(&i);
+        for n in ["1.1.1.1/32", "8.8.8.8/32", "9.9.9.0/24"] {
+            assert_eq!(target(&p, n), Some(Target::Node(office)), "{n}");
+            assert!(p.ckr.iter().any(|r| r.net == net(n) && r.system), "{n}: a system route");
+        }
+        assert_eq!(target(&p, "0.0.0.0/0"), None, "the rest of the internet goes direct");
+        assert_eq!(target(&p, "192.168.0.0/16"), None, "no holes needed");
+        assert_eq!(target(&p, "2001:db8:1::/48"), None, "IPv6 only with exit6");
+        assert_eq!(p.exit_only, [true, false]);
+        assert!(p.exit.is_empty() && !p.exit_split());
+        // the kill switch blocks only the listed destinations
+        i.exit4 = None;
+        i.kill = (true, true);
+        let p = compute(&i);
+        assert_eq!(target(&p, "9.9.9.0/24"), Some(Target::Blackhole));
+        assert_eq!(target(&p, "2001:db8:1::/48"), Some(Target::Blackhole));
+        assert_eq!(target(&p, "0.0.0.0/0"), None);
+        assert_eq!(target(&p, "::/0"), None);
+        assert_eq!(p.exit_only, [true, true]);
+        // a family the list has nothing of needs no pinning
+        let v4 = [net("1.1.1.1/32")];
+        i.exit_only = Some(&v4);
+        assert_eq!(compute(&i).exit_only, [true, false]);
+        // an empty list: nothing through the gateway (not the whole internet)
+        i.exit_only = Some(&[]);
+        i.exit4 = Some(office);
+        let p = compute(&i);
+        assert_eq!(target(&p, "0.0.0.0/0"), None);
+        assert_eq!(p.exit_only, [false, false]);
+        // a member's own subnet in the list stays the member's
+        let bob = by_name(&w, "bob");
+        let mixed = [net("192.168.30.0/24"), net("1.1.1.1/32")];
+        i.exit_only = Some(&mixed);
+        i.exit4 = Some(bob);
+        let p = compute(&i);
+        assert_eq!(target(&p, "192.168.30.0/24"), Some(Target::Node(office)));
+        assert_eq!(target(&p, "1.1.1.1/32"), Some(Target::Node(bob)));
+        // with sources: the listed destinations, in the exit table
+        let sources = [net("10.10.11.0/24")];
+        i.exit_sources = &sources;
+        let p = compute(&i);
+        assert!(p.exit_split());
+        assert!(p.exit.iter().any(|r| r.net == net("1.1.1.1/32") && r.system && r.target == Target::Node(bob)));
+        assert!(p.exit.iter().all(|r| r.net != net("0.0.0.0/0")));
+        assert!(p.ckr.iter().filter(|r| r.net == net("1.1.1.1/32")).all(|r| !r.system));
+    }
+
+    #[test]
     fn dns_zone_and_upstream() {
         let w = world();
         let mut i = inputs(&w);
@@ -368,6 +458,10 @@ mod tests {
         assert!(compute(&i).dns_upstream.is_empty(), "forwarding only while a gateway is in use");
         i.exit4 = Some(by_name(&w, "office"));
         assert_eq!(compute(&i).dns_upstream, dns);
+        let only = [net("9.9.9.0/24")];
+        i.exit_only = Some(&only);
+        assert!(compute(&i).dns_upstream.is_empty(), "a list of destinations: names resolve directly");
+        i.exit_only = None;
         i.dns_domain = None;
         let p = compute(&i);
         assert!(p.zone.is_empty() && p.dns_upstream.is_empty(), "no DNS server, nothing to serve");

@@ -305,6 +305,39 @@ wait_for 60 nsx b ping -c1 -W1 10.10.33.1 >/dev/null || fail "b -> a not back af
 wait_for 30 nsx b ping -c1 -W1 10.10.33.3 >/dev/null || fail "b -> c not back after the gateways came back"
 ok "kill switch: no gateway, no internet (and direct with it off)"
 
+# Only listed destinations through the gateway ([exit] only_file): 203.0.113.1 goes through the
+# gateway, another internet host (.99) directly; the node follows the file when it changes.
+nsx wan ip addr add 203.0.113.99/24 dev br0
+exited() { echo $(( $(masq) + $(masq_a) )); }
+printf '# through the gateway\n203.0.113.1\n' > "$W/only.txt"
+from=$(($(wc -l < "$W/node-b.log") + 1))
+"$D" --dir "$W/b" exit --only "$W/only.txt" | grep -q "only to the 1 destinations" || fail "b: exit --only"
+wait_for 10 sh -c "tail -n +$from '$W/node-b.log' | sed 's/\x1b\[[0-9;]*m//g' | grep -q '1 destinations through the gateway'" \
+    || fail "b did not read only_file"
+nsx b ip route show table 7347 | grep -q '^203.0.113.1 dev' || fail "no route for the listed destination: $(nsx b ip route show table 7347)"
+nsx b ip route show table 7347 | grep -q '^default' && fail "the whole internet still in the tunnel"
+before=$(exited)
+wait_for 10 nsx b ping -c1 -W1 203.0.113.1 >/dev/null || fail "b -> listed destination"
+nsx b ping -c3 -i0.2 -W1 203.0.113.1 >/dev/null || fail "b -> listed destination"
+[ $(( $(exited) - before )) -ge 3 ] || fail "the listed destination did not go through a gateway"
+before=$(exited)
+nsx b ping -c3 -i0.2 -W1 203.0.113.99 >/dev/null || fail "b -> unlisted destination (direct)"
+[ $(( $(exited) - before )) -lt 3 ] || fail "an unlisted destination went through a gateway"
+nsx b ping -c2 -W1 10.10.33.1 >/dev/null || fail "b -> a broken by the listed routes"
+# the file changes (a list of commas this time, and many entries: one ip -batch): followed
+{ printf '203.0.113.99/32, 198.51.100.0/24\n'; i=0; while [ $i -lt 40 ]; do printf '100.64.%d.0/24\n' $i; i=$((i+1)); done; } > "$W/only.txt"
+wait_for 10 sh -c "ip netns exec b ip route show table 7347 | grep -q '^203.0.113.99 dev'" || fail "b did not follow the edited only_file"
+nsx b ip route show table 7347 | grep -q '^203.0.113.1 dev' && fail "a destination no longer listed kept its route"
+[ "$(nsx b ip route show table 7347 | grep -c '^100.64.')" -eq 40 ] || fail "not all 40 listed networks routed (ip -batch)"
+before=$(exited)
+nsx b ping -c3 -i0.2 -W1 203.0.113.99 >/dev/null || fail "b -> newly listed destination"
+[ $(( $(exited) - before )) -ge 3 ] || fail "the newly listed destination did not go through a gateway"
+"$D" --dir "$W/b" exit --only none >/dev/null
+wait_for 10 sh -c "ip netns exec b ip route show table 7347 | grep -q '^default'" || fail "--only none: not the whole internet again"
+[ "$(nsx b ip route show table 7347 | grep -c '^100.64.')" -eq 0 ] || fail "--only none: listed routes left behind"
+nsx wan ip addr del 203.0.113.99/24 dev br0
+ok "exit only to listed destinations (only_file), followed when edited"
+
 # DNS through the gateway: B's DNS server forwards other names to [exit] dns, through the
 # tunnel; the upstream (a stub on the "internet") sees the gateway's address, not B's.
 if command -v python3 >/dev/null; then
