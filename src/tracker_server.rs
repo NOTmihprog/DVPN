@@ -486,6 +486,8 @@ pub async fn run(addr: std::net::IpAddr, port: u16, identity: Identity) -> std::
             Ok(r) => r,
             Err(e) => {
                 log::debug!("Server | recv error: {e}");
+                // errors come back at once: no spinning on them (see `Api::recv_loop`)
+                tokio::task::yield_now().await;
                 continue;
             }
         };

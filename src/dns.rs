@@ -237,7 +237,11 @@ pub async fn serve(addr: IpAddr, zone: Arc<ArcSwap<Zone>>, domain: String, upstr
     log::info!("DNS | names of members under .{domain} on {addr}:53");
     let mut buf = [0u8; 512];
     loop {
-        let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+        let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+            // errors come back at once: no spinning on them (see `Api::recv_loop`)
+            tokio::task::yield_now().await;
+            continue;
+        };
         let up = upstream.load();
         if !up.is_empty() && n >= 12 && !in_zone(&buf[..n], &domain) {
             tokio::spawn(forward(buf[..n].to_vec(), from, up.to_vec(), sock.clone()));

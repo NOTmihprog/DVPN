@@ -192,8 +192,10 @@ impl Transport {
                 r = sock.recv_from(buf) => match r {
                     Ok((n, from)) => return (n, normalize(from)),
                     Err(e) => {
-                        // e.g. ICMP port unreachable surfaced as ECONNREFUSED / WSAECONNRESET
+                        // e.g. ICMP port unreachable surfaced as ECONNREFUSED / WSAECONNRESET; or
+                        // the runtime shutting down, every time: no spinning on it
                         log::debug!("Transport | recv error: {e}");
+                        tokio::task::yield_now().await;
                     }
                 },
                 _ = self.rebound.notified() => {}

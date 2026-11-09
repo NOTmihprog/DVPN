@@ -1031,6 +1031,9 @@ impl Api {
                 Ok((_, None)) => continue,
                 Err(e) => {
                     log::debug!("API | recv error: {e}");
+                    // an error comes back at once, also every time from then on (the runtime
+                    // shutting down): give the worker back, so the loop cannot spin
+                    tokio::task::yield_now().await;
                     continue;
                 }
             };
