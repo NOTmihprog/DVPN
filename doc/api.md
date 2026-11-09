@@ -97,7 +97,7 @@ UDP `127.0.0.1:9902`.
 | `name_not_str`, `addr_validate_error`, `endpoint_validate_error`, `sub_args_not_dict`, `force_not_bool` | `set peer`: неверное поле |
 | `peer_not_exist`, `error_delete_self_peer` | `del` |
 | `not_int`, `out_of_range`, `route_exist`, `route_not_exist`, `not_permission` | `route` |
-| `gateway_unknown`, `gateway_self`, `dns_invalid`, `sources_invalid`, `table_invalid`, `config_write` | `set exit` |
+| `gateway_unknown`, `gateway_self`, `dns_invalid`, `sources_invalid`, `table_invalid`, `only_invalid`, `config_write` | `set exit` |
 | `not_admin`, `clock_untrusted` | операции админа: у узла нет секрета группы; часы раньше сборки (нужен NTP) |
 | `member_unknown`, `member_ambiguous`, `member_not_seen` | участник не найден, имя подходит нескольким, сертификата ещё нет |
 | `addr_taken`, `addr_invalid`, `route_invalid`, `endpoint_invalid`, `no_address`, `config_read` | `set invite`, `set node` |
