@@ -916,7 +916,10 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
                 println!("\n{}\n", github_table(&["Name", "Key", "Addr", "Cert valid"], &rows));
             }
             if !all && !keys_only.is_empty() {
-                println!("{} revoked keys without a certificate (used invites) not shown; --all lists them.", keys_only.len());
+                println!(
+                    "{} revoked keys without a certificate (used invites) not shown; --all lists them.",
+                    keys_only.len()
+                );
             }
         }
         GroupCommand::Rotate { group, lead } => {
