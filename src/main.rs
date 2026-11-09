@@ -355,6 +355,9 @@ enum GroupCommand {
         /// Group name or id (default: the only group)
         #[arg(short = 'g', long)]
         group: Option<String>,
+        /// Also list revoked keys without a certificate (mostly the one-time keys of used invites)
+        #[arg(short = 'a', long)]
+        all: bool,
     },
     /// Exclude a node from the group (admins only) and change the group psk; a running node of
     /// this admin spreads it within seconds
@@ -878,7 +881,7 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
                 .collect();
             println!("\n{}\n", github_table(&["Group", "Id", "Role", "Name", "Addr", "Cert valid"], &rows));
         }
-        GroupCommand::Members { group } => {
+        GroupCommand::Members { group, all } => {
             let g = pick_group(conf, &group);
             let store = state();
             let m = Membership::of(&store, &g.id);
@@ -899,14 +902,21 @@ fn cmd_group(conf: &mut Config, dir: &Path, cmd: GroupCommand) {
                     ]
                 })
                 .collect();
-            for r in &m.revoked {
-                if !certs.iter().any(|c| c.body.node == *r) {
-                    rows.push(vec![String::new(), r.to_string(), String::new(), "revoked".into()]);
-                }
+            // revoked keys nobody has a certificate of: mostly the one-time keys of used invites
+            // (the admin revokes one when its member gets a regular certificate)
+            let mut keys_only: Vec<String> =
+                m.revoked.iter().filter(|r| !certs.iter().any(|c| c.body.node == **r)).map(|r| r.to_string()).collect();
+            keys_only.sort();
+            if all {
+                rows.extend(keys_only.iter().map(|k| vec![String::new(), k.clone(), String::new(), "revoked".into()]));
             }
-            println!("\n{}\n", github_table(&["Name", "Key", "Addr", "Cert valid"], &rows));
             if rows.is_empty() {
                 println!("No records yet: members appear once an admin node has seen them online.");
+            } else {
+                println!("\n{}\n", github_table(&["Name", "Key", "Addr", "Cert valid"], &rows));
+            }
+            if !all && !keys_only.is_empty() {
+                println!("{} revoked keys without a certificate (used invites) not shown; --all lists them.", keys_only.len());
             }
         }
         GroupCommand::Rotate { group, lead } => {
