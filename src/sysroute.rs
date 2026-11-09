@@ -345,6 +345,7 @@ mod tests {
         assert!(!w.iter().any(|r| r.net() == "10.99.0.0/16".parse::<IpNet>().unwrap()), "~ entry");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn batch_failures_by_line() {
         let err = "Error: Nexthop has invalid gateway.\nCommand failed -:2\nRTNETLINK answers: No such process\nCommand failed -:5\nCommand failed -:99\n";
