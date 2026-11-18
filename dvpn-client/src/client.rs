@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -7,6 +7,7 @@ use rmpv::Value;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
+use crate::pipe::{PIPE_QUEUE, Pipe, PipeSlot};
 use crate::transport::Socket;
 use crate::types::*;
 use crate::wire::{decode, encode, field, field_str, from_value, map};
@@ -17,8 +18,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 type Reply = Result<Value, Error>;
 
-struct Shared {
-    sock: Socket,
+pub(crate) struct Shared {
+    pub(crate) sock: Socket,
     name: String,
     pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     /// The answer to our `init`, while we wait for it.
@@ -29,7 +30,9 @@ struct Shared {
     /// The last `sub` sent (with the token), sent again when the node forgot us.
     sub: Mutex<Option<Vec<u8>>>,
     /// API routes this client holds, as `route reg` messages: taken again when the node forgot us.
-    routes: Mutex<std::collections::BTreeMap<u8, Vec<u8>>>,
+    pub(crate) routes: std::sync::Mutex<BTreeMap<u8, Vec<u8>>>,
+    /// Routes with a [`Pipe`]: their packets go to it alone.
+    pub(crate) pipes: std::sync::Mutex<HashMap<u8, PipeSlot>>,
 }
 
 impl Shared {
@@ -84,7 +87,8 @@ impl Client {
             typed,
             net,
             sub: Mutex::default(),
-            routes: Mutex::default(),
+            routes: Default::default(),
+            pipes: Default::default(),
         });
         let task = tokio::spawn(recv_loop(shared.clone()));
         let (tx, rx) = oneshot::channel();
@@ -165,13 +169,43 @@ impl Client {
         let f = vec![("route", Value::from(route))];
         let again = self.message("route", Some("reg"), 0, f.clone());
         self.request("route", Some("reg"), f).await?;
-        self.shared.routes.lock().await.insert(route, again);
+        self.shared.routes.lock().unwrap().insert(route, again);
         Ok(())
+    }
+
+    /// Takes API route `route` as a [`Pipe`]: its packets go to the pipe alone, through a queue of
+    /// [`PIPE_QUEUE`] packets (see [`Client::pipe_with_queue`]). Dropping the pipe gives the route
+    /// back.
+    pub async fn pipe(&self, route: u8) -> Result<Pipe, Error> {
+        self.pipe_with_queue(route, PIPE_QUEUE).await
+    }
+
+    /// [`Client::pipe`] with a queue of `queue` packets: what comes while it is full is dropped
+    /// and counted ([`PipeReceiver::dropped`]).
+    pub async fn pipe_with_queue(&self, route: u8, queue: usize) -> Result<Pipe, Error> {
+        let (tx, rx) = tokio::sync::mpsc::channel(queue.max(1));
+        let dropped = Arc::new(AtomicU64::new(0));
+        {
+            let mut pipes = self.shared.pipes.lock().unwrap();
+            if pipes.contains_key(&route) {
+                return Err(Error::Api {
+                    code: ErrorCode::RouteExist,
+                    msg: format!("route {route}: this client has a pipe on it already"),
+                });
+            }
+            pipes.insert(route, PipeSlot { tx, dropped: dropped.clone() });
+        }
+        if let Err(e) = self.route_reg(route).await {
+            self.shared.pipes.lock().unwrap().remove(&route);
+            return Err(e);
+        }
+        let del = self.message("route", Some("del"), 0, vec![("route", Value::from(route))]);
+        Ok(Pipe::new(self.shared.clone(), route, rx, dropped, del))
     }
 
     /// Gives API route `route` back.
     pub async fn route_del(&self, route: u8) -> Result<(), Error> {
-        self.shared.routes.lock().await.remove(&route);
+        self.shared.routes.lock().unwrap().remove(&route);
         self.request("route", Some("del"), vec![("route", Value::from(route))]).await.map(|_| ())
     }
 
@@ -195,7 +229,7 @@ impl Client {
         self.shared.sock.send(&encode(&m)).await.map_err(Error::from)
     }
 
-    /// Packets members send to the routes this client holds.
+    /// Packets members send to the routes this client holds, but for those with a [`Pipe`].
     pub fn net_packets(&self) -> broadcast::Receiver<NetPacket> {
         self.shared.net.subscribe()
     }
@@ -475,8 +509,10 @@ fn strings(l: &[String]) -> Value {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        self.shared.sock.try_send(&encode(&map(vec![("type", "close".into())])));
+        let _ = self.shared.sock.try_send(&encode(&map(vec![("type", "close".into())])));
         self.task.abort();
+        // pipes see the end
+        self.shared.pipes.lock().unwrap().clear();
     }
 }
 
@@ -514,7 +550,7 @@ async fn recv_loop(shared: Arc<Shared>) {
                     if let Some(sub) = shared.sub.lock().await.clone() {
                         let _ = shared.sock.send(&sub).await;
                     }
-                    let again: Vec<Vec<u8>> = shared.routes.lock().await.values().cloned().collect();
+                    let again: Vec<Vec<u8>> = shared.routes.lock().unwrap().values().cloned().collect();
                     for m in again {
                         let _ = shared.sock.send(&m).await;
                     }
@@ -525,7 +561,15 @@ async fn recv_loop(shared: Arc<Shared>) {
                 let key = field_str(&v, "key").map(str::to_owned);
                 let data = field(&v, "pack").and_then(|p| p.as_slice()).map(<[u8]>::to_vec);
                 if let (Some(route), Some(key), Some(data)) = (route, key, data) {
-                    let _ = shared.net.send(NetPacket { route, key, data });
+                    let p = NetPacket { route, key, data };
+                    if let Some(slot) = shared.pipes.lock().unwrap().get(&route) {
+                        // a pipe's packets go to it alone: no copies, and a slow pipe holds up nobody
+                        if slot.tx.try_send(p).is_err() {
+                            slot.dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                    let _ = shared.net.send(p);
                 }
                 let _ = shared.events.send(v);
             }

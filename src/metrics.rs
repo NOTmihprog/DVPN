@@ -76,10 +76,13 @@ pub enum Drop {
     /// From a member: the ACL does not let it reach this node (filtered by the node itself
     /// where there is no nftables).
     Acl,
+    /// From a member, for a client of the API: the queue to the API is full (the client takes
+    /// its packets too slowly).
+    ApiQueue,
 }
 
 impl Drop {
-    pub const ALL: [Drop; 11] = [
+    pub const ALL: [Drop; 12] = [
         Drop::NoRoute,
         Drop::NoSession,
         Drop::Unreachable,
@@ -91,6 +94,7 @@ impl Drop {
         Drop::HopLimit,
         Drop::NoWayOn,
         Drop::Acl,
+        Drop::ApiQueue,
     ];
 
     pub fn name(self) -> &'static str {
@@ -106,6 +110,7 @@ impl Drop {
             Drop::HopLimit => "hop_limit",
             Drop::NoWayOn => "no_way_on",
             Drop::Acl => "acl",
+            Drop::ApiQueue => "api_queue",
         }
     }
 }

@@ -18,6 +18,7 @@
 mod addr;
 mod client;
 mod error;
+mod pipe;
 mod transport;
 pub mod types;
 pub mod wire;
@@ -25,6 +26,7 @@ pub mod wire;
 pub use addr::ApiAddr;
 pub use client::Client;
 pub use error::{Error, ErrorCode};
+pub use pipe::{PIPE_QUEUE, Pipe, PipeReceiver, PipeSender};
 pub use types::*;
 
 /// The API protocol version this library speaks (`init` `version`).

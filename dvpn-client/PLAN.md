@@ -134,7 +134,10 @@ let (from, data) = pipe.recv().await?;
 `members`, `exit`/`set_exit`, `acl`, `reset_endpoint`. Вместо `MockNode` пока тесты против настоящего узла:
 `api::tests::client_over_udp` / `client_over_a_unix_socket` в `dvpn`. Не сделано: `peer_*`/`server_*` (устаревшие
 — только через `raw`), типизированные события, `MockNode`.
-Этап 6 частично (2026-11-03): `invite`, `set_node`, `revoke`, `rotate`, `set_acl`, `clear_acl`. Большие ответы и журнал (2026-11-03): `members`/`neighbors`/`routes`/`metrics` частями при `too_large`, `Event::Log`, `Subscription`. События (2026-11-03): `events()` (тип `Event`), `subscribe(kinds, metrics_secs)`, повтор после `init`. Доступ (2026-11-03): поиск сокета в `$XDG_RUNTIME_DIR/dvpn`, токен UDP (`DVPN_API_TOKEN` или файл узла) в каждом запросе, `with_token`. Этап 7 для CLI начат: диагностика (`status`, `neighbors`, `routes`, `metrics`, `path`, `ping`) идёт через клиент,
+Этап 6 частично (2026-11-03): `invite`, `set_node`, `revoke`, `rotate`, `set_acl`, `clear_acl`. Большие ответы и журнал (2026-11-03): `members`/`neighbors`/`routes`/`metrics` частями при `too_large`, `Event::Log`, `Subscription`. События (2026-11-03): `events()` (тип `Event`), `subscribe(kinds, metrics_secs)`, повтор после `init`. Доступ (2026-11-03): поиск сокета в `$XDG_RUNTIME_DIR/dvpn`, токен UDP (`DVPN_API_TOKEN` или файл узла) в каждом запросе, `with_token`. Трубы (2026-11-10): `Client::pipe`/`pipe_with_queue`, `Pipe` со своей очередью (`PIPE_QUEUE` = 4096) без копий в
+`raw_events`/`net_packets`, `split` на `PipeSender` (с `try_send`/`poll_send_ready`) и `PipeReceiver` (`poll_recv`,
+`poll_recv_many`, `dropped`); возврат маршрута при `Drop`; тест в `api::tests::client_session`. Не сделано: пример
+`pipe_chat.rs` на netns. Этап 7 для CLI начат: диагностика (`status`, `neighbors`, `routes`, `metrics`, `path`, `ping`) идёт через клиент,
 `api::query` удалён.
 
 | # | Что | Готово, когда |

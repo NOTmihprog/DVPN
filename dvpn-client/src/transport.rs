@@ -81,13 +81,22 @@ impl Socket {
         }
     }
 
-    /// Without waiting (for `Drop`): whether it went out does not matter.
-    pub fn try_send(&self, data: &[u8]) {
-        let _ = match self {
-            Socket::Udp(s) => s.try_send(data),
+    /// Without waiting: `WouldBlock` when the socket's buffer is full.
+    pub fn try_send(&self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            Socket::Udp(s) => s.try_send(data).map(|_| ()),
             #[cfg(unix)]
-            Socket::Unix { sock, node, .. } => sock.try_send_to(data, node),
-        };
+            Socket::Unix { sock, node, .. } => sock.try_send_to(data, node).map(|_| ()),
+        }
+    }
+
+    /// Ready when [`Socket::try_send`] may go through.
+    pub fn poll_send_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        match self {
+            Socket::Udp(s) => s.poll_send_ready(cx),
+            #[cfg(unix)]
+            Socket::Unix { sock, .. } => sock.poll_send_ready(cx),
+        }
     }
 
     pub async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {

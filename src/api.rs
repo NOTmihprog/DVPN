@@ -108,10 +108,23 @@ fn is_abstract(p: &std::path::Path) -> bool {
     p.as_os_str().as_bytes().first() == Some(&0)
 }
 
+/// Socket buffers of the API: a client's own protocol (`net`) comes in bursts as large as its
+/// congestion window, which the default ~200 KiB drops in part before the API loop gets to it.
+const API_SOCKET_BUFFER: usize = 4 << 20;
+
+/// As large as the system lets (Linux caps it at `net.core.rmem_max`/`wmem_max`). Best effort: a
+/// smaller buffer still works.
+fn big_buffers(s: socket2::SockRef<'_>) {
+    let _ = s.set_recv_buffer_size(API_SOCKET_BUFFER);
+    let _ = s.set_send_buffer_size(API_SOCKET_BUFFER);
+}
+
 impl ApiSocket {
     pub async fn bind(addr: &str) -> anyhow::Result<Self> {
         if let Ok(a) = addr.parse::<SocketAddr>() {
-            return Ok(ApiSocket::Inet(UdpSocket::bind(a).await?));
+            let sock = UdpSocket::bind(a).await?;
+            big_buffers(socket2::SockRef::from(&sock));
+            return Ok(ApiSocket::Inet(sock));
         }
         #[cfg(unix)]
         {
@@ -124,6 +137,7 @@ impl ApiSocket {
             let tmp = path.with_extension("new");
             let _ = std::fs::remove_file(&tmp);
             let sock = UnixDatagram::bind(&tmp)?;
+            big_buffers(socket2::SockRef::from(&sock));
             access::secure_socket(&tmp).and_then(|()| std::fs::rename(&tmp, &path)).inspect_err(|_| {
                 let _ = std::fs::remove_file(&tmp);
             })?;
@@ -2769,7 +2783,7 @@ mod tests {
     async fn client_session(addr: &str) {
         use dvpn_client::{Client, ErrorCode, ExitUpdate};
         let (api, secret) = api_with_secret(true).await;
-        add_members(&api, &secret);
+        let (bob, _) = add_members(&api, &secret);
         let node = api.node.clone();
         let sock = ApiSocket::bind(addr).await.unwrap();
         let at: dvpn_client::ApiAddr = sock.describe().parse().unwrap();
@@ -2843,8 +2857,62 @@ mod tests {
             Err(dvpn_client::Error::PacketTooLarge { .. })
         ));
         c.send_net(40, "alice", b"hello").await.unwrap();
+
+        // a pipe: its route's packets go to it alone, not to raw_events / net_packets
+        let mut raw = c.raw_events();
+        let mut net = c.net_packets();
+        let mut pipe = c.pipe(42).await.unwrap();
+        assert_eq!(code(c.pipe(42).await), Some(ErrorCode::RouteExist));
+        assert_eq!(c.own_routes().await.unwrap(), vec![40, 42]);
+        node.to_api(42, bob, b"to the pipe");
+        node.to_api(40, bob, b"to route 40");
+        let wait = Duration::from_secs(5);
+        let p = tokio::time::timeout(wait, pipe.recv()).await.unwrap().unwrap();
+        assert_eq!((p.route, p.key, p.data), (42, bob.to_string(), b"to the pipe".to_vec()));
+        let p = tokio::time::timeout(wait, net.recv()).await.unwrap().unwrap();
+        assert_eq!((p.route, p.data), (40, b"to route 40".to_vec()), "the pipe's packet is not here");
+        let v = tokio::time::timeout(wait, raw.recv()).await.unwrap().unwrap();
+        assert_eq!(field(&v, "rou").and_then(Value::as_u64), Some(40), "nor here");
+        assert!(matches!(
+            pipe.send("alice", &[0; dvpn_client::MAX_PAYLOAD + 1]).await,
+            Err(dvpn_client::Error::PacketTooLarge { .. })
+        ));
+        pipe.send("alice", b"from the pipe").await.unwrap();
+        let (tx, rx) = pipe.split();
+        assert!(tx.try_send("alice", b"without waiting").is_ok());
+        drop((tx, rx));
+        // the route is given back without an answer awaited
+        let mut routes = Vec::new();
+        for _ in 0..50 {
+            routes = c.own_routes().await.unwrap();
+            if routes == [40] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(routes, vec![40]);
+        let mut pipe = c.pipe(42).await.unwrap();
         drop(c);
+        assert!(tokio::time::timeout(wait, pipe.recv()).await.unwrap().is_none(), "a pipe ends with its client");
         std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
+    }
+
+    /// Packets for the API that do not fit its queue are counted, not just lost.
+    #[tokio::test]
+    async fn a_full_api_queue_is_counted() {
+        let Api { node, .. } = api(false).await;
+        let (tx, mut rx) = mpsc::channel(1);
+        node.set_api_sink(tx);
+        let me = node.storage.self_id();
+        node.to_api(40, me, b"a");
+        node.to_api(40, me, b"b");
+        assert_eq!(rx.try_recv().unwrap().2, b"a");
+        let drops: HashMap<_, _> = node.metrics.drops().into_iter().map(|(d, n)| (d.name(), n)).collect();
+        assert_eq!(drops["api_queue"], 1);
+        drop(rx);
+        node.to_api(40, me, b"c");
+        let drops: HashMap<_, _> = node.metrics.drops().into_iter().map(|(d, n)| (d.name(), n)).collect();
+        assert_eq!(drops["api_queue"], 1, "a stopped API is not a full queue");
     }
 
     #[tokio::test(flavor = "multi_thread")]

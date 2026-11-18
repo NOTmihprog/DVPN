@@ -758,6 +758,16 @@ impl Node {
         let _ = self.api_tx.set(tx);
     }
 
+    /// A packet from `peer` on API route `route`, for the client holding it. A full queue drops it,
+    /// counted (`api_queue`): otherwise a client reading too slowly sees losses nobody can explain.
+    pub fn to_api(&self, route: u8, peer: NodeId, body: &[u8]) {
+        if let Some(tx) = self.api_tx.get()
+            && let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send((route, peer, body.to_vec()))
+        {
+            self.metrics.dropped(crate::metrics::Drop::ApiQueue);
+        }
+    }
+
     pub fn client(&self, addr: &SocketAddr) -> Option<&Arc<TrackerClient>> {
         self.clients_by_addr.get(addr)
     }
@@ -1162,11 +1172,7 @@ impl Node {
                     KIND_ROUTING => self.handle_routing(peer, body).await,
                     KIND_FORWARD => Box::pin(self.handle_forward(peer, body)).await,
                     KIND_REPORT => self.handle_report(peer, body).await,
-                    k if k >= KIND_API_MIN => {
-                        if let Some(tx) = self.api_tx.get() {
-                            let _ = tx.try_send((k, peer, body.to_vec()));
-                        }
-                    }
+                    k if k >= KIND_API_MIN => self.to_api(k, peer, body),
                     k => log::debug!("Link | unknown kind {k} from {}", node(peer)),
                 }
             }
@@ -1781,11 +1787,7 @@ impl Node {
                             _ => {}
                         }
                     }
-                    k if k >= KIND_API_MIN => {
-                        if let Some(tx) = self.api_tx.get() {
-                            let _ = tx.try_send((k, peer, body.to_vec()));
-                        }
-                    }
+                    k if k >= KIND_API_MIN => self.to_api(k, peer, body),
                     _ => {}
                 }
             }
