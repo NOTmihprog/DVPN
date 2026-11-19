@@ -33,8 +33,6 @@ pub(crate) struct PipeSlot {
 struct Owner {
     shared: Arc<Shared>,
     route: u8,
-    /// `route del`, with the token.
-    del: Vec<u8>,
 }
 
 impl Drop for Owner {
@@ -42,7 +40,8 @@ impl Drop for Owner {
         self.shared.pipes.lock().unwrap().remove(&self.route);
         self.shared.routes.lock().unwrap().remove(&self.route);
         // no answer awaited: if it is lost, the node frees the route when the client goes
-        let _ = self.shared.sock().try_send(&self.del);
+        let del = self.shared.message("route", Some("del"), 0, vec![("route", Value::from(self.route))]);
+        let _ = self.shared.sock().try_send(&del);
     }
 }
 
@@ -57,14 +56,8 @@ impl Pipe {
     /// The largest packet that goes through relays.
     pub const MAX_PAYLOAD: usize = MAX_PAYLOAD;
 
-    pub(crate) fn new(
-        shared: Arc<Shared>,
-        route: u8,
-        rx: mpsc::Receiver<NetPacket>,
-        dropped: Arc<AtomicU64>,
-        del: Vec<u8>,
-    ) -> Pipe {
-        let owner = Arc::new(Owner { shared: shared.clone(), route, del });
+    pub(crate) fn new(shared: Arc<Shared>, route: u8, rx: mpsc::Receiver<NetPacket>, dropped: Arc<AtomicU64>) -> Pipe {
+        let owner = Arc::new(Owner { shared: shared.clone(), route });
         Pipe {
             tx: PipeSender { shared, route, _owner: owner.clone() },
             rx: PipeReceiver { rx, dropped, _owner: owner },
