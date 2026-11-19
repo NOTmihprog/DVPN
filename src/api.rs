@@ -2928,6 +2928,52 @@ mod tests {
         client_session(path.to_str().unwrap()).await;
     }
 
+    /// The node restarts on the same socket path: a client with an abstract address stays
+    /// connected to the old node's socket, and the kernel drops what the new node sends. The
+    /// client notices the silence, makes its socket again, and its pipe gets its route back.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_comes_back_after_the_node_restarts() {
+        use dvpn_client::Client;
+        let (api, secret) = api_with_secret(true).await;
+        let (bob, _) = add_members(&api, &secret);
+        let node = api.node.clone();
+        let tag = encode_b64(&crate::crypto::random_bytes::<9>());
+        let path = std::env::temp_dir().join(format!("dvpn-api-restart-{tag}.sock"));
+        let p = path.to_str().unwrap();
+        let sock = ApiSocket::bind(p).await.unwrap();
+        let at: dvpn_client::ApiAddr = sock.describe().parse().unwrap();
+        let first = Api::start_with(node.clone(), sock, test_access(&at));
+        let c = Client::connect(at.clone(), "test").await.unwrap();
+        let mut pipe = c.pipe(42).await.unwrap();
+        let wait = Duration::from_secs(5);
+        node.to_api(42, bob, b"before");
+        assert_eq!(tokio::time::timeout(wait, pipe.recv()).await.unwrap().unwrap().data, b"before");
+
+        first.stop().await;
+        drop(first);
+        let sock = ApiSocket::bind(p).await.unwrap();
+        let second = Api::start_with(node.clone(), sock, test_access(&at));
+        // the silence, two probes, a new socket, init, the routes again
+        let back = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if c.own_routes().await.is_ok_and(|r| r.contains(&42)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await;
+        assert!(back.is_ok(), "the client did not come back to the restarted node");
+        // the new node knows the route at the client's new address (packets from the node itself
+        // cannot be shown here: one Node takes the sink of its first API only)
+        assert_eq!(second.state.lock().route_owner.len(), 1);
+        c.version().await.unwrap();
+        drop((pipe, c));
+        second.stop().await;
+        std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_socket_is_private_from_the_start() {

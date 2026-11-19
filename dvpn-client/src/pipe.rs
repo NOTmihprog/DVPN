@@ -42,7 +42,7 @@ impl Drop for Owner {
         self.shared.pipes.lock().unwrap().remove(&self.route);
         self.shared.routes.lock().unwrap().remove(&self.route);
         // no answer awaited: if it is lost, the node frees the route when the client goes
-        let _ = self.shared.sock.try_send(&self.del);
+        let _ = self.shared.sock().try_send(&self.del);
     }
 }
 
@@ -120,19 +120,19 @@ impl PipeSender {
     /// UDP: no answer, delivery not guaranteed.
     pub async fn send(&self, node: &str, data: &[u8]) -> Result<(), Error> {
         let m = self.message(node, data)?;
-        self.shared.sock.send(&m).await.map_err(Error::from)
+        self.shared.sock().send(&m).await.map_err(Error::from)
     }
 
     /// [`PipeSender::send`] without waiting: `Error::Io` of kind `WouldBlock` when the socket to the
     /// node is full ([`PipeSender::poll_send_ready`] tells when to try again).
     pub fn try_send(&self, node: &str, data: &[u8]) -> Result<(), Error> {
         let m = self.message(node, data)?;
-        self.shared.sock.try_send(&m).map_err(Error::from)
+        self.shared.sock().try_send(&m).map_err(Error::from)
     }
 
     /// Ready when [`PipeSender::try_send`] may go through.
     pub fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.shared.sock.poll_send_ready(cx)
+        self.shared.sock().poll_send_ready(cx)
     }
 }
 

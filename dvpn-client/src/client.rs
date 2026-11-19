@@ -18,8 +18,22 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 type Reply = Result<Value, Error>;
 
+/// How long the node may say nothing before the client asks whether it is still there.
+pub const SILENCE: Duration = Duration::from_secs(10);
+/// How often that is looked at.
+const LIVENESS: Duration = Duration::from_secs(5);
+
 pub(crate) struct Shared {
-    pub(crate) sock: Socket,
+    /// Made again when the node went away and came back (see [`Shared::reopen`]).
+    sock: std::sync::RwLock<Arc<Socket>>,
+    addr: ApiAddr,
+    abstract_addr: bool,
+    /// When the node last sent anything.
+    heard: std::sync::Mutex<std::time::Instant>,
+    /// Asks the receive task to make the socket again.
+    reopen: tokio::sync::Notify,
+    /// Ids of the client's own liveness probes (apart from requests').
+    probe_id: AtomicU64,
     name: String,
     pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     /// The answer to our `init`, while we wait for it.
@@ -36,6 +50,38 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// The socket to the node as it is now.
+    pub(crate) fn sock(&self) -> Arc<Socket> {
+        self.sock.read().unwrap().clone()
+    }
+
+    /// Asks the node something cheap; whether it answered in time.
+    async fn probe(&self) -> bool {
+        let id = self.probe_id.fetch_add(1, Ordering::Relaxed);
+        let msg = encode(&map(vec![("type", "get".into()), ("id", id.into()), ("req", "version".into())]));
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+        let _ = self.sock().send(&msg).await;
+        let ok = matches!(tokio::time::timeout(Duration::from_secs(3), rx).await, Ok(Ok(_)));
+        self.pending.lock().await.remove(&id);
+        ok
+    }
+
+    /// A new socket to the node and `init` again; its answer brings back the subscription and
+    /// the routes (see `recv_loop`). A unix socket must be made again: one with an abstract
+    /// address is connected to the old node's socket, and the kernel drops what the new node
+    /// sends to it.
+    async fn reopen_socket(&self) {
+        match Socket::open(&self.addr, self.abstract_addr).await {
+            Ok(s) => {
+                *self.sock.write().unwrap() = Arc::new(s);
+                log::debug!("dvpn-client | the node did not answer: a new socket, init again");
+                let _ = self.sock().send(&self.init_msg()).await;
+            }
+            Err(e) => log::debug!("dvpn-client | the node is not back yet: {e}"),
+        }
+    }
+
     fn init_msg(&self) -> Vec<u8> {
         encode(&map(vec![
             ("type", "init".into()),
@@ -46,7 +92,10 @@ impl Shared {
 }
 
 /// A connection to a node's API. Answers the node's pings and introduces itself again when the
-/// node forgets it (`close`), so it can be kept for as long as the program runs.
+/// node forgets it (`close`); when the node is silent for [`SILENCE`] and does not answer two
+/// probes (it was restarted, or killed and started again), the socket is made again and the
+/// subscription and routes (pipes too) are taken again. So it can be kept for as long as the
+/// program runs.
 pub struct Client {
     shared: Arc<Shared>,
     next_id: AtomicU64,
@@ -55,6 +104,7 @@ pub struct Client {
     token: Option<String>,
     info: InitInfo,
     task: tokio::task::JoinHandle<()>,
+    live: tokio::task::JoinHandle<()>,
 }
 
 impl Client {
@@ -79,7 +129,12 @@ impl Client {
         let (typed, _) = broadcast::channel(256);
         let (net, _) = broadcast::channel(1024);
         let shared = Arc::new(Shared {
-            sock,
+            sock: std::sync::RwLock::new(Arc::new(sock)),
+            addr: addr.clone(),
+            abstract_addr,
+            heard: std::sync::Mutex::new(std::time::Instant::now()),
+            reopen: tokio::sync::Notify::new(),
+            probe_id: AtomicU64::new(1 << 62),
             name: name.to_owned(),
             pending: Mutex::default(),
             init: Mutex::default(),
@@ -91,9 +146,10 @@ impl Client {
             pipes: Default::default(),
         });
         let task = tokio::spawn(recv_loop(shared.clone()));
+        let live = tokio::spawn(liveness(Arc::downgrade(&shared)));
         let (tx, rx) = oneshot::channel();
         *shared.init.lock().await = Some(tx);
-        shared.sock.send(&shared.init_msg()).await?;
+        shared.sock().send(&shared.init_msg()).await?;
         let answer = match tokio::time::timeout(wait, rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(Error::Closed),
@@ -103,10 +159,11 @@ impl Client {
             Ok(i) => i,
             Err(e) => {
                 task.abort();
+                live.abort();
                 return Err(e);
             }
         };
-        Ok(Client { shared, next_id: AtomicU64::new(1), timeout: DEFAULT_TIMEOUT, token, info, task })
+        Ok(Client { shared, next_id: AtomicU64::new(1), timeout: DEFAULT_TIMEOUT, token, info, task, live })
     }
 
     /// Uses `token` for a UDP API instead of the one found.
@@ -226,7 +283,7 @@ impl Client {
             ("key", node.into()),
             ("pack", Value::Binary(data.to_vec())),
         ]);
-        self.shared.sock.send(&encode(&m)).await.map_err(Error::from)
+        self.shared.sock().send(&encode(&m)).await.map_err(Error::from)
     }
 
     /// Packets members send to the routes this client holds, but for those with a [`Pipe`].
@@ -256,7 +313,7 @@ impl Client {
         let msg = self.message(kind, req, id, fields);
         let (tx, rx) = oneshot::channel();
         self.shared.pending.lock().await.insert(id, tx);
-        if let Err(e) = self.shared.sock.send(&msg).await {
+        if let Err(e) = self.shared.sock().send(&msg).await {
             self.shared.pending.lock().await.remove(&id);
             return Err(e.into());
         }
@@ -509,18 +566,53 @@ fn strings(l: &[String]) -> Value {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        let _ = self.shared.sock.try_send(&encode(&map(vec![("type", "close".into())])));
+        let _ = self.shared.sock().try_send(&encode(&map(vec![("type", "close".into())])));
         self.task.abort();
+        self.live.abort();
         // pipes see the end
         self.shared.pipes.lock().unwrap().clear();
+    }
+}
+
+/// Asks the node after a silence; two unanswered probes in a row make the socket again.
+async fn liveness(shared: std::sync::Weak<Shared>) {
+    let mut misses = 0;
+    loop {
+        tokio::time::sleep(LIVENESS).await;
+        let Some(s) = shared.upgrade() else { return };
+        if s.heard.lock().unwrap().elapsed() < SILENCE {
+            misses = 0;
+            continue;
+        }
+        if s.probe().await {
+            misses = 0;
+            continue;
+        }
+        misses += 1;
+        if misses >= 2 {
+            s.reopen.notify_one();
+            misses = 0;
+        }
     }
 }
 
 async fn recv_loop(shared: Arc<Shared>) {
     let mut buf = vec![0u8; 65536];
     loop {
-        let n = match shared.sock.recv(&mut buf).await {
-            Ok(n) => n,
+        let sock = shared.sock();
+        let got = tokio::select! {
+            r = sock.recv(&mut buf) => Some(r),
+            _ = shared.reopen.notified() => None,
+        };
+        let Some(got) = got else {
+            shared.reopen_socket().await;
+            continue;
+        };
+        let n = match got {
+            Ok(n) => {
+                *shared.heard.lock().unwrap() = std::time::Instant::now();
+                n
+            }
             Err(e) => {
                 // UDP: the node is not there (ICMP port unreachable); answers time out
                 log::debug!("dvpn-client | recv: {e}");
@@ -548,11 +640,11 @@ async fn recv_loop(shared: Arc<Shared>) {
                 } else {
                     // introduced ourselves again: the node forgot our subscription and routes too
                     if let Some(sub) = shared.sub.lock().await.clone() {
-                        let _ = shared.sock.send(&sub).await;
+                        let _ = shared.sock().send(&sub).await;
                     }
                     let again: Vec<Vec<u8>> = shared.routes.lock().unwrap().values().cloned().collect();
                     for m in again {
-                        let _ = shared.sock.send(&m).await;
+                        let _ = shared.sock().send(&m).await;
                     }
                 }
             }
@@ -597,12 +689,12 @@ async fn recv_loop(shared: Arc<Shared>) {
                 log::warn!("dvpn-client | node: {msg} ({code})");
             }
             Some("ping") => {
-                let _ = shared.sock.send(&encode(&map(vec![("type", "pong".into())]))).await;
+                let _ = shared.sock().send(&encode(&map(vec![("type", "pong".into())]))).await;
             }
             Some("close") => {
                 // the node forgot us (restarted, or we missed its pings): introduce ourselves again
                 log::debug!("dvpn-client | the node closed the connection, init again");
-                let _ = shared.sock.send(&shared.init_msg()).await;
+                let _ = shared.sock().send(&shared.init_msg()).await;
             }
             _ => {
                 let _ = shared.events.send(v);
