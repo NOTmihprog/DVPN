@@ -192,6 +192,60 @@ pub fn pin_socket_v4(sock: SOCKET, v4_index: u32) -> io::Result<()> {
     if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
+/// How often the zone is looked at again once it is set: Windows may put a network it identified
+/// anew back to its own choice.
+const ZONE_RECHECK: std::time::Duration = std::time::Duration::from_secs(300);
+/// How often and how many times it is tried first: a new adapter has no network profile for some
+/// seconds, until Windows has identified its network.
+const ZONE_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+const ZONE_TRIES: u32 = 30;
+
+/// Sets the network category (firewall profile) of an interface; whether it had to be changed.
+/// A domain's network is left as it is (Windows decides that).
+fn set_zone(if_index: u32, zone: crate::config::FirewallZone) -> Result<bool, String> {
+    let category = zone.category();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $p = Get-NetConnectionProfile -InterfaceIndex {if_index}; \
+         if ($p.NetworkCategory -notin '{category}', 'DomainAuthenticated') {{ \
+         Set-NetConnectionProfile -InterfaceIndex {if_index} -NetworkCategory {category}; 'changed' }}"
+    );
+    let o = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| format!("powershell: {e}"))?;
+    if !o.status.success() {
+        return Err(String::from_utf8_lossy(&o.stderr).lines().next().unwrap_or("failed").trim().to_owned());
+    }
+    Ok(String::from_utf8_lossy(&o.stdout).contains("changed"))
+}
+
+/// Keeps the TUN interface in its firewall zone (`[net] firewall_zone`) while `alive`.
+pub async fn keep_zone(if_index: u32, zone: crate::config::FirewallZone, alive: impl Fn() -> bool) {
+    let mut tries = 0;
+    while alive() {
+        let r = tokio::task::spawn_blocking(move || set_zone(if_index, zone)).await;
+        let set = match r {
+            Ok(Ok(changed)) => {
+                if changed {
+                    log::info!("TUN | firewall zone: {}", zone.category());
+                }
+                tries = ZONE_TRIES;
+                true
+            }
+            Ok(Err(e)) => {
+                tries += 1;
+                if tries == ZONE_TRIES {
+                    log::warn!("TUN | firewall zone {} not set: {e}", zone.category());
+                }
+                false
+            }
+            Err(_) => return,
+        };
+        tokio::time::sleep(if set || tries >= ZONE_TRIES { ZONE_RECHECK } else { ZONE_RETRY }).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

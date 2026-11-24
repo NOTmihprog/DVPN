@@ -69,7 +69,7 @@ try {
     # a: joins; its own TUN; the kept host is a hole ("!") in its routes
     Dvpn $a group join $invite | Out-Null
     SetKey "$a\config.toml" "bind_port" '"18912"'
-    SetKey "$a\config.toml" "tun_name" '"dvpne2e"'
+    SetKey "$a\config.toml" "tun_name" "`"dvpne2e`"`nfirewall_zone = `"private`""
     $keepIp = (Resolve-DnsName $Keep -Type A | Where-Object IPAddress | Select-Object -First 1).IPAddress
     Add-Content "$a\config.toml" "`n[ckr.remote_subnets]`n`"$bKey`" = [`"!$keepIp/32`"]"
 
@@ -80,6 +80,7 @@ try {
 
     Check "Wintun adapter dvpne2e up" (WaitFor { (Get-NetAdapter -Name dvpne2e -ErrorAction SilentlyContinue).Status -eq "Up" })
     Check "an address of the group on it" (WaitFor { Get-NetIPAddress -InterfaceAlias dvpne2e -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object IPAddress -like "10.*" })
+    Check "firewall zone of dvpne2e: Private" (WaitFor { (Get-NetConnectionProfile -InterfaceAlias dvpne2e -ErrorAction SilentlyContinue).NetworkCategory -eq "Private" } 60)
     Check "route to b's subnet on dvpne2e" (WaitFor { Get-NetRoute -DestinationPrefix 198.18.50.0/24 -InterfaceAlias dvpne2e -ErrorAction SilentlyContinue })
     Check "hole for $keepIp through the physical network" (WaitFor { Get-NetRoute -DestinationPrefix "$keepIp/32" -ErrorAction SilentlyContinue | Where-Object InterfaceAlias -ne dvpne2e })
     Check "NRPT sends .dvpn to the node" (WaitFor { OurNrpt | Where-Object { $_.Namespace -contains ".dvpn" } })
@@ -92,6 +93,12 @@ try {
     Check "kill switch: the internet is blocked" (-not (Test-Connection 1.1.1.1 -Count 2 -Quiet))
     $kept = try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 "https://$Keep/").StatusCode -lt 500 } catch { $false }
     Check "kill switch: the hole ($Keep) still reachable" $kept
+    # paused: the internet goes direct although the gateway is set; resumed: blocked again
+    Dvpn $a exit --pause 10m | Out-Null
+    Check "pause: default route halves gone" (WaitFor { -not (OurRoutes | Where-Object DestinationPrefix -in "0.0.0.0/1", "128.0.0.0/1") })
+    Check "pause: dvpn status warns" ((Dvpn $a status | Out-String) -match "PAUSED")
+    Dvpn $a exit --resume | Out-Null
+    Check "resume: default route halves back" (WaitFor { (OurRoutes | Where-Object { $_.InterfaceAlias -eq "dvpne2e" -and $_.DestinationPrefix -in "0.0.0.0/1", "128.0.0.0/1" }).Count -eq 2 })
     Dvpn $a exit --none | Out-Null
     Check "exit off: default route halves gone" (WaitFor { -not (OurRoutes | Where-Object DestinationPrefix -in "0.0.0.0/1", "128.0.0.0/1") })
     Check "exit off: the internet is back" (WaitFor { Test-Connection 1.1.1.1 -Count 1 -Quiet } 15)

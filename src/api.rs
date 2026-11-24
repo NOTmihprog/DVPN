@@ -244,6 +244,7 @@ mod watch {
         pub routes: HashMap<NodeId, NodeId>,
         /// Gateways in use (IPv4, IPv6), kill switch blocking (IPv4, IPv6).
         pub exit: (Option<NodeId>, Option<NodeId>, (bool, bool)),
+        pub exit_paused: bool,
         pub members: HashMap<NodeId, MemberState>,
         /// psk epoch in use, and one announced after it (epoch, unix ms).
         pub epoch: (u32, Option<(u32, u64)>),
@@ -280,6 +281,7 @@ mod watch {
                 neighbors: n.direct_links().into_iter().map(|l| (l.peer, (l.alive, l.endpoint))).collect(),
                 routes: n.mesh_routes().into_iter().map(|(d, via, _)| (d, via)).collect(),
                 exit: (gw4, gw6, kill),
+                exit_paused: n.exit_pause().0,
                 members,
                 epoch: (epoch, n.group_store().epoch(&n.group_id()).filter(|(e, _)| *e > epoch)),
             }
@@ -340,8 +342,8 @@ mod watch {
             out.push(event("route", f));
         }
 
-        // exit: gateways in use, kill switch
-        if old.exit != new.exit {
+        // exit: gateways in use, kill switch, pause
+        if old.exit != new.exit || old.exit_paused != new.exit_paused {
             let (gw4, gw6, (b4, b6)) = &new.exit;
             let active = |g: &Option<NodeId>| g.as_ref().map_or(Value::Nil, |g| map(who(g, name)));
             out.push(event(
@@ -349,6 +351,7 @@ mod watch {
                 vec![
                     ("active", map(vec![("v4", active(gw4)), ("v6", active(gw6))])),
                     ("blocked", map(vec![("v4", (*b4).into()), ("v6", (*b6).into())])),
+                    ("paused", new.exit_paused.into()),
                 ],
             ));
         }
@@ -434,6 +437,10 @@ mod watch {
             new.members.insert(b, member("b", true));
             new.members.insert(c, member("c", false));
             new.epoch = (0, Some((1, 120_000)));
+            let mut paused = new.clone();
+            paused.exit_paused = true;
+            let ev = diff(&new, &paused, &name);
+            assert_eq!(kinds(&ev), vec!["exit:-"], "a pause alone is an event");
             let ev = diff(&old, &new, &name);
             let mut got = kinds(&ev);
             got.sort();
@@ -1491,6 +1498,7 @@ impl Api {
         let n = &self.node;
         let (e, gw4, gw6, (block4, block6)) = n.exit_detail();
         let (only_count, only_error) = n.exit_only_state();
+        let (paused, paused_until) = n.exit_pause();
         let names = self.names();
         let list = |l: &[String]| {
             Value::Array(
@@ -1525,6 +1533,8 @@ impl Api {
             ("only_error", opt_str(only_error)),
             ("active", map(vec![("v4", active(gw4)), ("v6", active(gw6))])),
             ("blocked", map(vec![("v4", block4.into()), ("v6", block6.into())])),
+            ("paused", paused.into()),
+            ("paused_until", paused_until.map_or(Value::Nil, Value::from)),
         ])
     }
 
@@ -1615,6 +1625,26 @@ impl Api {
                 crate::config::read_only_list(&f).map_err(|err| ApiError::new("only_invalid", format!("{err:#}")))?;
                 e.only_file = Some(f);
             }
+        }
+        match raw_field(p, "pause") {
+            None => {}
+            Some(Value::Nil | Value::Boolean(false)) => e.paused = None,
+            Some(v) => {
+                if e.v4.is_empty() && e.v6.is_empty() {
+                    return Err(bad_param("pause", "no gateways set, nothing to pause"));
+                }
+                e.paused = Some(match v {
+                    Value::Boolean(true) => crate::config::Pause::On,
+                    v => {
+                        let secs = v.as_u64().ok_or_else(|| bad_param("pause", "expected true, false or seconds"))?;
+                        crate::config::Pause::for_secs(secs).map_err(|err| bad_param("pause", &err.to_string()))?
+                    }
+                });
+            }
+        }
+        // one that is over (or without gateways) does not come back with a later change
+        if !e.paused() {
+            e.paused = None;
         }
         n.set_exits(&e).map_err(|err| ApiError::new("config_write", format!("{err:#}")))?;
         Ok(self.exit_info())
@@ -1974,6 +2004,7 @@ impl Api {
                 let n = &self.node;
                 let cert = n.own_cert();
                 let (gw4, gw6, kill) = n.exit_state();
+                let (paused, paused_until) = n.exit_pause();
                 let name = |id: Option<NodeId>| opt_str(id.map(|i| storage.name(&i).unwrap_or_else(|| i.short())));
                 map(vec![
                     ("key", storage.self_id().to_string().into()),
@@ -1999,6 +2030,8 @@ impl Api {
                     ("exit_v4", name(gw4)),
                     ("exit_v6", name(gw6)),
                     ("kill_switch", kill.into()),
+                    ("exit_paused", paused.into()),
+                    ("exit_paused_until", paused_until.map_or(Value::Nil, Value::from)),
                     ("local_addr", opt_str(n.transport.local_addr().ok().map(|a| a.to_string()))),
                     ("group_name", n.group_name().into()),
                     ("admin", n.is_admin().into()),
@@ -2675,6 +2708,35 @@ mod tests {
         assert!(field(e, "table").is_none());
         assert_eq!(crate::config::read_exits(&path).unwrap().kill_switch, None);
 
+        // paused: nothing blocked, the gateways stay; for a time or until resumed
+        let get = |r: &Value, k: &str| field(get_ok(r), k).cloned();
+        let blocked4 = |r: &Value| field(field(get_ok(r), "blocked").unwrap(), "v4").and_then(Value::as_bool);
+        assert_eq!(blocked4(&r), Some(true));
+        let r = request(&api, "set", vec![("req", "exit".into()), ("pause", 600.into())]).await;
+        assert_eq!((get(&r, "paused"), blocked4(&r)), (Some(true.into()), Some(false)), "{r}");
+        assert!(get(&r, "paused_until").and_then(|v| v.as_u64()).is_some_and(|t| t > crate::clock::now_unix() + 500));
+        assert_eq!(field(get_ok(&r), "v4").unwrap().as_array().unwrap().len(), 1, "gateways kept");
+        let st = request(&api, "get", vec![("req", "status".into())]).await;
+        assert_eq!(get(&st, "exit_paused"), Some(true.into()));
+        // other changes keep the pause
+        let r = request(&api, "set", vec![("req", "exit".into()), ("pause", true.into())]).await;
+        assert_eq!((get(&r, "paused"), get(&r, "paused_until")), (Some(true.into()), None));
+        let r = request(&api, "set", vec![("req", "exit".into()), ("dns", list(&["9.9.9.9"]))]).await;
+        assert_eq!((get(&r, "paused"), blocked4(&r)), (Some(true.into()), Some(false)));
+        for bad in [Value::from("on"), 0.into(), (crate::config::MAX_PAUSE + 1).into()] {
+            let r = request(&api, "set", vec![("req", "exit".into()), ("pause", bad)]).await;
+            assert_eq!(s(&r, "err"), Some("bad_param"), "{r}");
+        }
+        // resumed: the kill switch holds at once
+        let r = request(&api, "set", vec![("req", "exit".into()), ("pause", false.into())]).await;
+        assert_eq!((get(&r, "paused"), blocked4(&r)), (Some(false.into()), Some(true)), "{r}");
+        // one that ran out
+        let mut over = crate::config::read_exits(&path).unwrap();
+        over.paused = Some(crate::config::Pause::Until(crate::clock::now_unix() - 1));
+        api.node.set_exits(&over).unwrap();
+        let r = request(&api, "get", vec![("req", "exit".into())]).await;
+        assert_eq!((get(&r, "paused"), blocked4(&r)), (Some(false.into()), Some(true)), "{r}");
+
         // a name nobody has (a typo, or a member not heard of yet; the API refuses it, an edited
         // config.toml does not): the kill switch still holds; only this node itself is no gateway
         let ghost = crate::config::Exits { v4: vec!["ghost".into()], v6: vec!["alice".into()], ..Default::default() };
@@ -2839,6 +2901,13 @@ mod tests {
         let e = c.set_exit(&ExitUpdate { only_file: Some(None), ..Default::default() }).await.unwrap();
         assert_eq!((e.only_file, e.only_count), (None, 0));
         std::fs::remove_file(&only).unwrap();
+        use dvpn_client::ExitPause;
+        let pause = |p| ExitUpdate { pause: Some(p), ..Default::default() };
+        let e = c.set_exit(&pause(ExitPause::Secs(300))).await.unwrap();
+        assert!(e.paused && e.paused_until.is_some());
+        let e = c.set_exit(&pause(ExitPause::On)).await.unwrap();
+        assert!(e.paused && e.paused_until.is_none() && c.status().await.unwrap().exit_paused);
+        assert!(!c.set_exit(&pause(ExitPause::Off)).await.unwrap().paused);
         let e = c.set_exit(&ExitUpdate { clear: true, ..Default::default() }).await.unwrap();
         assert!(e.v4.is_empty() && e.kill_switch);
         let acl = c.acl().await.unwrap();
@@ -3180,7 +3249,7 @@ mod tests {
 
         c.set_exit(&ExitUpdate { v4: Some(vec!["bob".into()]), ..Default::default() }).await.unwrap();
         let blocked = next_event(&mut rx, |e| match e {
-            Event::Exit { blocked, active } => Some((blocked.v4, active.v4.clone())),
+            Event::Exit { blocked, active, .. } => Some((blocked.v4, active.v4.clone())),
             _ => None,
         })
         .await;

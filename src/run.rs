@@ -136,12 +136,25 @@ pub async fn start(mut conf: Config, dir: &Path, opts: Options) -> anyhow::Resul
     {
         bail!("[net] mtu {} is below 1280, the minimum for IPv6", net.mtu);
     }
+    #[cfg(windows)]
+    let mut firewall = None;
     let tun = match (&conf.net, external) {
         (Some(net), false) => {
             let addr = self_addr.ok_or_else(|| anyhow!("the group certificate has no IPv4 address for the TUN"))?;
             let ula = crate::ckr::ula_addr(&group.id, &conf.identity.id());
             let dev = build_tun(net, addr, ula).context("TUN")?;
             log::info!("TUN | {} {addr}/{} {ula}/48 mtu {} - started", net.tun_name, net.prefix, net.mtu);
+            #[cfg(windows)]
+            if let Some(zone) = net.firewall_zone {
+                match dev.if_index() {
+                    Ok(i) => firewall = Some((i, zone)),
+                    Err(e) => log::warn!("TUN | firewall zone: {e}"),
+                }
+            }
+            #[cfg(not(windows))]
+            if net.firewall_zone.is_some() {
+                log::debug!("TUN | [net] firewall_zone is for Windows only");
+            }
             // public IPv6 addresses an admin gave this node (served by a gateway's NDP proxy)
             #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
             for p in &cert.body.prefixes {
@@ -253,6 +266,11 @@ pub async fn start(mut conf: Config, dir: &Path, opts: Options) -> anyhow::Resul
             });
             node.set_gateway(g);
         }
+    }
+    #[cfg(windows)]
+    if let Some((index, zone)) = firewall {
+        let node = Arc::downgrade(&node);
+        tokio::spawn(crate::winnet::keep_zone(index, zone, move || node.strong_count() > 0));
     }
     if let Some(f) = opts.on_plan {
         node.set_plan_listener(f);

@@ -297,6 +297,16 @@ echo "$ks" | grep -q 'From ' || fail "kill switch: no ICMP 'prohibited' for the 
 "$D" --dir "$W/b" exit --kill-switch off >/dev/null
 wait_for 10 nsx b ping -c1 -W1 203.0.113.1 || fail "kill switch off: b's internet did not go direct"
 "$D" --dir "$W/b" exit --kill-switch on >/dev/null
+wait_for 10 sh -c "! ip netns exec b ping -c1 -W1 203.0.113.1 >/dev/null 2>&1" || fail "kill switch not on again"
+# paused: direct although the kill switch is on; a pause with an end ends by itself
+"$D" --dir "$W/b" exit --pause | grep -q PAUSED || fail "b: exit --pause does not warn"
+wait_for 10 nsx b ping -c1 -W1 203.0.113.1 >/dev/null || fail "pause: b's internet did not go direct"
+"$D" --dir "$W/b" exit --resume | grep -q PAUSED && fail "b: exit --resume left it paused"
+wait_for 10 sh -c "! ip netns exec b ping -c1 -W1 203.0.113.1 >/dev/null 2>&1" || fail "resume: the kill switch does not hold"
+"$D" --dir "$W/b" exit --pause 6s >/dev/null
+wait_for 5 nsx b ping -c1 -W1 203.0.113.1 >/dev/null || fail "pause 6s: b's internet did not go direct"
+wait_for 15 sh -c "! ip netns exec b ping -c1 -W1 203.0.113.1 >/dev/null 2>&1" || fail "the pause did not end by itself"
+ok "exit paused, resumed, and a pause that ends by itself"
 nsx b nft delete table inet blockgw
 from=$(($(wc -l < "$W/node-b.log") + 1))
 wait_for 60 sh -c "tail -n +$from '$W/node-b.log' | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'Exit | IPv4 via'" \

@@ -131,7 +131,7 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 
 | `req` | параметры | результат |
 |---|---|---|
-| `status` | | словарь: `key`, `name`, `group`, `group_name`, `admin`, `prefixes` (адреса и подсети из сертификата), `ula` (IPv6-адрес узла в группе), `relay`, `cert_days`, `epoch` (эпоха psk), `servers` (`[{addr, connected}]`), `exit_v4`, `exit_v6` (имя текущего шлюза или nil), `kill_switch`, `local_addr`, `uptime_secs` |
+| `status` | | словарь: `key`, `name`, `group`, `group_name`, `admin`, `prefixes` (адреса и подсети из сертификата), `ula` (IPv6-адрес узла в группе), `relay`, `cert_days`, `epoch` (эпоха psk), `servers` (`[{addr, connected}]`), `exit_v4`, `exit_v6` (имя текущего шлюза или nil), `kill_switch`, `exit_paused` (выход временно отключён), `exit_paused_until` (unix-время или nil — до включения), `local_addr`, `uptime_secs` |
 | `version` | | `{api, api_min, node, wire}`: версии API, программы узла и протокола на проводе (`"dvpn/4"`) |
 | `neighbors` | | список прямых соседей: `key`, `name`, `endpoint`, `rtt_ms`, `alive`, `session_secs`, `tx_packets`, `tx_bytes`, `rx_packets`, `rx_bytes` |
 | `routes` | | `{"mesh": [{key, name, via, via_name, cost}], "ckr": [{net, to, system}]}` |
@@ -214,7 +214,9 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
   "only_count": 3,                              # сколько адресов из него сейчас в ходу
   "only_error": "line 2: ..." | nil,            # почему файл не прочитался (в ходу прежний список)
   "active": {"v4": {"key", "name"} | nil, "v6": ...},   # шлюз, через который идёт интернет сейчас
-  "blocked": {"v4": false, "v6": false}         # kill switch блокирует интернет: шлюзы есть, живых нет
+  "blocked": {"v4": false, "v6": false},        # kill switch блокирует интернет: шлюзы есть, живых нет
+  "paused": false,                              # выход временно отключён: интернет напрямую, без kill switch
+  "paused_until": 1795000000 | nil              # когда пауза кончится (unix-время; nil — до включения)
 }
 ```
 
@@ -287,6 +289,8 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
  "dns": ["1.1.1.1"], "sources": ["10.10.33.2"], # списки целиком заменяют старые
  "table": 100,                                  # nil — убрать
  "only_file": "/etc/dvpn/via-vps.txt",          # полный путь, узел читает его сам; nil — убрать
+ "pause": true,                                 # отключить выход: true — до включения, число — на столько секунд
+                                                # (до 30 дней); false или nil — включить
  "clear": true}                                 # сначала убрать весь [exit]
 ```
 
@@ -364,7 +368,7 @@ Invite — секрет: кто его знает, может войти в гр
 |---|---|---|
 | `neighbor` | прямая связь появилась, пропала, сменила адрес (роуминг) | `key`, `name`, `state`: `up` / `down` / `moved`, `endpoint` |
 | `route` | сменился первый хоп до участника | `key`, `name`, `via`, `via_name` (nil — пути нет) |
-| `exit` | сменился шлюз или kill switch | `active: {v4, v6}` (`{key, name}` или nil), `blocked: {v4, v6}` |
+| `exit` | сменился шлюз, kill switch или пауза | `active: {v4, v6}` (`{key, name}` или nil), `blocked: {v4, v6}`, `paused` |
 | `member` | участник вошёл, изменился (имя, адреса, роли) или исключён | `action`: `add` / `update` / `revoke`, `key`, `name`, `prefixes`, `revoked` |
 | `epoch` | объявлена смена psk или узел на неё перешёл | `epoch` (текущая), `next: {epoch, at}` или nil |
 | `metrics` | раз в `metrics_secs` (только по подписке) | как ответ `get metrics` |

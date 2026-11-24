@@ -220,6 +220,8 @@ pub struct Node {
     forwards: parking_lot::Mutex<Vec<crate::forward::Forward>>,
     exit4: parking_lot::Mutex<crate::exit::ExitChooser>,
     exit6: parking_lot::Mutex<crate::exit::ExitChooser>,
+    /// `[exit]` is paused (see [`crate::config::Exits::paused`]).
+    exit_paused: std::sync::atomic::AtomicBool,
     /// Kill switch on for IPv4 / IPv6: gateways configured, none alive.
     kill: parking_lot::Mutex<(bool, bool)>,
     /// Further addresses to try for peers without a session (PLAN §9.1): the candidates they
@@ -300,6 +302,7 @@ impl Node {
             exits: parking_lot::Mutex::new(exits),
             exit_only: parking_lot::Mutex::new(OnlyList::default()),
             forwards: parking_lot::Mutex::new(forwards),
+            exit_paused: std::sync::atomic::AtomicBool::new(false),
             exit4: parking_lot::Mutex::new(Default::default()),
             exit6: parking_lot::Mutex::new(Default::default()),
             kill: parking_lot::Mutex::new((false, false)),
@@ -1340,6 +1343,12 @@ impl Node {
         (e, self.exit4.lock().current, self.exit6.lock().current, *self.kill.lock())
     }
 
+    /// Whether the exit is paused, and until when (unix seconds; `None`: until resumed).
+    pub fn exit_pause(&self) -> (bool, Option<u64>) {
+        let e = &self.exits.lock().0;
+        (self.exit_paused.load(std::sync::atomic::Ordering::Relaxed), e.paused_until())
+    }
+
     /// Writes `[exit]` to the config file and applies it at once: the gateways are picked anew
     /// and the internet routes follow (without waiting for the file to be noticed).
     pub fn set_exits(&self, exits: &crate::config::Exits) -> anyhow::Result<()> {
@@ -1475,9 +1484,24 @@ impl Node {
             l.iter().filter_map(|s| self.resolve_member(s)).filter(|g| *g != me).collect()
         };
         let only_changed = self.refresh_only(exits.only_file.as_deref());
-        let (p4, p6) = (resolve(&exits.v4), resolve(&exits.v6));
+        let paused = exits.paused();
+        // paused: as if there were no gateways
+        let (p4, p6) = if paused { (Vec::new(), Vec::new()) } else { (resolve(&exits.v4), resolve(&exits.v6)) };
         let now = Instant::now();
         let alive = |g: &NodeId| self.next_hop(g).is_some();
+        if self.exit_paused.swap(paused, std::sync::atomic::Ordering::Relaxed) != paused {
+            if paused {
+                log::warn!(
+                    "Exit | paused {}: the internet goes direct, past the gateway and the kill switch",
+                    exits.paused_until().map_or("until resumed".to_owned(), |t| format!(
+                        "for {} s",
+                        t.saturating_sub(crate::clock::now_unix())
+                    ))
+                );
+            } else {
+                log::info!("Exit | pause over");
+            }
+        }
         // `[exit] dns` may have changed: the plan forwards names accordingly
         let mut changed = config_changed || only_changed;
         for (chooser, prio, fam) in [(&self.exit4, &p4, "IPv4"), (&self.exit6, &p6, "IPv6")] {
@@ -1488,7 +1512,7 @@ impl Node {
                 changed = true;
                 match new {
                     Some(g) => log::info!("Exit | {fam} via {}", node(g)),
-                    None if !prio.is_empty() || old.is_some() => {
+                    None if !paused && (!prio.is_empty() || old.is_some()) => {
                         log::warn!("Exit | {fam}: no gateway alive, internet goes direct")
                     }
                     None => {}
@@ -1498,9 +1522,10 @@ impl Node {
         // gateways configured: any entry but this node, also one we cannot resolve (yet): the kill
         // switch must not let the internet out just because a gateway's name is not known
         let configured = |l: &[String]| l.iter().any(|s| self.resolve_member(s) != Some(me));
+        let hold = exits.kill_switch() && !paused;
         let kill = (
-            configured(&exits.v4) && exits.kill_switch() && self.exit4.lock().current.is_none(),
-            configured(&exits.v6) && exits.kill_switch() && self.exit6.lock().current.is_none(),
+            configured(&exits.v4) && hold && self.exit4.lock().current.is_none(),
+            configured(&exits.v6) && hold && self.exit6.lock().current.is_none(),
         );
         {
             let mut k = self.kill.lock();

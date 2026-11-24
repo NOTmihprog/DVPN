@@ -54,6 +54,8 @@ mtu = 1350
 # netmask of the group network as "255.255.255.0" or prefix length "24";
 # the own address comes from the group certificate
 mask = "255.255.255.0"
+# Windows: the firewall zone (network category) of the interface, "private" or "public"
+# firewall_zone = "private"
 
 # Groups ([[groups]] sections) are written by `dvpn group create` (new group, this node is its
 # admin) and `dvpn group join <invite>`; see `dvpn group --help`.
@@ -75,6 +77,26 @@ pub struct NetConfig {
     pub prefix: u8,
     /// Install system routes for subnets behind other nodes and exits (default on).
     pub manage_routes: bool,
+    /// Windows: the firewall zone (network category) of the TUN interface; `None` leaves it as
+    /// Windows chose (`firewall_zone`).
+    pub firewall_zone: Option<FirewallZone>,
+}
+
+/// The Windows network category of an interface, which picks its firewall profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirewallZone {
+    Private,
+    Public,
+}
+
+impl FirewallZone {
+    /// As `Set-NetConnectionProfile -NetworkCategory` takes it.
+    pub fn category(self) -> &'static str {
+        match self {
+            FirewallZone::Private => "Private",
+            FirewallZone::Public => "Public",
+        }
+    }
 }
 
 pub struct ServerConfig {
@@ -307,9 +329,59 @@ pub struct Exits {
     /// blocked by the kill switch); everything else reaches the internet directly. The node
     /// re-reads the file when it changes. Format: [`parse_only_list`].
     pub only_file: Option<PathBuf>,
+    /// The exit is turned off for a while: the gateways stay configured but are not used, and the
+    /// kill switch does not hold. See [`Exits::paused`] for whether it is in force now.
+    pub paused: Option<Pause>,
+}
+
+/// `[exit] paused`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pause {
+    /// `true`: until resumed.
+    On,
+    /// Until this time (unix seconds).
+    Until(u64),
+}
+
+/// The longest pause with an end, seconds (30 days).
+pub const MAX_PAUSE: u64 = 30 * 86400;
+
+impl Pause {
+    /// A pause of `secs` seconds from now.
+    pub fn for_secs(secs: u64) -> anyhow::Result<Pause> {
+        if secs == 0 || secs > MAX_PAUSE {
+            bail!("a pause is 1 second to 30 days long");
+        }
+        let now = crate::clock::trusted_unix()
+            .ok_or_else(|| anyhow!("the clock is not set: only a pause without an end is possible"))?;
+        Ok(Pause::Until(now + secs))
+    }
+
+    /// Whether the pause is in force. With a clock certainly wrong (or set far back) one with an
+    /// end counts as over: the exit and its kill switch must not stay off by mistake.
+    fn active(self, now: Option<u64>) -> bool {
+        match self {
+            Pause::On => true,
+            Pause::Until(t) => now.is_some_and(|n| n < t && t - n <= MAX_PAUSE),
+        }
+    }
 }
 
 impl Exits {
+    /// The exit is configured but paused now.
+    pub fn paused(&self) -> bool {
+        (!self.v4.is_empty() || !self.v6.is_empty())
+            && self.paused.is_some_and(|p| p.active(crate::clock::trusted_unix()))
+    }
+
+    /// When the pause in force now ends (unix seconds); `None` also for one without an end.
+    pub fn paused_until(&self) -> Option<u64> {
+        match self.paused {
+            Some(Pause::Until(t)) if self.paused() => Some(t),
+            _ => None,
+        }
+    }
+
     pub fn kill_switch(&self) -> bool {
         self.kill_switch.unwrap_or(true)
     }
@@ -345,7 +417,8 @@ fn parse_exits(t: &dyn toml_edit::TableLike) -> anyhow::Result<Exits> {
             .collect()
     };
     for (k, _) in t.iter() {
-        if !["v4", "v6", "kill_switch", "dns", "v4_sources", "v6_sources", "table", "only_file"].contains(&k) {
+        if !["v4", "v6", "kill_switch", "dns", "v4_sources", "v6_sources", "table", "only_file", "paused"].contains(&k)
+        {
             bail!("unknown key {k}");
         }
     }
@@ -382,7 +455,15 @@ fn parse_exits(t: &dyn toml_edit::TableLike) -> anyhow::Result<Exits> {
         }
         None => None,
     };
-    Ok(Exits { v4: list("v4")?, v6: list("v6")?, kill_switch, dns, v4_sources, v6_sources, table, only_file })
+    let paused = match t.get("paused") {
+        None => None,
+        Some(v) => match (v.as_bool(), v.as_integer().and_then(|t| u64::try_from(t).ok())) {
+            (Some(on), _) => on.then_some(Pause::On),
+            (_, Some(t)) => Some(Pause::Until(t)),
+            _ => bail!("paused: true, false or the unix time it ends at"),
+        },
+    };
+    Ok(Exits { v4: list("v4")?, v6: list("v6")?, kill_switch, dns, v4_sources, v6_sources, table, only_file, paused })
 }
 
 /// The most entries `[exit] only_file` may list.
@@ -632,6 +713,11 @@ fn put_exits(doc: &mut DocumentMut, exits: &Exits) {
         if let Some(f) = &exits.only_file {
             t["only_file"] = value(f.to_string_lossy().as_ref());
         }
+        match exits.paused {
+            Some(Pause::On) => t["paused"] = value(true),
+            Some(Pause::Until(u)) => t["paused"] = value(i64::try_from(u).unwrap_or(i64::MAX)),
+            None => {}
+        }
         t.decor_mut()
             .set_prefix("\n# gateways to the internet by priority (names or keys); the first alive one is used\n");
         doc["exit"] = Item::Table(t);
@@ -790,7 +876,15 @@ fn parse_net(t: &Table) -> anyhow::Result<NetConfig> {
         Some(v) => v.as_bool().ok_or_else(|| anyhow!("manage_routes: expected true or false"))?,
         None => true,
     };
-    Ok(NetConfig { tun_name, mtu, prefix, manage_routes })
+    let firewall_zone = match t.get("firewall_zone") {
+        Some(v) => match v.as_str().map(str::to_ascii_lowercase).as_deref() {
+            Some("private") => Some(FirewallZone::Private),
+            Some("public") => Some(FirewallZone::Public),
+            _ => bail!("firewall_zone: expected \"private\" or \"public\""),
+        },
+        None => None,
+    };
+    Ok(NetConfig { tun_name, mtu, prefix, manage_routes, firewall_zone })
 }
 
 fn parse_server(name: &str, t: &Table) -> anyhow::Result<ServerConfig> {
@@ -1465,6 +1559,7 @@ mod tests {
             v6_sources: vec!["fd00::/64".parse().unwrap()],
             table: Some(445),
             only_file: Some("/etc/dvpn/only.txt".into()),
+            paused: Some(Pause::Until(1_800_000_000)),
         };
         c.set_exits(&e);
         c.save();
@@ -1473,6 +1568,47 @@ mod tests {
         c.save();
         assert_eq!(read_exits(&dir.join(CONFIG_FILE_NAME)).unwrap(), Exits::default());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exit_pause() {
+        let ex = |s: &str| with_group(&format!("[exit]\n{s}\n")).unwrap().exits;
+        assert!(ex("v4 = [\"a\"]\npaused = true").paused());
+        assert!(!ex("v4 = [\"a\"]\npaused = false").paused());
+        assert!(!ex("paused = true").paused(), "nothing to pause");
+        let now = crate::clock::now_unix();
+        let e = ex(&format!("v6 = [\"a\"]\npaused = {}", now + 600));
+        assert!(e.paused());
+        assert_eq!(e.paused_until(), Some(now + 600));
+        let e = ex(&format!("v4 = [\"a\"]\npaused = {}", now - 1));
+        assert!(!e.paused() && e.paused_until().is_none(), "over");
+        for bad in ["\"yes\"", "-5", "1.5"] {
+            assert!(with_group(&format!("[exit]\npaused = {bad}\n")).is_err(), "{bad}");
+        }
+        // no clock to trust, or one set far back: over
+        assert!(!Pause::Until(now + 600).active(None));
+        assert!(!Pause::Until(now + 600).active(Some(now - 2 * MAX_PAUSE)));
+        assert!(Pause::On.active(None));
+        assert!(Pause::for_secs(0).is_err() && Pause::for_secs(MAX_PAUSE + 1).is_err());
+        assert!(matches!(Pause::for_secs(60), Ok(Pause::Until(t)) if t >= now + 60));
+        // an edited config with a pause is written back as it was
+        let mut c = with_group("[exit]\nv4 = [\"a\"]\npaused = true\n").unwrap();
+        let e = c.exits.clone();
+        c.set_exits(&e);
+        assert!(c.doc.to_string().contains("paused = true"));
+    }
+
+    #[test]
+    fn firewall_zone() {
+        let net = |z: &str| {
+            let t: DocumentMut = format!("tun_name = \"d\"\nmtu = 1350\nmask = \"24\"\n{z}").parse().unwrap();
+            parse_net(t.as_table()).map(|n| n.firewall_zone)
+        };
+        assert_eq!(net("").unwrap(), None);
+        assert_eq!(net("firewall_zone = \"Private\"").unwrap(), Some(FirewallZone::Private));
+        assert_eq!(net("firewall_zone = \"public\"").unwrap(), Some(FirewallZone::Public));
+        assert!(net("firewall_zone = \"domain\"").is_err());
+        assert!(net("firewall_zone = 1").is_err());
     }
 
     #[test]

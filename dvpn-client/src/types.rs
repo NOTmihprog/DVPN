@@ -42,6 +42,12 @@ pub struct Status {
     pub exit_v4: Option<String>,
     pub exit_v6: Option<String>,
     pub kill_switch: bool,
+    /// The exit is paused: the internet goes direct; until when (unix seconds, None: until
+    /// resumed).
+    #[serde(default)]
+    pub exit_paused: bool,
+    #[serde(default)]
+    pub exit_paused_until: Option<u64>,
     pub local_addr: Option<String>,
     pub uptime_secs: u64,
 }
@@ -299,6 +305,12 @@ pub struct Exit {
     pub active: PerFamily<Option<ActiveGateway>>,
     /// The kill switch blocks the internet: gateways configured, none alive.
     pub blocked: PerFamily<bool>,
+    /// The exit is paused: the gateways stay set but the internet goes direct, the kill switch
+    /// does not hold; until when (unix seconds, None: until resumed).
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub paused_until: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -340,6 +352,20 @@ pub struct ExitUpdate {
     pub table: Option<Option<u32>>,
     /// A full path, read by the node; `Some(None)`: the whole internet again.
     pub only_file: Option<Option<String>>,
+    /// Turn the exit off for a while, or on again. Nodes up to 4.4.0 ignore it: look at
+    /// `Exit::paused` in the answer.
+    pub pause: Option<ExitPause>,
+}
+
+/// `ExitUpdate::pause`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitPause {
+    /// Resume: the gateways and the kill switch are in use again.
+    Off,
+    /// Until resumed.
+    On,
+    /// For so many seconds (up to 30 days).
+    Secs(u64),
 }
 
 /// One forwarded port of a gateway.
@@ -474,8 +500,13 @@ pub enum Event {
     Neighbor { key: String, name: Option<String>, state: NeighborState, endpoint: Option<String> },
     /// The first hop to a member changed; `via` None: no route now.
     Route { key: String, name: Option<String>, via: Option<String>, via_name: Option<String> },
-    /// The gateways in use or the kill switch changed.
-    Exit { active: PerFamily<Option<ActiveGateway>>, blocked: PerFamily<bool> },
+    /// The gateways in use, the kill switch or the pause changed.
+    Exit {
+        active: PerFamily<Option<ActiveGateway>>,
+        blocked: PerFamily<bool>,
+        #[serde(default)]
+        paused: bool,
+    },
     /// A member joined, changed (name, addresses, roles) or was revoked.
     Member { action: MemberAction, key: String, name: Option<String>, prefixes: Vec<String>, revoked: bool },
     /// A psk change was announced (`next`) or switched to (`epoch`).

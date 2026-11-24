@@ -124,6 +124,13 @@ enum Command {
         /// commas, spaces or new lines; the node re-reads the file when it changes
         #[arg(long, value_name = "FILE")]
         only: Option<PathBuf>,
+        /// Turn the exit off for a while: the internet goes direct, the kill switch does not
+        /// hold, the gateways stay set. For a time (90, 30s, 15m, 2h, 1d) or until --resume
+        #[arg(long, value_name = "TIME", num_args = 0..=1, default_missing_value = "on", conflicts_with = "none")]
+        pause: Option<String>,
+        /// End the pause: the gateways and the kill switch are in use again
+        #[arg(long, conflicts_with = "pause")]
+        resume: bool,
     },
     /// Start peer discovery server
     Server {
@@ -412,6 +419,44 @@ enum GroupCommand {
         /// Group name or id
         group: String,
     },
+}
+
+/// A time: seconds, or a number with s, m, h or d.
+fn parse_secs(s: &str) -> Result<u64, String> {
+    let (n, unit) = match s.char_indices().last() {
+        Some((i, 's')) => (&s[..i], 1),
+        Some((i, 'm')) => (&s[..i], 60),
+        Some((i, 'h')) => (&s[..i], 3600),
+        Some((i, 'd')) => (&s[..i], 86400),
+        _ => (s, 1),
+    };
+    n.parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(unit))
+        .ok_or_else(|| "a time like 90, 30s, 15m, 2h or 1d expected".to_owned())
+}
+
+/// What a paused exit means (`until`: unix seconds, none: until resumed).
+fn pause_warning(until: Option<u64>) -> String {
+    let when = match until {
+        None => "until resumed".to_owned(),
+        Some(t) => {
+            let s = t.saturating_sub(now_unix());
+            format!("for {} h {:02} min {:02} s more", s / 3600, s / 60 % 60, s % 60)
+        }
+    };
+    format!("PAUSED {when}. WARNING: the internet goes direct, past the gateway and the kill switch")
+}
+
+#[test]
+fn pause_times() {
+    for (s, n) in [("90", 90), ("30s", 30), ("15m", 900), ("2h", 7200), ("1d", 86400)] {
+        assert_eq!(parse_secs(s), Ok(n), "{s}");
+    }
+    for s in ["", "m", "-5", "1w", "1.5h", "99999999999999999999", "400000000000000000d"] {
+        assert!(parse_secs(s).is_err(), "{s}");
+    }
+    assert!(pause_warning(None).contains("until resumed"));
 }
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -1207,6 +1252,9 @@ fn main() {
                 dash(s.exit_v6),
                 if s.kill_switch { "  (kill switch on: no gateway alive)" } else { "" }
             );
+            if s.exit_paused {
+                println!("          {}", pause_warning(s.exit_paused_until));
+            }
         }
         Some(Command::Neighbors) => {
             let c = api_client(&rt, &conf, cli.api_addr);
@@ -1311,7 +1359,7 @@ fn main() {
                 _ => die(format!("no route to {node}")),
             }
         }
-        Some(Command::Exit { v4, v6, none, kill_switch, dns, sources, table, only }) => {
+        Some(Command::Exit { v4, v6, none, kill_switch, dns, sources, table, only, pause, resume }) => {
             let mut e = conf.exits.clone();
             if none {
                 e = config::Exits::default();
@@ -1364,6 +1412,25 @@ fn main() {
                     Some(f)
                 };
             }
+            if resume {
+                e.paused = None;
+            }
+            if let Some(d) = &pause {
+                if e.v4.is_empty() && e.v6.is_empty() {
+                    die("--pause: no gateways set, nothing to pause");
+                }
+                e.paused = Some(match d.as_str() {
+                    "on" => config::Pause::On,
+                    d => {
+                        config::Pause::for_secs(parse_secs(d).unwrap_or_else(|err| die(format!("--pause {d}: {err}"))))
+                            .unwrap_or_else(|err| die(format!("--pause {d}: {err}")))
+                    }
+                });
+            }
+            // one that is over does not come back with a later change
+            if !e.paused() {
+                e.paused = None;
+            }
             if e != conf.exits {
                 conf.set_exits(&e);
                 conf.save();
@@ -1372,6 +1439,10 @@ fn main() {
             println!("IPv4 exit: {}\nIPv6 exit: {}", show(&e.v4), show(&e.v6));
             if !e.v4.is_empty() || !e.v6.is_empty() {
                 println!("kill switch: {}", if e.kill_switch() { "on (no gateway: no internet)" } else { "off" });
+            }
+            if e.paused() {
+                println!("exit {}", pause_warning(e.paused_until()));
+                println!("turn it on again: dvpn exit --resume");
             }
             if e.split() {
                 let src = e.sources();

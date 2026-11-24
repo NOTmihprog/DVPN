@@ -500,6 +500,16 @@ impl Client {
         if let Some(o) = &u.only_file {
             f.push(("only_file", o.as_deref().map_or(Value::Nil, Value::from)));
         }
+        if let Some(p) = u.pause {
+            f.push((
+                "pause",
+                match p {
+                    ExitPause::Off => false.into(),
+                    ExitPause::On => true.into(),
+                    ExitPause::Secs(s) => s.into(),
+                },
+            ));
+        }
         from_value(self.raw("set", "exit", f).await?)
     }
 
