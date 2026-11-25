@@ -320,7 +320,7 @@ impl Admitted {
 
     /// Writes the file if something changed; forgets expired certificates.
     pub fn save(&mut self) {
-        if !std::mem::take(&mut self.changed) {
+        if !self.changed {
             return;
         }
         if let Some(now) = crate::clock::trusted_unix() {
@@ -329,13 +329,18 @@ impl Admitted {
                 !seen.is_empty()
             });
         }
-        let Some(path) = &self.path else { return };
+        let Some(path) = &self.path else {
+            self.changed = false;
+            return;
+        };
         let list: Vec<_> =
             self.groups.iter().flat_map(|(g, s)| s.iter().map(move |(k, (n, until))| (g, k, n, until))).collect();
         let tmp = path.with_extension("tmp2");
         let data = postcard::to_stdvec(&list).expect("list serializes");
-        if let Err(e) = std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, path)) {
-            log::warn!("State | write {} error: {e}", path.display());
+        match std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, path)) {
+            Ok(()) => self.changed = false,
+            // still to be written: the next `save` tries again
+            Err(e) => log::warn!("State | write {} error: {e}", path.display()),
         }
     }
 }
@@ -461,6 +466,11 @@ impl StateStore {
         let new = matches!(a.insert(cert), Some((_, true)));
         a.save();
         new
+    }
+
+    /// Writes what an earlier `admit` could not.
+    pub fn save_admitted(&self) {
+        self.admitted.lock().save();
     }
 
     /// Forgets a group's records (a tracker, when nobody of the group has been around for long).
@@ -839,6 +849,25 @@ mod tests {
         daemon.save();
         assert_eq!(StateStore::open(path).revoked(&g.id()).len(), 2);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// What could not be written is written the next time, though nothing new came.
+    #[test]
+    fn admitted_is_saved_again_after_an_error() {
+        let tag = crate::crypto::encode_b64(&crate::crypto::random_bytes::<9>());
+        let dir = std::env::temp_dir().join(format!("dvpn-admitted-{tag}"));
+        let path = dir.join("state.admitted");
+        let g = GroupSecret::generate();
+        let join = g.grant_join(CertBody::new(Identity::generate().id(), "n", vec![]), u64::MAX);
+        let cert = join.enroll(Identity::generate().id());
+        let mut a = Admitted::open(path.clone());
+        a.insert(&cert);
+        a.save(); // there is no such folder
+        std::fs::create_dir_all(&dir).unwrap();
+        a.save();
+        let got = Admitted::open(path).get(&g.id(), &join.grant.key);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(got, Some(cert.body.node));
     }
 
     #[test]

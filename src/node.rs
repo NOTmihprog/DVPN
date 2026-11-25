@@ -1193,6 +1193,8 @@ impl Node {
                     storage.set_peer(peer, update);
                 }
                 self.roam(peer, from);
+                // the link found it in time: not judged again a moment later
+                self.admit(&cert);
                 self.member_seen(&cert).await;
                 storage.update_link(&peer, |l| l.last_seen = Some(Instant::now()));
                 match reply {
@@ -1351,6 +1353,7 @@ impl Node {
             if self.system.lock().retry() {
                 self.replan();
             }
+            self.group.store.save_admitted();
         }
     }
 
@@ -1870,6 +1873,7 @@ impl Node {
                 {
                     self.storage.set_peer(peer, update);
                 }
+                self.admit(&cert);
                 Box::pin(self.member_seen(&cert)).await;
                 if let Some(r) = reply {
                     // back the way it came if we have no route of our own yet
@@ -1962,9 +1966,11 @@ impl Node {
         }
         // the gateway's DNS is reached through the tunnel; the system's past it (protected)
         let protect = if system { self.transport.protector().cloned() } else { None };
+        // reserved before the task, like in `dns::serve`
+        let Some(permit) = crate::dns::forward_permit() else { return true };
         let (me, query) = (self.clone(), query.to_vec());
         self.tasks.spawn(async move {
-            if let Some(r) = crate::dns::forward_once(&query, &upstream, protect.as_ref()).await
+            if let Some(r) = crate::dns::forward_once(permit, &query, &upstream, protect.as_ref()).await
                 && let (Some(p), Some(tun)) = (packet::udp_packet(dst, src, 53, sport, &r, 64), me.tun.load_full())
             {
                 let _ = tun.send(&p).await;

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::net::UdpSocket;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
@@ -215,16 +215,21 @@ async fn ask(
     }
 }
 
-/// Asks the upstream servers in turn for `query`; the first answer. None also when too many
-/// queries are under way. `protect` keeps the socket out of the VPN (the system's own DNS servers
+/// A place among the queries being forwarded, if there is one left: taken before a task is made
+/// for the query.
+pub fn forward_permit() -> Option<SemaphorePermit<'static>> {
+    FORWARDS.try_acquire().ok()
+}
+
+/// Asks the upstream servers in turn for `query`; the first answer. `protect` keeps the socket out of the VPN (the system's own DNS servers
 /// on Android).
 pub async fn forward_once(
+    _permit: SemaphorePermit<'static>,
     query: &[u8],
     upstream: &[IpAddr],
     protect: Option<&crate::transport::Protect>,
 ) -> Option<Vec<u8>> {
     let (_, _, end) = question(query)?;
-    let _permit = FORWARDS.try_acquire().ok()?;
     for server in upstream {
         if let Ok(Ok(r)) = tokio::time::timeout(FORWARD_TIMEOUT, ask(query, end, *server, protect)).await {
             return Some(r);
@@ -254,20 +259,18 @@ pub async fn serve(addr: IpAddr, zone: Arc<ArcSwap<Zone>>, domain: String, upstr
         let up = upstream.load();
         if !up.is_empty() && n >= 12 && !in_zone(&buf[..n], &domain) {
             // before the task: a flood must not pile them up either
+            let Some(permit) = forward_permit() else { continue };
             {
                 let mut c = clients.lock();
                 let n = c.entry(from.ip()).or_insert(0);
-                if *n >= MAX_CLIENT_FORWARDS || FORWARDS.available_permits() == 0 {
-                    if *n == 0 {
-                        c.remove(&from.ip());
-                    }
+                if *n >= MAX_CLIENT_FORWARDS {
                     continue;
                 }
                 *n += 1;
             }
             let (query, up, sock, clients) = (buf[..n].to_vec(), up.to_vec(), sock.clone(), clients.clone());
             tokio::spawn(async move {
-                if let Some(r) = forward_once(&query, &up, None).await {
+                if let Some(r) = forward_once(permit, &query, &up, None).await {
                     let _ = sock.send_to(&r, from).await;
                 }
                 let mut c = clients.lock();
@@ -541,7 +544,7 @@ mod tests {
             for f in FORGERIES {
                 let server = serve_forged(f).await;
                 let up = ["127.0.0.2".parse().unwrap()];
-                let got = forward_once(&query("example.com", TYPE_A), &up, None).await;
+                let got = forward_once(forward_permit().unwrap(), &query("example.com", TYPE_A), &up, None).await;
                 server.await.unwrap();
                 check(&mut bad, f, got);
             }
@@ -572,6 +575,34 @@ mod tests {
                 check(&mut bad, f, n.ok().map(|n| buf[..n.unwrap()].to_vec()));
             }
             assert!(bad.is_empty(), "{bad:#?}");
+        }
+
+        /// A task is only made for a query that has its place: many sources at once do not get
+        /// more tasks than there are places left.
+        #[tokio::test]
+        async fn no_tasks_beyond_the_limit() {
+            if !crate::testutil::in_netns("dns::tests::upstream::no_tasks_beyond_the_limit", None) {
+                return;
+            }
+            let _silent = UdpSocket::bind("127.0.0.2:53").await.unwrap();
+            start();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _others = FORWARDS.try_acquire_many(MAX_FORWARDS as u32 - 2).unwrap();
+            let alive = || tokio::runtime::Handle::current().metrics().num_alive_tasks();
+            let before = alive();
+            // more than the runtime runs between two looks at `alive` (61), fewer than one read of the socket
+            for i in 0..120 {
+                let c = std::net::UdpSocket::bind((format!("127.0.1.{}", i + 1), 0)).unwrap();
+                c.send_to(&query("example.com", TYPE_A), "127.0.0.1:53").unwrap();
+            }
+            let mut most = 0;
+            for _ in 0..500 {
+                tokio::task::yield_now().await;
+                most = most.max(alive() - before);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(alive() - before, 2, "the places left are used");
+            assert_eq!(most, 2, "tasks for 2 places");
         }
 
         /// Clients asking faster than a (silent) server answers do not use up the node's sockets,

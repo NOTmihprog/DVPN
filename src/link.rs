@@ -348,7 +348,7 @@ impl Links {
             return None;
         }
         let now = crate::clock::trusted_unix();
-        let mut m = self.membership.upgradable_read();
+        let m = self.membership.read();
         if !m.admits(&cert) {
             log::debug!("Link | handshake from revoked {}", crate::logger::node(cert.body.node));
             return None;
@@ -357,16 +357,18 @@ impl Links {
             log::info!("Link | {}: its invite has expired", crate::logger::node(cert.body.node));
             return None;
         }
-        // it came in time: it stays when the invite runs out (the node keeps this on disk)
-        if let (Some(g), Some(_)) = (cert.join_grant(), now)
-            && m.admitted.len() < crate::state::MAX_GROUP_RECORDS
-            && !m.admitted.contains_key(&g.key)
-        {
-            let (key, node) = (g.key, cert.body.node);
-            m.with_upgraded(|m| m.admitted.insert(key, node));
-        }
         drop(m);
         (cert.body.node != self.identity.id()).then_some(cert)
+    }
+
+    /// The handshake of `cert`'s node is accepted: with an invite certificate it came in time, and
+    /// stays when the invite runs out (the node keeps this on disk).
+    fn admit(&self, cert: &Cert) {
+        let Some(g) = cert.join_grant().filter(|_| crate::clock::trusted()) else { return };
+        let mut m = self.membership.write();
+        if m.admitted.len() < crate::state::MAX_GROUP_RECORDS {
+            m.admitted.entry(g.key).or_insert(cert.body.node);
+        }
     }
 
     /// Packets that start a handshake with `peer`, in sending order: the profile's signature and
@@ -427,6 +429,7 @@ impl Links {
         out[HS_RESP_HDR..HS_RESP_HDR + 32].copy_from_slice(&repr);
         inner.install(Arc::new(Session::new(peer, idx, sender_idx, transport, key.obfs.clone(), false)));
         drop(inner);
+        self.admit(&cert);
         Some(Received::Handshake { peer, cert: Box::new(cert), reply: Some(self.finish_handshake(key, HS_RESP, out)) })
     }
 
@@ -446,6 +449,8 @@ impl Links {
         let mut inner = self.inner.write();
         inner.pending.remove(&receiver_idx)?;
         inner.install(Arc::new(Session::new(peer, receiver_idx, sender_idx, transport, key.obfs.clone(), true)));
+        drop(inner);
+        self.admit(&cert);
         Some(Received::Handshake { peer, cert: Box::new(cert), reply: None })
     }
 
@@ -623,6 +628,32 @@ mod tests {
         let secret = GroupSecret::generate();
         let now = crate::clock::now_unix();
         assert!(!handshake(&invited(&secret, now - 3600), &side(&secret)));
+    }
+
+    /// A refused handshake decides nothing about who used an invite: neither one whose certificate
+    /// is for another key (as either side), nor a replay.
+    #[test]
+    fn refused_handshake_admits_nobody() {
+        let secret = GroupSecret::generate();
+        let admitted = |s: &Side| s.links.membership.read().admitted.len();
+        let honest = invited(&secret, crate::clock::now_unix() + 3600);
+        let cert = honest.links.cert.read().clone();
+        // another key with that certificate
+        let group = Group { id: secret.id(), psk: secret.psk(0), obfs: Profile::default(), cert };
+        let thief = side_with(Identity::generate(), group);
+        let b = side(&secret);
+        assert!(!handshake(&thief, &b));
+        assert_eq!(admitted(&b), 0, "as the initiator");
+        assert!(!handshake(&b, &thief));
+        assert_eq!(admitted(&b), 0, "as the responder");
+
+        let mut init = honest.links.initiate(b.id, Duration::ZERO).unwrap().pop().unwrap();
+        let mut again = init.clone();
+        assert!(b.links.receive(&mut init).is_some());
+        assert_eq!(admitted(&b), 1, "an accepted one does");
+        b.links.membership.write().admitted.clear();
+        assert!(b.links.receive(&mut again).is_none());
+        assert_eq!(admitted(&b), 0, "a replay does not");
     }
 
     /// The other half: a member that came in time keeps its invite certificate until an admin
