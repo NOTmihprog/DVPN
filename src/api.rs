@@ -509,7 +509,7 @@ pub mod access {
         /// Whether request `p` of `kind` may go on.
         pub fn check(&self, p: &Value, kind: &str) -> Result<(), ApiError> {
             let Access::Token { token, all, file } = self else { return Ok(()) };
-            if kind == "get" && !all {
+            if matches!(kind, "get" | "init") && !all {
                 return Ok(());
             }
             let given = field(p, "token").and_then(Value::as_str);
@@ -1113,6 +1113,12 @@ impl Api {
                 );
             }
         };
+        // with `token = "all"` nobody gets in without it: the answer tells about the node, and a
+        // client gets events
+        if let Err(e) = self.access.check(p, "init") {
+            log::debug!("API | conn {from} ({name}): init refused, no token");
+            return error_msg(e.code, &e.msg, Vec::new());
+        }
         self.state.lock().conns.entry(from.clone()).or_insert_with(|| Conn::new(version)).version = version;
         log::debug!("API | conn {from} init, name {name:?}, version {version}");
         let n = &self.node;
@@ -2253,7 +2259,7 @@ impl Api {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::group::{CertBody, GroupSecret};
     use crate::identity::Identity;
@@ -2283,6 +2289,11 @@ mod tests {
     }
 
     /// The test node and its group's secret (to write group records as an admin would).
+    pub(crate) async fn node_with_secret(admin: bool) -> (Arc<Node>, GroupSecret) {
+        let (api, secret) = api_with_secret(admin).await;
+        (api.node, secret)
+    }
+
     async fn api_with_secret(admin: bool) -> (Api, GroupSecret) {
         let identity = Arc::new(Identity::generate());
         let secret = GroupSecret::generate();
@@ -2378,12 +2389,12 @@ mod tests {
                 CertBody::new(Identity::generate().id(), name, prefixes.iter().map(|p| p.parse().unwrap()).collect());
             b.roles.0 = roles;
             let c = secret.issue(b);
-            store.add(secret, crate::state::Body::Cert(Box::new(c.clone())), false);
+            store.add(secret, crate::state::Body::Cert(Box::new(c.clone())), false).unwrap();
             c.body.node
         };
         let bob = issue("bob", &["10.10.33.2/32", "192.168.1.0/24"], crate::group::Roles::RELAY);
         let dave = issue("dave", &["10.10.33.4/32"], 0);
-        store.add(secret, crate::state::Body::Revoke { key: dave }, false);
+        store.add(secret, crate::state::Body::Revoke { key: dave }, false).unwrap();
         (bob, dave)
     }
 
@@ -2559,7 +2570,7 @@ mod tests {
         assert_eq!(field(g, "statics"), Some(&Value::Array(Vec::new())));
 
         // a psk change announced for a minute from now
-        api.node.group_store().rotate(&secret, 0, 60_000);
+        api.node.group_store().rotate(&secret, 0, 60_000).unwrap();
         let r = request(&api, "get", vec![("req", "group".into())]).await;
         let next = field(get_ok(&r), "next_epoch").expect("announced epoch");
         assert_eq!(field(next, "epoch").and_then(Value::as_u64), Some(1));
@@ -2588,7 +2599,7 @@ mod tests {
         let (bob, dave) = add_members(&api, &secret);
         let _ = dave;
         let carol = Identity::generate().id(); // revoked before anybody saw it
-        api.node.group_store().add(&secret, crate::state::Body::Revoke { key: carol }, false);
+        api.node.group_store().add(&secret, crate::state::Body::Revoke { key: carol }, false).unwrap();
 
         let r = request(&api, "get", vec![("req", "members".into())]).await;
         let list = get_ok(&r).as_array().expect("a list").clone();
@@ -2823,7 +2834,7 @@ mod tests {
         };
         let text = "default = \"deny\"\n[tags]\nservers = [\"bob\"]\n\n[[rule]]\nfrom = [\"alice\"]\nto = [\"servers\"]\nproto = \"tcp\"\nports = [\"22\", \"8000-8080\"]\naction = \"allow\"\n";
         let acl = crate::acl::Acl::parse(text, &member).unwrap();
-        api.node.group_store().add(&secret, crate::state::Body::Acl(Box::new(acl)), false);
+        api.node.group_store().add(&secret, crate::state::Body::Acl(Box::new(acl)), false).unwrap();
 
         let r = request(&api, "get", vec![("req", "acl".into())]).await;
         let a = get_ok(&r);
@@ -3329,7 +3340,7 @@ mod tests {
                 &format!("m{i:03}"),
                 vec![format!("{addr}/32").parse().unwrap()],
             );
-            store.add(&secret, crate::state::Body::Cert(Box::new(secret.issue(b))), false);
+            store.add(&secret, crate::state::Body::Cert(Box::new(secret.issue(b))), false).unwrap();
         }
         assert_eq!(code(c.raw("get", "members", Vec::new()).await), Some(ErrorCode::TooLarge));
         let part = c.raw("get", "members", vec![("offset", 10.into()), ("limit", 5.into())]).await.unwrap();
@@ -3358,5 +3369,61 @@ mod tests {
         assert_eq!((s(&failed, "err"), s(&failed, "msg")), (Some("not_admin"), Some("only admins")));
         assert!(failed.as_map().unwrap().iter().any(|(k, v)| k.as_str() == Some("id") && v.is_nil()));
         assert!(field(&failed, "res").is_none());
+    }
+
+    /// `[api] token = "all"`: reading needs the token too, so a client without it gets neither the
+    /// node's identity in the answer to `init` nor events.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_all_covers_init_and_events() {
+        let (api, _) = api_with_secret(false).await;
+        let node = api.node.clone();
+        let sock = ApiSocket::bind("127.0.0.1:0").await.unwrap();
+        let at: std::net::SocketAddr = match &sock {
+            ApiSocket::Inet(s) => s.local_addr().unwrap(),
+            #[cfg(unix)]
+            ApiSocket::Unix(..) => unreachable!("bound to an IP address"),
+        };
+        let access = access::Access::Token { token: Some(TEST_TOKEN.into()), all: true, file: None };
+        Api::start_with(node.clone(), sock, access);
+
+        async fn next(c: &tokio::net::UdpSocket) -> Option<Value> {
+            let mut buf = vec![0u8; MAX_DATAGRAM];
+            let n = tokio::time::timeout(Duration::from_millis(500), c.recv(&mut buf)).await.ok()?.ok()?;
+            rmpv::decode::read_value(&mut &buf[..n]).ok()
+        }
+        use dvpn_client::{Client, ErrorCode};
+        let client_at = dvpn_client::ApiAddr::Udp(at);
+        let r = Client::connect_with_token(client_at.clone(), "test", "wrong").await;
+        assert_eq!(code(r.map(|_| ())), Some(ErrorCode::NotPermitted));
+        let c = Client::connect_with_token(client_at, "test", TEST_TOKEN).await.unwrap();
+        assert!(c.status().await.is_ok());
+        let mut leaks = Vec::new();
+        for (token, allowed) in [(None, false), (Some("wrong"), false), (Some(TEST_TOKEN), true)] {
+            let c = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            c.connect(at).await.unwrap();
+            let mut m = vec![("type", "init".into()), ("version", API_VERSION.into()), ("name", "test".into())];
+            m.extend(token.map(|t| ("token", Value::from(t))));
+            let mut b = Vec::new();
+            rmpv::encode::write_value(&mut b, &map(m)).unwrap();
+            c.send(&b).await.unwrap();
+            let reply = next(&c).await;
+            let identity = reply.as_ref().is_some_and(|r| field(r, "key").is_some() || field(r, "group").is_some());
+            let secret = GroupSecret::generate();
+            let body = CertBody::new(Identity::generate().id(), "eve", vec!["10.10.33.9/32".parse().unwrap()]);
+            node.storage.set_peer(body.node, PeerUpdate::from_cert(&secret.issue(body)));
+            let mut event = false;
+            while let Some(v) = next(&c).await {
+                event |= s_type(&v) == Some("event");
+            }
+            if (identity, event) != (allowed, allowed) {
+                leaks.push(format!("token {token:?}: identity {identity}, events {event}, expected {allowed}"));
+            }
+        }
+        std::fs::remove_dir_all(node.config_path().parent().unwrap()).unwrap();
+        assert!(leaks.is_empty(), "{leaks:#?}");
+    }
+
+    fn s_type(v: &Value) -> Option<&str> {
+        s(v, "type")
     }
 }

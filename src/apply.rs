@@ -24,6 +24,8 @@ pub struct System {
     resolved: Option<String>,
     /// The ACL chain installed now (rendered for nftables).
     acl: Option<String>,
+    /// The ACL wanted could not be installed: to be tried again.
+    acl_failed: bool,
 }
 
 impl System {
@@ -63,6 +65,11 @@ impl System {
         }
     }
 
+    /// Part of the last plan could not be applied: the same plan again may help.
+    pub fn retry(&self) -> bool {
+        self.acl_failed
+    }
+
     /// From `old` to `new` for node `me`. Blocking (runs `ip`, `nft`, `resolvectl`).
     pub fn apply(&mut self, me: &NodeId, old: &Plan, new: &Plan) {
         self.addresses(&old.addrs, &new.addrs);
@@ -76,8 +83,8 @@ impl System {
         }
         if self.tun.is_some() {
             let chain = new.acl.as_ref().and_then(|a| a.render(me, &new.members.clone().into_iter().collect()));
-            if chain != self.acl {
-                crate::acl::apply_nft(&self.tun_name, chain.as_deref());
+            self.acl_failed = chain != self.acl && !crate::acl::apply_nft(&self.tun_name, chain.as_deref());
+            if !self.acl_failed {
                 self.acl = chain;
             }
         }
@@ -143,5 +150,52 @@ impl System {
         if self.resolved.is_some() {
             crate::dns::resolved_clear();
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// An ACL that could not be installed is tried again: it is not the one in place.
+    #[test]
+    fn failed_acl_is_tried_again() {
+        use std::os::unix::fs::PermissionsExt;
+        const NAME: &str = "apply::tests::failed_acl_is_tried_again";
+        let tag = crate::crypto::encode_b64(&crate::crypto::random_bytes::<9>());
+        let dir = std::env::temp_dir().join(format!("dvpn-nft-{tag}"));
+        // `nft` that fails to load rules while the file `fail` is next to it; found first in PATH
+        let script =
+            "#!/bin/sh\n[ \"$1\" = -f ] && [ -e \"${0%/*}/fail\" ] && exit 1\nPATH=${PATH#*:}\nexec nft \"$@\"\n";
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("nft"), script).unwrap();
+        std::fs::set_permissions(dir.join("nft"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = std::panic::catch_unwind(|| crate::testutil::in_netns(NAME, Some(&dir)));
+        std::fs::remove_dir_all(&dir).unwrap();
+        match r {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+        let path = std::env::var("PATH").unwrap();
+        let fail = std::path::Path::new(path.split(':').next().unwrap()).join("fail");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _in_rt = rt.enter();
+        let tun = tun_rs::DeviceBuilder::new().name("dvpntest").build_async().unwrap();
+        let mut sys = System::new(Some(Arc::new(tun)));
+        let me = crate::identity::Identity::generate().id();
+        let acl = crate::acl::Acl { default_deny: true, ..Default::default() };
+        let members = [(me, vec!["10.0.0.1/32".parse().unwrap()])].into();
+        let plan = Plan { acl: Some(acl), members, ..Default::default() };
+        let installed = || {
+            let o = std::process::Command::new("nft").args(["list", "table", "inet", "dvpn_acl"]).output().unwrap();
+            o.status.success()
+        };
+        std::fs::write(&fail, "").unwrap();
+        sys.apply(&me, &Plan::default(), &plan);
+        assert!(!installed() && sys.retry(), "nft failed");
+        std::fs::remove_file(&fail).unwrap();
+        sys.apply(&me, &plan, &plan);
+        assert!(installed() && !sys.retry(), "never tried again: no rules until the ACL changes");
     }
 }

@@ -17,7 +17,7 @@ use crate::logger::node as show;
 use crate::noise::{TAG_LEN, Tai64n};
 use crate::obfs::MAX_PAD;
 use crate::proto::{DATA, DATA_HDR, HS_INIT, MAX_ANNOUNCE_CERTS, MAX_CANDIDATES, MAX_DATAGRAM, TrackerMsg};
-use crate::state::{Entry, MAX_GROUP_RECORDS, Membership, StateStore, SyncMsg, record_key};
+use crate::state::{Admitted, Entry, Membership, StateStore, SyncMsg, record_key};
 use crate::transport::{bind_udp, normalize, wire_addr};
 use crate::tunnel::{self, MAX_SKEW, TrackerKeys};
 
@@ -102,7 +102,7 @@ pub struct Server {
     store: StateStore,
     /// Join key -> the first node that enrolled with it, by group: an invite works for one node
     /// only.
-    joins: HashMap<GroupId, HashMap<NodeId, NodeId>>,
+    joins: Admitted,
     /// Groups nobody is online in, and since when.
     idle: HashMap<GroupId, Instant>,
     hs_total: Bucket,
@@ -121,11 +121,19 @@ impl Server {
             last_ts: HashMap::new(),
             groups: HashMap::new(),
             store: StateStore::memory(),
-            joins: HashMap::new(),
+            joins: Admitted::default(),
             idle: HashMap::new(),
             hs_total: Bucket::new(HS_TOTAL.1, Instant::now()),
             hs_sources: HashMap::new(),
             half_open: VecDeque::new(),
+        }
+    }
+
+    /// Keeps who used which invite in `path`, over restarts.
+    pub fn keep_joins(&mut self, path: std::path::PathBuf) {
+        self.joins = Admitted::open(path);
+        for g in self.joins.groups() {
+            self.idle.entry(*g).or_insert_with(Instant::now);
         }
     }
 
@@ -298,24 +306,34 @@ impl Server {
         let mut valid: HashMap<GroupId, Cert> = HashMap::new();
         for c in certs.into_iter().take(MAX_ANNOUNCE_CERTS) {
             let group = c.body.group;
+            let m = Membership::of(&self.store, &group);
             match c.verify(&group, now) {
                 Ok(()) if c.body.node != node => {
                     log::info!("Server | {:#}: certificate of another node ignored", show(node))
                 }
-                Ok(()) if !Membership::of(&self.store, &group).admits(&c) => {
+                Ok(()) if !m.admits(&c) => {
                     log::info!("Server | {:#}: revoked in group {}", show(node), group.short())
                 }
                 Ok(()) => {
                     if let Some(jk) = c.join_key() {
-                        let joins = self.joins.entry(group).or_default();
-                        if joins.len() >= MAX_GROUP_RECORDS && !joins.contains_key(&jk) {
-                            log::info!("Server | {:#}: too many invites in group {}", show(node), group.short());
+                        let known = self.joins.get(&group, &jk).is_some();
+                        if !known
+                            && now.zip(c.join_grant()).is_some_and(|(t, g)| t > g.until)
+                            && !m.issued.contains(&node)
+                        {
+                            log::info!("Server | {:#}: invite expired", show(node));
                             continue;
                         }
-                        let first = *joins.entry(jk).or_insert(node);
-                        if first != node {
-                            log::info!("Server | {:#}: invite already used by {:#}", show(node), show(first));
-                            continue;
+                        match self.joins.insert(&c) {
+                            Some((first, _)) if first != node => {
+                                log::info!("Server | {:#}: invite already used by {:#}", show(node), show(first));
+                                continue;
+                            }
+                            Some(_) => {}
+                            None => {
+                                log::info!("Server | {:#}: too many invites in group {}", show(node), group.short());
+                                continue;
+                            }
                         }
                     }
                     valid.insert(group, c);
@@ -435,6 +453,7 @@ impl Server {
         let clients = &self.clients;
         self.half_open.retain(|n| clients.get(n).is_some_and(|c| !c.announced));
         self.forget_idle_groups(GROUP_IDLE);
+        self.joins.save();
         out
     }
 
@@ -451,18 +470,28 @@ impl Server {
         }
         for g in gone {
             self.idle.remove(&g);
-            self.joins.remove(&g);
+            self.joins.remove_group(&g);
             self.store.remove_group(&g);
         }
     }
 }
 
 /// Serves on `addr:port` (`::` = IPv6 and IPv4 on one socket).
-pub async fn run(addr: std::net::IpAddr, port: u16, identity: Identity) -> std::io::Result<()> {
+/// `joins`: the file that remembers who used which invite.
+pub async fn run(
+    addr: std::net::IpAddr,
+    port: u16,
+    identity: Identity,
+    joins: Option<std::path::PathBuf>,
+) -> std::io::Result<()> {
     let (sock, families) = bind_udp(addr, port)?;
     log::info!("Server started listen: {}", std::net::SocketAddr::new(addr, port));
     let sock: Arc<UdpSocket> = Arc::new(sock);
-    let server = Arc::new(Mutex::new(Server::new(identity)));
+    let mut server = Server::new(identity);
+    if let Some(p) = joins {
+        server.keep_joins(p);
+    }
+    let server = Arc::new(Mutex::new(server));
 
     let gc = {
         let (sock, server) = (sock.clone(), server.clone());
@@ -645,7 +674,7 @@ mod tests {
         let announce = TrackerMsg::Announce { candidates: vec![], certs: vec![cert(&g, &c)] };
         send(&mut st, &c, &announce);
         let member = StateStore::memory();
-        member.add(&g, Body::Revoke { key: Identity::generate().id() }, false);
+        member.add(&g, Body::Revoke { key: Identity::generate().id() }, false).unwrap();
         let keys: Vec<_> = member.summary(&g.id()).iter().map(|(k, _)| *k).collect();
         send(&mut st, &c, &TrackerMsg::Sync(SyncMsg::Records { records: member.get(&g.id(), &keys) }));
         assert_eq!(st.store.summary(&g.id()).len(), 1);
@@ -838,7 +867,7 @@ mod tests {
 
         // a (an admin's node) pushes a revocation of b
         let admin = StateStore::memory();
-        admin.add(&g, Body::Revoke { key: b.id.id() }, false);
+        admin.add(&g, Body::Revoke { key: b.id.id() }, false).unwrap();
         let keys: Vec<_> = admin.summary(&g.id()).iter().map(|(k, _)| *k).collect();
         send(&mut st, &a, &TrackerMsg::Sync(SyncMsg::Records { records: admin.get(&g.id(), &keys) }));
         assert!(!st.groups[&g.id()].contains(&b.id.id()), "b left the index");
@@ -850,9 +879,64 @@ mod tests {
 
         // records of a group the sender is not in are refused
         let h = GroupSecret::generate();
-        admin.add(&h, Body::Revoke { key: a.id.id() }, false);
+        admin.add(&h, Body::Revoke { key: a.id.id() }, false).unwrap();
         let keys: Vec<_> = admin.summary(&h.id()).iter().map(|(k, _)| *k).collect();
         send(&mut st, &a, &TrackerMsg::Sync(SyncMsg::Records { records: admin.get(&h.id(), &keys) }));
         assert!(st.store.revoked(&h.id()).is_empty());
+    }
+
+    fn invite_cert(g: &GroupSecret, c: &Client, until: u64) -> Cert {
+        g.grant_join(CertBody::new(Identity::generate().id(), "n", vec![]), until).enroll(c.id.id())
+    }
+
+    #[test]
+    fn expired_invite_is_not_admitted() {
+        let mut st = server();
+        let g = GroupSecret::generate();
+        let c = connect(&mut st, "198.51.100.1:4000");
+        let certs = vec![invite_cert(&g, &c, crate::clock::now_unix() - 3600)];
+        let r = send(&mut st, &c, &TrackerMsg::Announce { candidates: vec![], certs });
+        assert_eq!(found(&r), vec![]);
+    }
+
+    /// The other half: who came in time stays, also on later announces.
+    #[test]
+    fn member_admitted_in_time_stays_after_the_invite_expires() {
+        let mut st = server();
+        let g = GroupSecret::generate();
+        let c = connect(&mut st, "198.51.100.1:4000");
+        let certs = vec![invite_cert(&g, &c, crate::clock::now_unix() + 2)];
+        let msg = TrackerMsg::Announce { candidates: vec![], certs };
+        let me = vec![(c.id.id(), c.addr)];
+        assert_eq!(found(&send(&mut st, &c, &msg)), me);
+        std::thread::sleep(Duration::from_millis(3100));
+        assert_eq!(found(&send(&mut st, &c, &msg)), me);
+    }
+
+    /// Who came in time is known after a restart of the tracker, and the invite stays used.
+    #[test]
+    fn joins_survive_a_restart() {
+        let tag = crate::crypto::encode_b64(&crate::crypto::random_bytes::<9>());
+        let path = std::env::temp_dir().join(format!("dvpn-joins-{tag}.bin"));
+        let g = GroupSecret::generate();
+        let until = crate::clock::now_unix() + 2;
+        let join = g.grant_join(CertBody::new(Identity::generate().id(), "n", vec![]), until);
+        let announce = |st: &mut Server, c: &Client| {
+            let certs = vec![join.enroll(c.id.id())];
+            found(&send(st, c, &TrackerMsg::Announce { candidates: vec![], certs })).len()
+        };
+        let mut st = server();
+        st.keep_joins(path.clone());
+        let c = connect(&mut st, "198.51.100.1:4000");
+        assert_eq!(announce(&mut st, &c), 1);
+        st.collect_garbage();
+        std::thread::sleep(Duration::from_millis(3100));
+        let mut st = server();
+        st.keep_joins(path.clone());
+        let c = connect_as(&mut st, c.id, "198.51.100.1:4000");
+        let other = connect(&mut st, "198.51.100.2:4000");
+        let got = (announce(&mut st, &c), announce(&mut st, &other));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(got, (1, 0));
     }
 }

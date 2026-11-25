@@ -18,7 +18,7 @@ use crate::group::{
     CERT_TTL_SECS, Cert, CertBody, Delegate, GroupId, GroupSecret, Invite, IssuedDelegation, Roles, StaticRef, now_unix,
 };
 use crate::identity::NodeId;
-use crate::state::{Body, Entry, Membership, StateStore};
+use crate::state::{Body, Entry, Membership, RecordError, StateStore};
 
 /// What joining gave.
 #[derive(Clone, Debug)]
@@ -226,6 +226,25 @@ fn inviter<'a>(g: &'a GroupConfig, revoked: &HashSet<NodeId>) -> Result<Inviter<
     Ok(Inviter::Delegate(d))
 }
 
+impl From<RecordError> for OpError {
+    fn from(e: RecordError) -> Self {
+        let code = match e {
+            RecordError::Full => "group_full",
+            RecordError::TooLarge => "record_too_large",
+            _ => "record_invalid",
+        };
+        OpError::new(code, e.to_string())
+    }
+}
+
+fn check_name(name: &str) -> Result<(), OpError> {
+    let max = crate::group::MAX_NAME_LEN;
+    if name.trim().chars().count() > max {
+        return Err(OpError::new("bad_param", format!("name: longer than {max} characters")));
+    }
+    Ok(())
+}
+
 /// An invite for one new node to group `g` (needs its secret, or a delegation that allows it).
 /// `certs`: the members known, so that a free address is picked. `revoked`: the group's revoked
 /// keys. Adds no records: the invite carries a one-time join key.
@@ -241,6 +260,7 @@ pub fn invite(
     if req.name.trim().is_empty() {
         return Err(OpError::new("bad_param", "name: the new node needs a name"));
     }
+    check_name(&req.name)?;
     let own = g.ipv4().ok_or_else(|| OpError::new("no_address", "this node has no address in the group"))?;
     let net = Ipv4Net::new(own, net_prefix(conf)).map_err(|e| OpError::new("bad_param", e.to_string()))?.trunc();
     let taken: Vec<Ipv4Addr> = certs.iter().filter_map(|c| c.body.ipv4()).chain([own]).collect();
@@ -293,7 +313,10 @@ pub fn invite(
     if req.relay {
         template.roles.0 |= Roles::RELAY;
     }
-    let until = now_unix() + req.ttl_hours * 3600;
+    if !template.fits_record() {
+        return Err(RecordError::TooLarge.into());
+    }
+    let until = now_unix().saturating_add(req.ttl_hours.saturating_mul(3600));
     let join = match inviter {
         Inviter::Admin(secret) => secret.grant_join(template, until),
         Inviter::Delegate(d) => d.grant_join(template, until),
@@ -385,7 +408,7 @@ pub fn remove_delegate(
         .iter()
         .find(|d| d.name == who || d.delegation.key.to_string() == who)
         .ok_or_else(|| OpError::new("no_delegate", format!("no delegate {who}")))?;
-    Ok((d.clone(), store.add(secret, Body::Revoke { key: d.delegation.key }, false)))
+    Ok((d.clone(), store.add(secret, Body::Revoke { key: d.delegation.key }, false)?))
 }
 
 /// Makes this node a delegate from the text an admin gave it, and saves.
@@ -422,6 +445,7 @@ pub fn change_node(
         if n.trim().is_empty() {
             return Err(OpError::new("bad_param", "name: empty"));
         }
+        check_name(n)?;
         body.name = n.trim().to_owned();
     }
     if let Some(a) = ch.addr {
@@ -449,14 +473,14 @@ pub fn change_node(
     body.not_after = now_unix() + CERT_TTL_SECS;
     body.serial = u64::from_le_bytes(random_bytes());
     let cert = secret.issue(body);
-    let entry = store.add(secret, Body::Cert(Box::new(cert.clone())), false);
+    let entry = store.add(secret, Body::Cert(Box::new(cert.clone())), false)?;
     Ok((cert, entry))
 }
 
 /// Starts a new psk epoch in `lead_secs` (after `epoch`, the one in use): sealed to every member.
 pub fn rotate(secret: &GroupSecret, store: &StateStore, epoch: u32, lead_secs: u64) -> Result<Vec<Entry>, OpError> {
     check_clock()?;
-    Ok(store.rotate(secret, epoch, lead_secs * 1000))
+    Ok(store.rotate(secret, epoch, lead_secs * 1000)?)
 }
 
 /// Revokes `key` from the group, and with `rotate` (seconds of lead) changes the psk too, so that
@@ -473,9 +497,13 @@ pub fn revoke(
     if key == me {
         return Err(OpError::new("revoke_self", "an admin cannot revoke itself; leave the group instead"));
     }
-    let mut changed = vec![store.add(secret, Body::Revoke { key }, false)];
+    let mut changed = vec![store.add(secret, Body::Revoke { key }, false)?];
     if let Some(lead) = rotate {
-        changed.extend(store.rotate(secret, epoch, lead * 1000));
+        // the revocation stands and must spread, whatever becomes of the psk
+        match store.rotate(secret, epoch, lead * 1000) {
+            Ok(r) => changed.extend(r),
+            Err(e) => log::error!("Group | {key} is revoked, but the psk was not changed: {e}"),
+        }
     }
     Ok(changed)
 }
@@ -496,7 +524,7 @@ pub fn set_acl(
         })
     };
     let acl = crate::acl::Acl::parse(text, &member).map_err(|e| OpError::new("acl_parse", format!("{e:#}")))?;
-    let entry = store.add(secret, Body::Acl(Box::new(acl.clone())), false);
+    let entry = store.add(secret, Body::Acl(Box::new(acl.clone())), false)?;
     Ok((acl, entry))
 }
 
@@ -519,13 +547,13 @@ pub fn set_forwards(
     if postcard::to_stdvec(&body).expect("body serializes").len() + 200 > crate::state::MAX_RECORD_LEN {
         return Err(OpError::new("forward_invalid", "too many rules for one gateway"));
     }
-    Ok(store.add(secret, body, false))
+    Ok(store.add(secret, body, false)?)
 }
 
 /// Removes the group's access rules: everybody may reach everybody.
 pub fn clear_acl(secret: &GroupSecret, store: &StateStore) -> Result<Entry, OpError> {
     check_clock()?;
-    Ok(store.add(secret, Body::Acl(Box::default()), true))
+    Ok(store.add(secret, Body::Acl(Box::default()), true)?)
 }
 
 #[cfg(test)]
@@ -691,8 +719,8 @@ mod tests {
         let (member, pending) = (join("10.10.40.1/32"), join("10.10.40.2/32"));
         let store = StateStore::memory();
         let body = CertBody { group: secret.id(), ..member.body.clone() };
-        store.add(&secret, Body::Cert(Box::new(secret.issue(body))), false);
-        store.add(&secret, Body::Revoke { key: d.delegation.key }, false);
+        store.add(&secret, Body::Cert(Box::new(secret.issue(body))), false).unwrap();
+        store.add(&secret, Body::Revoke { key: d.delegation.key }, false).unwrap();
         let m = Membership::of(&store, &secret.id());
         assert!(m.admits(&member), "has a regular certificate, not picked up yet");
         assert!(!m.admits(&pending));
@@ -798,5 +826,43 @@ mod tests {
         assert!(join(&mut conf, &expired).unwrap_err().to_string().contains("expired"));
         assert!(conf.groups.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `f` must return; a panic is the whole node's end in a release build (`panic = "abort"`).
+    fn no_panic<T>(f: impl FnOnce() -> T) -> T {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| panic!("it panicked"))
+    }
+
+    #[test]
+    fn acl_too_large_is_an_error() {
+        let secret = GroupSecret::generate();
+        let store = StateStore::memory();
+        set_acl(&secret, &store, &[], "default = \"deny\"\n").unwrap();
+        let rule = "[[rule]]\nfrom = [\"*\"]\nto = [\"*\"]\nproto = \"tcp\"\nports = [\"22\", \"80-443\"]\naction = \"allow\"\n";
+        let text = format!("default = \"allow\"\n{}", rule.repeat(200));
+        assert!(no_panic(|| set_acl(&secret, &store, &[], &text)).is_err());
+        assert!(store.acl(&secret.id()).unwrap().default_deny, "the old rules stay");
+    }
+
+    #[test]
+    fn certificate_too_large_is_an_error() {
+        let secret = GroupSecret::generate();
+        let store = StateStore::memory();
+        let cert = secret.issue(CertBody::new(Identity::generate().id(), "office", vec![net("10.10.0.2/32")]));
+        let add_routes = (0..250).map(|i| net(&format!("192.168.{i}.0/24"))).collect();
+        let ch = NodeChange { add_routes, ..Default::default() };
+        let node = cert.body.node;
+        assert!(no_panic(|| change_node(&secret, &store, &[cert], node, &ch)).is_err());
+        assert!(store.cert(&secret.id(), &node).is_none());
+    }
+
+    #[test]
+    fn revocation_fits_a_full_group() {
+        let secret = GroupSecret::generate();
+        let store = StateStore::memory();
+        store.fill(&secret);
+        let (me, bad) = (Identity::generate().id(), Identity::generate().id());
+        no_panic(|| revoke(&secret, &store, me, bad, 0, None)).unwrap();
+        assert!(store.revoked(&secret.id()).contains(&bad));
     }
 }

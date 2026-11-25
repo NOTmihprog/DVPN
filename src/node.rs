@@ -115,6 +115,11 @@ type EpochPsk = (u32, [u8; 32]);
 /// Called with every new plan (Android: rebuild the VPN interface when its part changed).
 pub type PlanListener = Box<dyn Fn(&crate::plan::Plan) + Send + Sync>;
 
+/// A plan that could not be applied (nft failed) is tried again this often.
+const SYSTEM_RETRY: Duration = Duration::from_secs(30);
+/// Routes are computed at most this often, however many LSAs come.
+const ROUTES_MIN_INTERVAL: Duration = Duration::from_millis(200);
+
 /// The DNS server address a VPN service gives the system (Android, PLAN 7): inside the group
 /// ULA, so its queries come into the TUN, where the node answers them (`tun_dns`).
 pub fn tun_dns_addr(group: &GroupId) -> std::net::Ipv6Addr {
@@ -200,6 +205,10 @@ pub struct Node {
     lsdb: parking_lot::Mutex<Lsdb>,
     routes: arc_swap::ArcSwap<RouteTable>,
     my_lsa: parking_lot::Mutex<(Vec<NodeId>, Option<Instant>, u64)>,
+    /// When routes were last computed, and whether something changed since (`routes_changed`).
+    routes_at: parking_lot::Mutex<(Instant, bool)>,
+    /// When a plan that could not be applied was last tried again.
+    last_retry: parking_lot::Mutex<Instant>,
     last_routing_sync: parking_lot::Mutex<HashMap<NodeId, Instant>>,
     /// Misbehaving neighbours: their ROUTING and STATE messages are ignored for a while.
     scores: parking_lot::Mutex<Scores>,
@@ -293,6 +302,8 @@ impl Node {
             lsdb: parking_lot::Mutex::new(Lsdb::new(group_id)),
             routes: arc_swap::ArcSwap::from_pointee(RouteTable::default()),
             my_lsa: parking_lot::Mutex::new((Vec::new(), None, 0)),
+            routes_at: parking_lot::Mutex::new((Instant::now(), false)),
+            last_retry: parking_lot::Mutex::new(Instant::now()),
             last_routing_sync: parking_lot::Mutex::new(HashMap::new()),
             scores: parking_lot::Mutex::new(Scores::default()),
             metrics: crate::metrics::Metrics::default(),
@@ -440,7 +451,7 @@ impl Node {
         });
         // one replan at a time, so the system follows the plans in order
         let mut current = self.plan.lock();
-        if *current == plan {
+        if *current == plan && !self.system.lock().retry() {
             return;
         }
         // in-process state first: packets route by the new table at once
@@ -617,12 +628,27 @@ impl Node {
         }
     }
 
+    /// The node of an invite certificate came in time: it stays when the invite runs out.
+    fn admit(&self, cert: &Cert) {
+        if cert.from_invite() && self.group.store.admit(cert) {
+            let m = Membership::of(&self.group.store, &self.group.id);
+            self.links.set_membership(m.clone());
+            self.e2e.set_membership(m);
+        }
+    }
+
     /// A member's certificate seen in a handshake or from a tracker. Admins turn invite
     /// certificates into regular ones (revoking the join key, so the invite is used up) and
     /// renew certificates that expire soon.
     async fn member_seen(&self, cert: &Cert) {
         let id = cert.body.node;
         if id != self.storage.self_id() {
+            let now = crate::clock::trusted_unix();
+            if Membership::of(&self.group.store, &self.group.id).too_late(cert, now) {
+                log::warn!("Group | {}: its invite has expired, it needs a new one", node(id));
+                return;
+            }
+            self.admit(cert);
             let changed = {
                 let mut certs = self.peer_certs.lock();
                 match certs.get(&id) {
@@ -653,7 +679,10 @@ impl Node {
             && let Some(taken) = crate::ops::invite_conflict(cert, &self.member_certs(), &Membership::of(store, &g))
         {
             log::warn!("Group | {} refused: {taken}", node(id));
-            let changed = [store.add(secret, Body::Revoke { key: jk }, false)];
+            let changed = match store.add(secret, Body::Revoke { key: jk }, false) {
+                Ok(e) => [e],
+                Err(e) => return log::error!("Group | cannot revoke the invite of {}: {e}", node(id)),
+            };
             self.apply(&changed);
             self.spread(&changed).await;
             return;
@@ -664,19 +693,28 @@ impl Node {
             let mut body = cert.body.clone();
             body.not_after = now_unix() + CERT_TTL_SECS;
             body.serial = rand::random();
-            changed.push(store.add(secret, Body::Cert(Box::new(secret.issue(body))), false));
-            if let Some(jk) = cert.join_key() {
-                changed.push(store.add(secret, Body::Revoke { key: jk }, false));
-                log::info!("Group | {} joined by invite: regular certificate issued, invite used up", node(id));
-            } else {
-                log::info!("Group | certificate of {} renewed", node(id));
+            let mut new = vec![(Body::Cert(Box::new(secret.issue(body))), false)];
+            new.extend(cert.join_key().map(|key| (Body::Revoke { key }, false)));
+            match store.add_all(secret, new) {
+                Ok(e) => {
+                    changed.extend(e);
+                    if cert.from_invite() {
+                        log::info!("Group | {} joined by invite: regular certificate issued, invite used up", node(id));
+                    } else {
+                        log::info!("Group | certificate of {} renewed", node(id));
+                    }
+                }
+                Err(e) => log::error!("Group | no certificate for {}: {e}", node(id)),
             }
         }
         // a member that joined after the last psk change needs that epoch's psk too
         if let Some((n, _)) = store.epoch(&g)
             && !store.has_epoch_key(&g, &id, n)
         {
-            changed.push(store.add(secret, crate::state::seal_psk(&g, &id, n, &secret.psk(n)), false));
+            match store.add(secret, crate::state::seal_psk(&g, &id, n, &secret.psk(n)), false) {
+                Ok(e) => changed.push(e),
+                Err(e) => log::error!("Group | no psk for {}: {e}", node(id)),
+            }
         }
         if changed.is_empty() {
             return;
@@ -906,6 +944,9 @@ impl Node {
             }
         }
         for cert in &out.members {
+            // trackers let nobody use an invite that ran out or was used by another node, and
+            // know who came while we (or an admin) were offline
+            self.admit(cert);
             Box::pin(self.member_seen(cert)).await;
         }
         self.apply(&out.changed);
@@ -1240,6 +1281,27 @@ impl Node {
         let table = RouteTable::compute(me, &self.lsdb.lock(), &relay, &self.routes.load());
         drop(certs);
         self.routes.store(Arc::new(table));
+        *self.routes_at.lock() = (Instant::now(), false);
+    }
+
+    /// The database changed: new routes now, or in the next `mesh_tick` if they were just computed.
+    fn routes_changed(&self) {
+        {
+            let mut r = self.routes_at.lock();
+            if r.0.elapsed() < ROUTES_MIN_INTERVAL {
+                r.1 = true;
+                return;
+            }
+        }
+        self.recompute_routes();
+    }
+
+    /// Nodes whose certificate we know: their LSAs, and those of the neighbours they name, count.
+    fn known_members(&self, m: &Membership) -> HashSet<NodeId> {
+        let mut known = m.issued.clone();
+        known.extend(self.peer_certs.lock().keys());
+        known.insert(self.storage.self_id());
+        known
     }
 
     /// Floods LSAs to all neighbours but `except`.
@@ -1279,10 +1341,17 @@ impl Node {
             self.lsdb.lock().insert(lsa.clone(), &HashSet::new());
             self.flood(vec![lsa], None).await;
         }
-        if due || expired {
+        let late = self.routes_at.lock().1;
+        if due || expired || late {
             self.recompute_routes();
         }
         self.exit_tick();
+        if self.last_retry.lock().elapsed() >= SYSTEM_RETRY {
+            *self.last_retry.lock() = Instant::now();
+            if self.system.lock().retry() {
+                self.replan();
+            }
+        }
     }
 
     // ---- diagnostics (dvpn status / neighbors / routes / path) ----
@@ -1568,29 +1637,52 @@ impl Node {
                 }
             }
             RoutingMsg::Lsas(lsas) => {
-                let revoked = Membership::of(&self.group.store, &self.group.id).revoked;
+                let m = Membership::of(&self.group.store, &self.group.id);
+                let known = self.known_members(&m);
                 let me = self.storage.self_id();
                 let mut bad = 0;
-                let new: Vec<Lsa> = {
-                    let mut db = self.lsdb.lock();
-                    let mut new = Vec::new();
-                    for l in lsas {
+                let mut opened: Vec<(Lsa, LsaBody)> = Vec::new();
+                for l in lsas {
+                    match l.open() {
                         // our own LSA comes back from neighbours: ignore older copies of it
-                        if l.open().is_some_and(|b| b.origin == me) {
-                            continue;
-                        }
-                        match db.insert_checked(l.clone(), &revoked) {
-                            Insert::New => new.push(l),
-                            Insert::Known => {}
+                        Some(b) if b.origin == me => {}
+                        Some(b) => opened.push((l, b)),
+                        None => bad += 5,
+                    }
+                }
+                // members first: they vouch for the neighbours they name
+                opened.sort_by_key(|(_, b)| !known.contains(&b.origin));
+                let (new, missing) = {
+                    let mut db = self.lsdb.lock();
+                    let (mut new, mut named) = (Vec::new(), Vec::new());
+                    for (l, b) in opened {
+                        let origin = b.origin;
+                        let neighbors: Vec<NodeId> = b.neighbors.iter().map(|(n, _)| *n).collect();
+                        match db.insert_opened(l.clone(), b, &m.revoked, &known) {
+                            Insert::New => {
+                                new.push(l);
+                                if known.contains(&origin) {
+                                    named.extend(neighbors);
+                                }
+                            }
+                            // not a fault of the neighbour's: it may know more certificates
+                            Insert::Known | Insert::Stranger | Insert::Full => {}
                             Insert::Invalid => bad += 5,
                             Insert::TooSoon => bad += 1,
                         }
                     }
-                    new
+                    // perhaps refused as strangers before
+                    named.retain(|n| *n != me && !known.contains(n) && db.seq(n).is_none());
+                    named.sort();
+                    named.dedup();
+                    (new, named)
                 };
+                if !missing.is_empty() {
+                    self.send_kind(&peer, KIND_ROUTING, &RoutingMsg::Want(missing).encode()).await;
+                }
                 self.penalize(peer, bad, "routing");
                 if !new.is_empty() {
-                    self.recompute_routes();
+                    self.routes_changed();
                     self.flood(new, Some(peer)).await;
                 }
             }
@@ -2016,5 +2108,101 @@ mod tests {
         assert_eq!(a.octets()[15], 0x53);
         assert_eq!(a, tun_dns_addr(&g));
         assert_ne!(a, tun_dns_addr(&crate::group::GroupSecret::from_bytes([8; 32]).id()));
+    }
+
+    use crate::api::tests::node_with_secret;
+    use crate::group::CertBody;
+    use crate::identity::Identity;
+
+    fn clean(n: &Node) {
+        std::fs::remove_dir_all(n.config_path().parent().unwrap()).unwrap();
+    }
+
+    /// Any key can sign an LSA for the group; only members' count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lsa_of_a_key_without_a_certificate_is_refused() {
+        let (n, secret) = node_with_secret(false).await;
+        let (bob, stranger) = (Identity::generate(), Identity::generate());
+        n.member_seen(&secret.issue(CertBody::new(bob.id(), "bob", vec![]))).await;
+        for i in [&bob, &stranger] {
+            let b = LsaBody { origin: i.id(), group: secret.id(), seq: 1, neighbors: vec![] };
+            n.handle_routing(bob.id(), &RoutingMsg::Lsas(vec![Lsa::sign(i, &b)]).encode()).await;
+        }
+        let seq = |i: &Identity| n.lsdb.lock().seq(&i.id());
+        let (member, other) = (seq(&bob), seq(&stranger));
+        clean(&n);
+        assert_eq!(member, Some(1), "a member's LSA is kept");
+        assert_eq!(other, None, "a stranger's is not");
+    }
+
+    /// A member behind a relay is known by its LSA first: its certificate comes over the route.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lsa_of_a_members_neighbour_is_kept() {
+        let (n, secret) = node_with_secret(false).await;
+        let (bob, carol, eve) = (Identity::generate(), Identity::generate(), Identity::generate());
+        n.member_seen(&secret.issue(CertBody::new(bob.id(), "bob", vec![]))).await;
+        let lsa = |i: &Identity, to: &Identity| {
+            let b = LsaBody { origin: i.id(), group: secret.id(), seq: 1, neighbors: vec![(to.id(), 1)] };
+            Lsa::sign(i, &b)
+        };
+        // whatever the order in the message; carol (no certificate yet) vouches for nobody
+        let lsas = vec![lsa(&eve, &carol), lsa(&carol, &eve), lsa(&bob, &carol)];
+        n.handle_routing(bob.id(), &RoutingMsg::Lsas(lsas).encode()).await;
+        let seq = |i: &Identity| n.lsdb.lock().seq(&i.id());
+        let got = (seq(&bob), seq(&carol), seq(&eve));
+        clean(&n);
+        assert_eq!(got, (Some(1), Some(1), None));
+    }
+
+    /// An admin must not turn an invite that ran out into a regular 30-day certificate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admin_issues_nothing_for_an_expired_invite() {
+        let (n, secret) = node_with_secret(true).await;
+        let invite = |until| {
+            let t = CertBody::new(Identity::generate().id(), "carol", vec![]);
+            secret.grant_join(t, until).enroll(Identity::generate().id())
+        };
+        let (late, good) = (invite(now_unix() - 3600), invite(now_unix() + 3600));
+        n.member_seen(&late).await;
+        n.member_seen(&good).await;
+        let issued = |c: &Cert| n.store().cert(&secret.id(), &c.body.node).is_some();
+        let (late, good) = (issued(&late), issued(&good));
+        clean(&n);
+        assert!(good, "an invite in time is honoured");
+        assert!(!late, "a late one is not");
+    }
+
+    /// Who a tracker let in while this admin was offline is a member, also when the invite has
+    /// run out since; a second node with that invite is not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tracker_vouches_for_who_came_in_time() {
+        let (n, secret) = node_with_secret(true).await;
+        let t = CertBody::new(Identity::generate().id(), "carol", vec![]);
+        let join = secret.grant_join(t, now_unix() - 3600);
+        let (carol, eve) = (join.enroll(Identity::generate().id()), join.enroll(Identity::generate().id()));
+        for c in [&carol, &eve] {
+            n.admit(c); // as `send_tracker` does
+            n.member_seen(c).await;
+        }
+        let issued = |c: &Cert| n.store().cert(&secret.id(), &c.body.node).is_some();
+        let got = (issued(&carol), issued(&eve));
+        clean(&n);
+        assert_eq!(got, (true, false));
+    }
+
+    /// A delegate chooses the name in its invites. An admin that cannot store the certificate
+    /// must refuse it, not die (`StateStore::add` panics, release builds abort on panic).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delegate_cannot_kill_an_admin_with_a_long_name() {
+        let (n, secret) = node_with_secret(true).await;
+        let d = secret.delegate(vec!["10.10.40.0/24".parse().unwrap()], now_unix() + 3600);
+        let t = CertBody::new(Identity::generate().id(), &"x".repeat(1000), vec!["10.10.40.1/32".parse().unwrap()]);
+        let cert = d.grant_join(t, now_unix() + 3600).enroll(Identity::generate().id());
+        // refused before `member_seen`; which must not die either
+        assert_eq!(cert.verify(&secret.id(), Some(now_unix())), Err(crate::group::CertError::TooLarge));
+        let me = n.clone();
+        let r = tokio::spawn(async move { me.member_seen(&cert).await }).await;
+        clean(&n);
+        assert!(r.is_ok(), "the admin node panicked");
     }
 }

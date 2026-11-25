@@ -8,9 +8,11 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
@@ -174,52 +176,58 @@ pub fn in_zone(query: &[u8], domain: &str) -> bool {
     question(query).is_some_and(|(name, _, _)| name == domain || name.ends_with(&format!(".{domain}")))
 }
 
-/// Forwards a query to the upstream servers in turn (through the tunnel: they are public
-/// addresses, routed to the gateway) and relays the first answer.
-async fn forward(query: Vec<u8>, from: SocketAddr, upstream: Vec<IpAddr>, sock: Arc<UdpSocket>) {
-    for server in upstream {
-        let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
-        let Ok(up) = UdpSocket::bind(bind).await else { continue };
-        if up.send_to(&query, SocketAddr::new(server, 53)).await.is_err() {
-            continue;
-        }
-        let mut buf = vec![0u8; 4096];
-        if let Ok(Ok((n, _))) = tokio::time::timeout(std::time::Duration::from_secs(2), up.recv_from(&mut buf)).await
-            && n >= 2
-            && buf[..2] == query[..2]
-        {
-            let _ = sock.send_to(&buf[..n], from).await;
-            return;
+/// Queries being forwarded at once: by the process, and for one client.
+const MAX_FORWARDS: usize = 256;
+const MAX_CLIENT_FORWARDS: usize = 128;
+static FORWARDS: Semaphore = Semaphore::const_new(MAX_FORWARDS);
+/// How long one server may take to answer.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether `r` answers `query`: its id, a response, and the same question (`end`: where that ends).
+fn answers_query(r: &[u8], query: &[u8], end: usize) -> bool {
+    r.len() >= end
+        && r[..2] == query[..2]
+        && r[2] & 0x80 != 0
+        && r[4..6] == query[4..6]
+        && r[12..end].eq_ignore_ascii_case(&query[12..end])
+}
+
+/// Asks one server. The socket is connected: only its answers come in, and others than to this
+/// query are passed over.
+async fn ask(
+    query: &[u8],
+    end: usize,
+    server: IpAddr,
+    protect: Option<&crate::transport::Protect>,
+) -> std::io::Result<Vec<u8>> {
+    let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+    let up = UdpSocket::bind(bind).await?;
+    crate::transport::protect_socket(&up, protect)?;
+    up.connect(SocketAddr::new(server, 53)).await?;
+    up.send(query).await?;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let n = up.recv(&mut buf).await?;
+        if answers_query(&buf[..n], query, end) {
+            buf.truncate(n);
+            return Ok(buf);
         }
     }
 }
 
-/// Asks the upstream servers in turn for `query`; the first answer. `protect` keeps the socket
-/// out of the VPN (the system's own DNS servers on Android).
+/// Asks the upstream servers in turn for `query`; the first answer. None also when too many
+/// queries are under way. `protect` keeps the socket out of the VPN (the system's own DNS servers
+/// on Android).
 pub async fn forward_once(
     query: &[u8],
     upstream: &[IpAddr],
     protect: Option<&crate::transport::Protect>,
 ) -> Option<Vec<u8>> {
-    if query.len() < 12 {
-        return None;
-    }
+    let (_, _, end) = question(query)?;
+    let _permit = FORWARDS.try_acquire().ok()?;
     for server in upstream {
-        let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
-        let Ok(up) = UdpSocket::bind(bind).await else { continue };
-        if crate::transport::protect_socket(&up, protect).is_err() {
-            continue;
-        }
-        if up.send_to(query, SocketAddr::new(*server, 53)).await.is_err() {
-            continue;
-        }
-        let mut buf = vec![0u8; 4096];
-        if let Ok(Ok((n, _))) = tokio::time::timeout(std::time::Duration::from_secs(2), up.recv_from(&mut buf)).await
-            && n >= 2
-            && buf[..2] == query[..2]
-        {
-            buf.truncate(n);
-            return Some(buf);
+        if let Ok(Ok(r)) = tokio::time::timeout(FORWARD_TIMEOUT, ask(query, end, *server, protect)).await {
+            return Some(r);
         }
     }
     None
@@ -235,6 +243,7 @@ pub async fn serve(addr: IpAddr, zone: Arc<ArcSwap<Zone>>, domain: String, upstr
         }
     };
     log::info!("DNS | names of members under .{domain} on {addr}:53");
+    let clients: Arc<parking_lot::Mutex<HashMap<IpAddr, usize>>> = Default::default();
     let mut buf = [0u8; 512];
     loop {
         let Ok((n, from)) = sock.recv_from(&mut buf).await else {
@@ -244,7 +253,31 @@ pub async fn serve(addr: IpAddr, zone: Arc<ArcSwap<Zone>>, domain: String, upstr
         };
         let up = upstream.load();
         if !up.is_empty() && n >= 12 && !in_zone(&buf[..n], &domain) {
-            tokio::spawn(forward(buf[..n].to_vec(), from, up.to_vec(), sock.clone()));
+            // before the task: a flood must not pile them up either
+            {
+                let mut c = clients.lock();
+                let n = c.entry(from.ip()).or_insert(0);
+                if *n >= MAX_CLIENT_FORWARDS || FORWARDS.available_permits() == 0 {
+                    if *n == 0 {
+                        c.remove(&from.ip());
+                    }
+                    continue;
+                }
+                *n += 1;
+            }
+            let (query, up, sock, clients) = (buf[..n].to_vec(), up.to_vec(), sock.clone(), clients.clone());
+            tokio::spawn(async move {
+                if let Some(r) = forward_once(&query, &up, None).await {
+                    let _ = sock.send_to(&r, from).await;
+                }
+                let mut c = clients.lock();
+                if let Some(n) = c.get_mut(&from.ip()) {
+                    *n -= 1;
+                    if *n == 0 {
+                        c.remove(&from.ip());
+                    }
+                }
+            });
             continue;
         }
         if let Some(reply) = answer(&buf[..n], &zone.load(), &domain) {
@@ -440,5 +473,133 @@ mod tests {
     fn labels() {
         assert_eq!(label("PC rinacs228 (Windows)"), "pc-rinacs228--windows");
         assert_eq!(label("msk-mihprog-firstvds"), "msk-mihprog-firstvds");
+    }
+
+    #[cfg(target_os = "linux")]
+    mod upstream {
+        use super::*;
+
+        /// What reaches the node before the real answer.
+        #[derive(Clone, Copy, Debug)]
+        enum Forgery {
+            None,
+            OtherSender,
+            OtherQuestion,
+            OtherId,
+        }
+
+        fn reply(q: &[u8], last: u8) -> Vec<u8> {
+            let name = question(q).unwrap().0;
+            let zone = HashMap::from([(name.clone(), vec![IpAddr::from([192, 0, 2, last])])]);
+            answer(q, &zone, &name).unwrap()
+        }
+
+        /// A DNS server on 127.0.0.2:53 that answers 192.0.2.1 after the forgery (192.0.2.66).
+        async fn serve_forged(f: Forgery) -> tokio::task::JoinHandle<()> {
+            let sock = UdpSocket::bind("127.0.0.2:53").await.unwrap();
+            let other = UdpSocket::bind("127.0.0.3:53").await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+                let q = &buf[..n];
+                match f {
+                    Forgery::None => {}
+                    Forgery::OtherSender => drop(other.send_to(&reply(q, 66), from).await),
+                    Forgery::OtherQuestion => {
+                        let mut other_q = query("evil.example", TYPE_A);
+                        other_q[..2].copy_from_slice(&q[..2]);
+                        drop(sock.send_to(&reply(&other_q, 66), from).await)
+                    }
+                    Forgery::OtherId => {
+                        let mut r = reply(q, 66);
+                        r[0] ^= 0xff;
+                        drop(sock.send_to(&r, from).await)
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = sock.send_to(&reply(q, 1), from).await;
+            })
+        }
+
+        const FORGERIES: [Forgery; 4] = [Forgery::None, Forgery::OtherSender, Forgery::OtherQuestion, Forgery::OtherId];
+
+        fn check(bad: &mut Vec<String>, f: Forgery, got: Option<Vec<u8>>) {
+            let q = query("example.com", TYPE_A);
+            if got.as_deref() != Some(&reply(&q, 1)) {
+                let ip = got.map(|r| r[r.len() - 4..].to_vec());
+                bad.push(format!("{f:?}: got {ip:?}"));
+            }
+        }
+
+        #[tokio::test]
+        async fn forward_once_takes_only_the_servers_answer() {
+            let name = "dns::tests::upstream::forward_once_takes_only_the_servers_answer";
+            if !crate::testutil::in_netns(name, None) {
+                return;
+            }
+            let mut bad = Vec::new();
+            for f in FORGERIES {
+                let server = serve_forged(f).await;
+                let up = ["127.0.0.2".parse().unwrap()];
+                let got = forward_once(&query("example.com", TYPE_A), &up, None).await;
+                server.await.unwrap();
+                check(&mut bad, f, got);
+            }
+            assert!(bad.is_empty(), "{bad:#?}");
+        }
+
+        fn start() -> tokio::task::JoinHandle<()> {
+            let up = Arc::new(ArcSwap::from_pointee(vec!["127.0.0.2".parse().unwrap()]));
+            let zone = Arc::new(ArcSwap::from_pointee(zone()));
+            tokio::spawn(serve("127.0.0.1".parse().unwrap(), zone, "dvpn".into(), up))
+        }
+
+        #[tokio::test]
+        async fn serve_takes_only_the_servers_answer() {
+            if !crate::testutil::in_netns("dns::tests::upstream::serve_takes_only_the_servers_answer", None) {
+                return;
+            }
+            start();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut bad = Vec::new();
+            for f in FORGERIES {
+                let server = serve_forged(f).await;
+                let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                c.send_to(&query("example.com", TYPE_A), "127.0.0.1:53").await.unwrap();
+                let mut buf = vec![0u8; 512];
+                let n = tokio::time::timeout(Duration::from_secs(3), c.recv(&mut buf)).await;
+                server.await.unwrap();
+                check(&mut bad, f, n.ok().map(|n| buf[..n.unwrap()].to_vec()));
+            }
+            assert!(bad.is_empty(), "{bad:#?}");
+        }
+
+        /// Clients asking faster than a (silent) server answers do not use up the node's sockets,
+        /// and names of members are still answered.
+        #[tokio::test]
+        async fn forwarded_queries_are_limited() {
+            if !crate::testutil::in_netns("dns::tests::upstream::forwarded_queries_are_limited", None) {
+                return;
+            }
+            let _silent = UdpSocket::bind("127.0.0.2:53").await.unwrap();
+            start();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let fds = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+            let before = fds();
+            let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            for i in 0..800 {
+                c.send_to(&query(&format!("n{i}.example.com"), TYPE_A), "127.0.0.1:53").await.unwrap();
+                if i % 20 == 0 {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let used = fds() - before;
+            c.send_to(&query("phone.dvpn", TYPE_A), "127.0.0.1:53").await.unwrap();
+            let mut buf = [0u8; 512];
+            let own = tokio::time::timeout(Duration::from_secs(1), c.recv(&mut buf)).await;
+            assert!(own.is_ok(), "no answer for a member's name");
+            assert!(used <= 300, "{used} sockets for 800 queries");
+        }
     }
 }

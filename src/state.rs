@@ -36,6 +36,8 @@ pub const MAX_CLOCK_SKEW_MS: u64 = 10 * 60 * 1000;
 pub const MAX_RECORD_LEN: usize = 1024;
 /// Per group, so a member cannot fill a tracker's memory.
 pub const MAX_GROUP_RECORDS: usize = 4096;
+/// Room kept on top for revocations and psk epochs: a full group can still be defended.
+const SECURITY_RESERVE: usize = 4096;
 const RECORD_CTX: &[u8] = b"dvpn/4 record\0";
 /// Datagram budget for the records of one sync message.
 const RECORDS_BUDGET: usize = 1100;
@@ -70,6 +72,14 @@ pub enum Body {
 }
 
 impl Body {
+    /// How many records a group may have for this one to be added.
+    fn limit(&self) -> usize {
+        match self {
+            Body::Revoke { .. } | Body::Epoch { .. } | Body::EpochKey { .. } => MAX_GROUP_RECORDS + SECURITY_RESERVE,
+            _ => MAX_GROUP_RECORDS,
+        }
+    }
+
     fn id(&self) -> String {
         match self {
             Body::Revoke { key } => format!("revoke/{key}"),
@@ -217,11 +227,17 @@ pub struct Membership {
     pub revoked: HashSet<NodeId>,
     /// Nodes with a certificate issued by an admin (record `cert/<node>`).
     pub issued: HashSet<NodeId>,
+    /// Join key -> the node seen using it while its invite could be used (`Admitted`).
+    pub admitted: HashMap<NodeId, NodeId>,
 }
 
 impl Membership {
     pub fn of(store: &StateStore, group: &GroupId) -> Self {
-        Membership { revoked: store.revoked(group), issued: store.certs(group).iter().map(|c| c.body.node).collect() }
+        Membership {
+            revoked: store.revoked(group),
+            issued: store.certs(group).iter().map(|c| c.body.node).collect(),
+            admitted: store.admitted.lock().of(group),
+        }
     }
 
     /// Whether a (verified) certificate still admits its node. When an admin turns an invite
@@ -235,6 +251,92 @@ impl Membership {
             return false;
         }
         !invite_revoked(&self.revoked, cert) || self.issued.contains(&node)
+    }
+
+    /// Whether the invite this certificate comes from ran out before its node was seen: the
+    /// certificate itself lasts longer, until an admin replaces it. `now` is `None` while the
+    /// clock is wrong.
+    pub fn too_late(&self, cert: &Cert, now: Option<u64>) -> bool {
+        let Some(g) = cert.join_grant() else { return false };
+        now.is_some_and(|t| t > g.until)
+            && !self.issued.contains(&cert.body.node)
+            && self.admitted.get(&g.key) != Some(&cert.body.node)
+    }
+}
+
+/// The nodes seen using an invite while it was valid, by group and join key, until their invite
+/// certificate expires: they stay members after the invite runs out, others cannot use it any
+/// more. This node's (or tracker's) own knowledge, not a group record.
+#[derive(Default)]
+pub struct Admitted {
+    path: Option<PathBuf>,
+    groups: HashMap<GroupId, HashMap<NodeId, (NodeId, u64)>>,
+    changed: bool,
+}
+
+impl Admitted {
+    pub fn open(path: PathBuf) -> Self {
+        let list: Vec<(GroupId, NodeId, NodeId, u64)> =
+            std::fs::read(&path).ok().and_then(|b| postcard::from_bytes(&b).ok()).unwrap_or_default();
+        let mut groups: HashMap<GroupId, HashMap<NodeId, (NodeId, u64)>> = HashMap::new();
+        for (g, k, n, until) in list {
+            groups.entry(g).or_default().insert(k, (n, until));
+        }
+        Admitted { path: Some(path), groups, changed: false }
+    }
+
+    /// The node that used the invite of `cert` first (its own, unless another one is known), and
+    /// whether that is new. `None`: not an invite certificate, or the group has no more room.
+    pub fn insert(&mut self, cert: &Cert) -> Option<(NodeId, bool)> {
+        let key = cert.join_key()?;
+        let seen = self.groups.entry(cert.body.group).or_default();
+        if let Some((n, _)) = seen.get(&key) {
+            return Some((*n, false));
+        }
+        if seen.len() >= MAX_GROUP_RECORDS {
+            return None;
+        }
+        seen.insert(key, (cert.body.node, cert.body.not_after));
+        self.changed = true;
+        Some((cert.body.node, true))
+    }
+
+    /// Join key -> node of one group.
+    pub fn of(&self, group: &GroupId) -> HashMap<NodeId, NodeId> {
+        self.groups.get(group).into_iter().flatten().map(|(k, (n, _))| (*k, *n)).collect()
+    }
+
+    pub fn get(&self, group: &GroupId, join_key: &NodeId) -> Option<NodeId> {
+        self.groups.get(group)?.get(join_key).map(|(n, _)| *n)
+    }
+
+    pub fn groups(&self) -> impl Iterator<Item = &GroupId> {
+        self.groups.keys()
+    }
+
+    pub fn remove_group(&mut self, group: &GroupId) {
+        self.changed |= self.groups.remove(group).is_some();
+    }
+
+    /// Writes the file if something changed; forgets expired certificates.
+    pub fn save(&mut self) {
+        if !std::mem::take(&mut self.changed) {
+            return;
+        }
+        if let Some(now) = crate::clock::trusted_unix() {
+            self.groups.retain(|_, seen| {
+                seen.retain(|_, (_, until)| *until >= now);
+                !seen.is_empty()
+            });
+        }
+        let Some(path) = &self.path else { return };
+        let list: Vec<_> =
+            self.groups.iter().flat_map(|(g, s)| s.iter().map(move |(k, (n, until))| (g, k, n, until))).collect();
+        let tmp = path.with_extension("tmp2");
+        let data = postcard::to_stdvec(&list).expect("list serializes");
+        if let Err(e) = std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, path)) {
+            log::warn!("State | write {} error: {e}", path.display());
+        }
     }
 }
 
@@ -261,7 +363,7 @@ impl Inner {
         let key = record_key(&e.group, &e.id);
         match records.get(&key) {
             Some(old) if (old.entry.ts, &old.record.payload) >= (e.ts, &record.payload) => return Ok(None),
-            None if records.len() >= MAX_GROUP_RECORDS => return Err(RecordError::Full),
+            None if records.len() >= e.body.limit() => return Err(RecordError::Full),
             _ => {}
         }
         records.insert(key, Stored { entry: e.clone(), record });
@@ -276,6 +378,7 @@ impl Inner {
 /// The records of all groups a node (or tracker) knows.
 pub struct StateStore {
     path: Option<PathBuf>,
+    admitted: Mutex<Admitted>,
     inner: Mutex<Inner>,
 }
 
@@ -296,12 +399,13 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 impl StateStore {
     /// In memory only (trackers, tests).
     pub fn memory() -> Self {
-        StateStore { path: None, inner: Mutex::new(Inner::default()) }
+        StateStore { path: None, admitted: Mutex::default(), inner: Mutex::new(Inner::default()) }
     }
 
     /// Backed by `path` (a missing file is an empty state). Records are re-verified on load.
     pub fn open(path: PathBuf) -> Self {
-        let s = StateStore { path: Some(path), inner: Mutex::new(Inner::default()) };
+        let admitted = Mutex::new(Admitted::open(path.with_extension("admitted")));
+        let s = StateStore { path: Some(path), admitted, inner: Mutex::new(Inner::default()) };
         s.reload();
         s
     }
@@ -347,21 +451,67 @@ impl StateStore {
         }
     }
 
+    /// Remembers that the node of invite certificate `cert` came in time, or that a tracker, which
+    /// lets nobody else in, says so. Whether that is new.
+    pub fn admit(&self, cert: &Cert) -> bool {
+        if !crate::clock::trusted() {
+            return false;
+        }
+        let mut a = self.admitted.lock();
+        let new = matches!(a.insert(cert), Some((_, true)));
+        a.save();
+        new
+    }
+
     /// Forgets a group's records (a tracker, when nobody of the group has been around for long).
     pub fn remove_group(&self, group: &GroupId) {
         self.inner.lock().groups.remove(group);
     }
 
-    /// Signs and stores a new record with a timestamp after any earlier one of the same id.
-    pub fn add(&self, secret: &GroupSecret, body: Body, deleted: bool) -> Entry {
+    /// Signs and stores a new record with a timestamp after any earlier one of the same id. The
+    /// error is for the caller to show: the record is too large, or the group is full.
+    pub fn add(&self, secret: &GroupSecret, body: Body, deleted: bool) -> Result<Entry, RecordError> {
+        Ok(self.add_all(secret, [(body, deleted)])?.pop().expect("one record"))
+    }
+
+    /// Like `add` for several records: all of them, or none and an error.
+    pub fn add_all(
+        &self,
+        secret: &GroupSecret,
+        bodies: impl IntoIterator<Item = (Body, bool)>,
+    ) -> Result<Vec<Entry>, RecordError> {
         let group = secret.id();
-        let id = body.id();
-        let key = record_key(&group, &id);
         let mut inner = self.inner.lock();
-        let prev = inner.groups.get(&group).and_then(|r| r.get(&key)).map_or(0, |s| s.entry.ts);
-        let entry = Entry { group, id, ts: now_ms().max(prev + 1), deleted, body };
-        inner.insert(Record::sign(secret, &entry), now_ms()).expect("own record is valid");
-        entry
+        let records = inner.groups.entry(group).or_default();
+        let mut new: Vec<(RecordKey, Stored)> = Vec::new();
+        let mut added = HashSet::new();
+        for (body, deleted) in bodies {
+            let id = body.id();
+            let key = record_key(&group, &id);
+            let prev = records.get(&key);
+            if prev.is_none() && added.insert(key) && records.len() + added.len() > body.limit() {
+                return Err(RecordError::Full);
+            }
+            let entry = Entry { group, id, ts: now_ms().max(prev.map_or(0, |s| s.entry.ts) + 1), deleted, body };
+            let record = Record::sign(secret, &entry);
+            record.open()?;
+            new.push((key, Stored { entry, record }));
+        }
+        let out = new.iter().map(|(_, s)| s.entry.clone()).collect();
+        records.extend(new);
+        Ok(out)
+    }
+
+    /// Fills the group to `MAX_GROUP_RECORDS` with copies of one record (under keys of their own).
+    #[cfg(test)]
+    pub(crate) fn fill(&self, secret: &GroupSecret) {
+        let e = self.add(secret, Body::Revoke { key: Identity::generate().id() }, false).unwrap();
+        let record = Record::sign(secret, &e);
+        let mut inner = self.inner.lock();
+        let records = inner.groups.get_mut(&e.group).expect("just added");
+        while records.len() < MAX_GROUP_RECORDS {
+            records.insert(rand::random(), Stored { entry: e.clone(), record: record.clone() });
+        }
     }
 
     pub fn revoked(&self, group: &GroupId) -> HashSet<NodeId> {
@@ -446,17 +596,17 @@ impl StateStore {
 
     /// Starts psk epoch `after + 1` (or the next after any announced one) at `now + lead_ms`:
     /// the epoch record and the new psk sealed to every member with an issued certificate that is
-    /// not revoked. Returns the new records.
-    pub fn rotate(&self, secret: &GroupSecret, after: u32, lead_ms: u64) -> Vec<Entry> {
+    /// not revoked. Returns the new records; on an error there are none.
+    pub fn rotate(&self, secret: &GroupSecret, after: u32, lead_ms: u64) -> Result<Vec<Entry>, RecordError> {
         let g = secret.id();
         let epoch = self.epoch(&g).map_or(after, |(e, _)| e.max(after)) + 1;
         let psk = secret.psk(epoch);
         let m = Membership::of(self, &g);
-        let mut out = vec![self.add(secret, Body::Epoch { epoch, active_from: now_ms() + lead_ms }, false)];
+        let mut bodies = vec![(Body::Epoch { epoch, active_from: now_ms() + lead_ms }, false)];
         for c in self.certs(&g).iter().filter(|c| m.admits(c)) {
-            out.push(self.add(secret, seal_psk(&g, &c.body.node, epoch, &psk), false));
+            bodies.push((seal_psk(&g, &c.body.node, epoch, &psk), false));
         }
-        out
+        self.add_all(secret, bodies)
     }
 
     pub fn summary(&self, group: &GroupId) -> Vec<(RecordKey, u64)> {
@@ -590,11 +740,11 @@ mod tests {
         let g = GroupSecret::generate();
         let s = StateStore::memory();
         let victim = Identity::generate().id();
-        let e = s.add(&g, Body::Revoke { key: victim }, false);
+        let e = s.add(&g, Body::Revoke { key: victim }, false).unwrap();
         assert!(s.revoked(&g.id()).contains(&victim));
         // a newer tombstone wins, an older record does not come back
         let old = s.get(&g.id(), &[record_key(&g.id(), &e.id)]);
-        s.add(&g, Body::Revoke { key: victim }, true);
+        s.add(&g, Body::Revoke { key: victim }, true).unwrap();
         assert!(s.revoked(&g.id()).is_empty());
         assert!(s.insert(old).is_empty());
         assert!(s.revoked(&g.id()).is_empty());
@@ -643,9 +793,9 @@ mod tests {
         let g = GroupSecret::generate();
         let (a, b) = (StateStore::memory(), StateStore::memory());
         let (x, y, z) = (Identity::generate().id(), Identity::generate().id(), Identity::generate().id());
-        a.add(&g, Body::Revoke { key: x }, false);
-        a.add(&g, Body::Cert(Box::new(g.issue(CertBody::new(z, "z", vec![])))), false);
-        b.add(&g, Body::Revoke { key: y }, false);
+        a.add(&g, Body::Revoke { key: x }, false).unwrap();
+        a.add(&g, Body::Cert(Box::new(g.issue(CertBody::new(z, "z", vec![])))), false).unwrap();
+        b.add(&g, Body::Revoke { key: y }, false).unwrap();
         sync(&a, &b, &g.id());
         assert_eq!(a.revoked(&g.id()), HashSet::from([x, y]));
         assert_eq!(b.revoked(&g.id()), HashSet::from([x, y]));
@@ -659,7 +809,7 @@ mod tests {
     fn sync_respects_allowed_groups() {
         let (g, h) = (GroupSecret::generate(), GroupSecret::generate());
         let (a, b) = (StateStore::memory(), StateStore::memory());
-        a.add(&h, Body::Revoke { key: Identity::generate().id() }, false);
+        a.add(&h, Body::Revoke { key: Identity::generate().id() }, false).unwrap();
         let records = a.get(&h.id(), &a.summary(&h.id()).iter().map(|(k, _)| *k).collect::<Vec<_>>());
         let (_, changed) = SyncMsg::Records { records }.handle(&b, |grp| *grp == g.id());
         assert!(changed.is_empty() && b.summary(&h.id()).is_empty());
@@ -676,11 +826,11 @@ mod tests {
         let g = GroupSecret::generate();
         let (x, y) = (Identity::generate().id(), Identity::generate().id());
         let daemon = StateStore::open(path.clone());
-        daemon.add(&g, Body::Revoke { key: x }, false);
+        daemon.add(&g, Body::Revoke { key: x }, false).unwrap();
         daemon.save();
         // the CLI adds a record while the daemon runs
         let cli = StateStore::open(path.clone());
-        cli.add(&g, Body::Revoke { key: y }, false);
+        cli.add(&g, Body::Revoke { key: y }, false).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtime
         cli.save();
         let changed = daemon.reload();
@@ -715,12 +865,12 @@ mod tests {
         let (ca, cb) = (join.enroll(a), join.enroll(b));
         assert!(Membership::of(&s, &g.id()).admits(&ca));
         // the admin converts a: regular cert for a, join key revoked
-        s.add(&g, Body::Cert(Box::new(g.issue(ca.body.clone()))), false);
-        s.add(&g, Body::Revoke { key: join.grant.key }, false);
+        s.add(&g, Body::Cert(Box::new(g.issue(ca.body.clone()))), false).unwrap();
+        s.add(&g, Body::Revoke { key: join.grant.key }, false).unwrap();
         let m = Membership::of(&s, &g.id());
         assert!(m.admits(&ca), "a still shows its invite cert until it picks up the new one");
         assert!(!m.admits(&cb), "the invite cannot be used by a second node");
-        s.add(&g, Body::Revoke { key: a }, false);
+        s.add(&g, Body::Revoke { key: a }, false).unwrap();
         let m = Membership::of(&s, &g.id());
         assert!(!m.admits(&ca) && !m.admits(&g.issue(ca.body.clone())));
     }
@@ -731,10 +881,10 @@ mod tests {
         let s = StateStore::memory();
         let (a, b, x) = (Identity::generate(), Identity::generate(), Identity::generate());
         for i in [&a, &b, &x] {
-            s.add(&g, Body::Cert(Box::new(g.issue(CertBody::new(i.id(), "n", vec![])))), false);
+            s.add(&g, Body::Cert(Box::new(g.issue(CertBody::new(i.id(), "n", vec![])))), false).unwrap();
         }
-        s.add(&g, Body::Revoke { key: x.id() }, false);
-        let changed = s.rotate(&g, 0, 60_000);
+        s.add(&g, Body::Revoke { key: x.id() }, false).unwrap();
+        let changed = s.rotate(&g, 0, 60_000).unwrap();
         assert_eq!(changed.len(), 3, "epoch + a + b, not the revoked x");
         let (epoch, at) = s.epoch(&g.id()).unwrap();
         assert_eq!(epoch, 1);
@@ -752,7 +902,7 @@ mod tests {
         };
         assert_eq!(open_psk(&g.id(), &b, 1, &eph, &sealed), None);
         assert!(
-            s.rotate(&g, 0, 0).len() == 3 && s.epoch(&g.id()).unwrap().0 == 2,
+            s.rotate(&g, 0, 0).unwrap().len() == 3 && s.epoch(&g.id()).unwrap().0 == 2,
             "next rotation goes on from the announced epoch"
         );
     }
@@ -806,7 +956,8 @@ mod tests {
                 &g,
                 Body::Cert(Box::new(g.issue(CertBody::new(Identity::generate().id(), &format!("node{i}"), vec![])))),
                 false,
-            );
+            )
+            .unwrap();
         }
         let all = s.get(&g.id(), &s.summary(&g.id()).iter().map(|(k, _)| *k).collect::<Vec<_>>());
         let msgs = SyncMsg::records(all);

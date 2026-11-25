@@ -27,6 +27,8 @@ pub const LSA_MIN_INTERVAL: Duration = Duration::from_secs(2);
 pub const LSA_MIN_SEND: Duration = Duration::from_secs(4);
 /// At most this many neighbours per LSA (the cheapest), so it fits a datagram.
 pub const MAX_LSA_NEIGHBORS: usize = 28;
+/// Origins in the database: as many as a group may have members.
+pub const MAX_LSAS: usize = crate::state::MAX_GROUP_RECORDS;
 const LSA_CTX: &[u8] = b"dvpn/4 lsa\0";
 /// Hysteresis (PLAN §6.2): a new first hop must be at least this much better.
 const SWITCH_RATIO: f64 = 0.9;
@@ -89,6 +91,10 @@ pub enum Insert {
     Invalid,
     /// Newer, but its origin sent one less than `LSA_MIN_INTERVAL` ago.
     TooSoon,
+    /// Its origin is not a member we know, nor a neighbour of one.
+    Stranger,
+    /// No room for another origin.
+    Full,
 }
 
 impl Lsdb {
@@ -96,10 +102,25 @@ impl Lsdb {
         Lsdb { group, entries: HashMap::new(), min_interval: LSA_MIN_INTERVAL }
     }
 
-    /// Stores a verified LSA if it is newer and not too soon after the last one of its origin;
-    /// `revoked` origins are refused.
+    /// `insert_opened` of an LSA from anybody (tests, and our own).
     pub fn insert_checked(&mut self, lsa: Lsa, revoked: &HashSet<NodeId>) -> Insert {
         let Some(b) = lsa.open() else { return Insert::Invalid };
+        let known = HashSet::from([b.origin]);
+        self.insert_opened(lsa, b, revoked, &known)
+    }
+
+    /// Stores a verified LSA (`b`: what is in it) if it is newer and not too soon after the last
+    /// one of its origin; `revoked` origins are refused. The origin must be `known` (its
+    /// certificate is), or named as a neighbour by one that is: a member behind a relay is first
+    /// seen that way, and its certificate comes over the route. So strangers get in only as fake
+    /// neighbours of a member, `MAX_LSA_NEIGHBORS` at most.
+    pub fn insert_opened(
+        &mut self,
+        lsa: Lsa,
+        b: LsaBody,
+        revoked: &HashSet<NodeId>,
+        known: &HashSet<NodeId>,
+    ) -> Insert {
         if b.group != self.group || revoked.contains(&b.origin) {
             return Insert::Invalid;
         }
@@ -111,6 +132,13 @@ impl Lsdb {
             if received.elapsed() < self.min_interval {
                 return Insert::TooSoon;
             }
+        }
+        let named = || self.bodies().any(|x| known.contains(&x.origin) && x.neighbors.iter().any(|n| n.0 == b.origin));
+        if !known.contains(&b.origin) && !named() {
+            return Insert::Stranger;
+        }
+        if self.entries.len() >= MAX_LSAS && !self.entries.contains_key(&b.origin) {
+            return Insert::Full;
         }
         self.entries.insert(b.origin, (b, lsa, Instant::now() + LSA_TTL));
         Insert::New
@@ -545,5 +573,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn database_is_bounded() {
+        let mut db = Lsdb::new(group());
+        let limit = crate::state::MAX_GROUP_RECORDS;
+        for i in 0..limit as u32 + 100 {
+            let mut seed = [7u8; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            let n = Identity::from_seed(&seed);
+            let body = LsaBody { origin: n.id(), group: group(), seq: 1, neighbors: vec![] };
+            db.insert_checked(Lsa::sign(&n, &body), &HashSet::new());
+        }
+        assert!(db.bodies().count() <= limit, "{} LSAs, more than a group has records", db.bodies().count());
     }
 }

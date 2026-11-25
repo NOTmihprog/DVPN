@@ -309,8 +309,13 @@ impl Links {
 
     /// New handshakes are checked against this; existing sessions of revoked nodes are dropped
     /// by the caller (`drop_peer`).
-    pub fn set_membership(&self, m: Membership) {
-        *self.membership.write() = m;
+    pub fn set_membership(&self, mut m: Membership) {
+        let mut old = self.membership.write();
+        // seen here, perhaps not yet by the node
+        for (k, n) in old.admitted.drain() {
+            m.admitted.entry(k).or_insert(n);
+        }
+        *old = m;
     }
 
     /// Pads and masks a finished handshake packet in `out` (header with a zero pad field).
@@ -342,10 +347,25 @@ impl Links {
             log::debug!("Link | handshake from {} with {e}", crate::logger::node(cert.body.node));
             return None;
         }
-        if !self.membership.read().admits(&cert) {
+        let now = crate::clock::trusted_unix();
+        let mut m = self.membership.upgradable_read();
+        if !m.admits(&cert) {
             log::debug!("Link | handshake from revoked {}", crate::logger::node(cert.body.node));
             return None;
         }
+        if m.too_late(&cert, now) {
+            log::info!("Link | {}: its invite has expired", crate::logger::node(cert.body.node));
+            return None;
+        }
+        // it came in time: it stays when the invite runs out (the node keeps this on disk)
+        if let (Some(g), Some(_)) = (cert.join_grant(), now)
+            && m.admitted.len() < crate::state::MAX_GROUP_RECORDS
+            && !m.admitted.contains_key(&g.key)
+        {
+            let (key, node) = (g.key, cert.body.node);
+            m.with_upgraded(|m| m.admitted.insert(key, node));
+        }
+        drop(m);
         (cert.body.node != self.identity.id()).then_some(cert)
     }
 
@@ -588,6 +608,53 @@ mod tests {
         let (a, b) = (side(&GroupSecret::generate()), side(&GroupSecret::generate()));
         assert!(!handshake(&a, &b), "other psk and group id: no reply");
         assert!(a.links.current(&b.id).is_none() && b.links.current(&a.id).is_none());
+    }
+
+    /// `a` with an invite certificate that can be used for the first time until `until`.
+    fn invited(secret: &GroupSecret, until: u64) -> Side {
+        let identity = Identity::generate();
+        let join = secret.grant_join(CertBody::new(Identity::generate().id(), "n", vec![]), until);
+        let cert = join.enroll(identity.id());
+        side_with(identity, Group { id: secret.id(), psk: secret.psk(0), obfs: Profile::default(), cert })
+    }
+
+    #[test]
+    fn expired_invite_no_session() {
+        let secret = GroupSecret::generate();
+        let now = crate::clock::now_unix();
+        assert!(!handshake(&invited(&secret, now - 3600), &side(&secret)));
+    }
+
+    /// The other half: a member that came in time keeps its invite certificate until an admin
+    /// replaces it, also after the invite ran out.
+    #[test]
+    fn member_admitted_in_time_stays_after_the_invite_expires() {
+        let secret = GroupSecret::generate();
+        let (a, b) = (invited(&secret, crate::clock::now_unix() + 2), side(&secret));
+        assert!(handshake(&a, &b));
+        std::thread::sleep(Duration::from_millis(3100));
+        assert!(handshake(&a, &b));
+    }
+
+    /// A delegate's certificate with a name too long for a group record gets through a handshake
+    /// (see `node::tests::delegate_cannot_kill_an_admin_with_a_long_name`), in one datagram.
+    #[test]
+    fn certificate_too_large_for_a_record_no_session() {
+        let secret = GroupSecret::generate();
+        let identity = Identity::generate();
+        let until = crate::clock::now_unix() + 3600;
+        let d = secret.delegate(vec!["10.10.40.0/24".parse().unwrap()], until);
+        let t = CertBody::new(Identity::generate().id(), &"x".repeat(800), vec![]);
+        let cert = d.grant_join(t, until).enroll(identity.id());
+        let id = format!("cert/{}", identity.id());
+        let regular = Box::new(secret.issue(cert.body.clone()));
+        let body = crate::state::Body::Cert(regular);
+        let e = crate::state::Entry { group: secret.id(), id, ts: crate::clock::now_ms(), deleted: false, body };
+        assert_eq!(crate::state::Record::sign(&secret, &e).open(), Err(crate::state::RecordError::TooLarge));
+        let a = side_with(identity, Group { id: secret.id(), psk: secret.psk(0), obfs: Profile::default(), cert });
+        let b = side(&secret);
+        let len = a.links.initiate(b.id, Duration::ZERO).unwrap().pop().unwrap().len();
+        assert!(!handshake(&a, &b), "accepted, HS_INIT is {len} bytes");
     }
 
     #[test]

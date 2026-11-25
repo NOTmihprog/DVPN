@@ -257,36 +257,46 @@ impl Acl {
 
 const TABLE: &str = "dvpn_acl";
 
-/// Installs (or with `None` removes) the ACL chain for traffic from `tun`.
-pub fn apply_nft(tun: &str, chain: Option<&str>) {
+/// Installs (or with `None` removes) the ACL chain for traffic from `tun`: in one nftables
+/// transaction, so packets never see a moment without rules, and what nft refuses changes
+/// nothing. Whether it worked.
+pub fn apply_nft(tun: &str, chain: Option<&str>) -> bool {
     if !cfg!(target_os = "linux") {
         // elsewhere the node enforces the rules itself (aclfilter.rs)
-        return;
+        return true;
     }
-    let _ = Command::new("nft").args(["delete", "table", "inet", TABLE]).stderr(Stdio::null()).status();
-    let Some(body) = chain else { return };
-    let script = format!(
-        "table inet {TABLE} {{
+    // declared first, so that there is a table to delete
+    let mut script = format!("table inet {TABLE}\ndelete table inet {TABLE}\n");
+    if let Some(body) = chain {
+        let _ = write!(
+            script,
+            "table inet {TABLE} {{
     chain acl {{
 {body}    }}
     chain input {{ type filter hook input priority 0; iifname \"{tun}\" jump acl; }}
     chain forward {{ type filter hook forward priority 0; iifname \"{tun}\" jump acl; }}
-}}"
-    );
+}}
+"
+        );
+    }
     let child = Command::new("nft").args(["-f", "-"]).stdin(Stdio::piped()).stderr(Stdio::piped()).spawn();
     let Ok(mut child) = child else {
         log::warn!("ACL | cannot run nft");
-        return;
+        return false;
     };
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         let _ = stdin.write_all(script.as_bytes());
     }
     match child.wait_with_output() {
-        Ok(o) if o.status.success() => log::info!("ACL | rules applied"),
+        Ok(o) if o.status.success() => {
+            log::info!("ACL | {}", if chain.is_some() { "rules applied" } else { "rules removed" });
+            return true;
+        }
         Ok(o) => log::warn!("ACL | nft: {}", String::from_utf8_lossy(&o.stderr).trim()),
         Err(e) => log::warn!("ACL | nft: {e}"),
     }
+    false
 }
 
 #[cfg(test)]
@@ -360,5 +370,26 @@ action = "allow"
             let err = format!("{:#}", Acl::parse(bad, &member).unwrap_err());
             assert!(err.contains(why), "{bad}: {err}");
         }
+    }
+
+    /// Rules that nft refuses must leave the old ones in place, not none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refused_rules_leave_the_old_ones() {
+        if !crate::testutil::in_netns("acl::tests::refused_rules_leave_the_old_ones", None) {
+            return;
+        }
+        let table = || {
+            let o = Command::new("nft").args(["list", "table", "inet", TABLE]).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        assert!(apply_nft("dvpn0", Some("tcp dport 22 drop\n")));
+        assert!(table().contains("tcp dport 22 drop"), "{}", table());
+        assert!(apply_nft("dvpn0", Some("tcp dport 23 drop\n")));
+        assert!(table().contains("dport 23") && !table().contains("dport 22"), "replaced: {}", table());
+        assert!(!apply_nft("dvpn0", Some("no such statement\n")));
+        assert!(table().contains("tcp dport 23 drop"), "the rules are gone");
+        assert!(apply_nft("dvpn0", None) && apply_nft("dvpn0", None), "also when there is none");
+        assert_eq!(table(), "");
     }
 }

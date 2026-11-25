@@ -155,11 +155,12 @@ impl Shared {
     }
 
     fn init_msg(&self) -> Vec<u8> {
-        encode(&map(vec![
-            ("type", "init".into()),
-            ("name", self.name.as_str().into()),
-            ("version", API_VERSION.into()),
-        ]))
+        let mut m = vec![("type", "init".into()), ("name", self.name.as_str().into()), ("version", API_VERSION.into())];
+        // a UDP node with `[api] token = "all"` lets nobody in without it
+        if let Some(t) = &*self.token.read().unwrap() {
+            m.push(("token", t.as_str().into()));
+        }
+        encode(&map(m))
     }
 }
 
@@ -184,16 +185,28 @@ impl Client {
         // a unix socket: an abstract address first (Linux; see transport.rs), which a node
         // older than 4.2.1 leaves unanswered: then a file
         if cfg!(any(target_os = "linux", target_os = "android")) && matches!(addr, ApiAddr::Unix(_)) {
-            match Self::connect_on(&addr, name, true, Duration::from_millis(1500)).await {
+            match Self::connect_on(&addr, name, None, true, Duration::from_millis(1500)).await {
                 Err(Error::Timeout) => {}
                 r => return r,
             }
         }
-        Self::connect_on(&addr, name, false, DEFAULT_TIMEOUT).await
+        Self::connect_on(&addr, name, None, false, DEFAULT_TIMEOUT).await
     }
 
-    async fn connect_on(addr: &ApiAddr, name: &str, abstract_addr: bool, wait: Duration) -> Result<Client, Error> {
-        let token = addr.find_token();
+    /// Like [`Client::connect`], with this token for a UDP API: where `[api] token = "all"` is set
+    /// and the token is not in its usual place, [`Client::with_token`] would come too late.
+    pub async fn connect_with_token(addr: ApiAddr, name: &str, token: &str) -> Result<Client, Error> {
+        Self::connect_on(&addr, name, Some(token), false, DEFAULT_TIMEOUT).await
+    }
+
+    async fn connect_on(
+        addr: &ApiAddr,
+        name: &str,
+        given: Option<&str>,
+        abstract_addr: bool,
+        wait: Duration,
+    ) -> Result<Client, Error> {
+        let token = given.map(str::to_owned).or_else(|| addr.find_token());
         let sock = Socket::open(addr, abstract_addr).await?;
         let (events, _) = broadcast::channel(256);
         let (typed, _) = broadcast::channel(256);
@@ -207,7 +220,7 @@ impl Client {
             own_id: AtomicU64::new(1 << 62),
             name: name.to_owned(),
             token: std::sync::RwLock::new(token),
-            token_fixed: AtomicBool::new(false),
+            token_fixed: AtomicBool::new(given.is_some()),
             restoring: AtomicU64::new(0),
             pending: Mutex::default(),
             init: Mutex::default(),
@@ -779,6 +792,12 @@ async fn recv_loop(shared: Arc<Shared>) {
             Some("error") => {
                 let code = field_str(&v, "err").unwrap_or_default();
                 let msg = field_str(&v, "msg").unwrap_or_default().to_owned();
+                if code == ErrorCode::NotPermitted.as_str()
+                    && let Some(tx) = shared.init.lock().await.take()
+                {
+                    let _ = tx.send(Err(Error::Api { code: ErrorCode::NotPermitted, msg }));
+                    continue;
+                }
                 if code == ErrorCode::VersionUnsupported.as_str() {
                     let num = |k| field(&v, k).and_then(Value::as_u64).unwrap_or_default();
                     if let Some(tx) = shared.init.lock().await.take() {

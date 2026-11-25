@@ -178,10 +178,81 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     f.write_all(text.as_bytes())
 }
 
-#[cfg(not(unix))]
+/// Windows: a new file that only SYSTEM, Administrators and its owner may open from the start
+/// (the same as `restrict_private`), in place of the old one when all of it is written.
+#[cfg(windows)]
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
-    std::fs::write(path, text)?;
-    restrict_private(path)
+    use std::io::Write;
+    let tag = crate::crypto::encode_b64(&crate::crypto::random_bytes::<9>());
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{tag}.tmp"));
+    let tmp = path.with_file_name(name);
+    let written = create_private(&tmp).and_then(|mut f| {
+        f.write_all(text.as_bytes())?;
+        f.sync_all()
+    });
+    let r = written.and_then(|()| std::fs::rename(&tmp, path));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// Creates `path` with a protected DACL (`CreateFileW` with a security descriptor).
+#[cfg(windows)]
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL};
+    let wide = |s: &std::ffi::OsStr| s.encode_wide().chain([0]).collect::<Vec<u16>>();
+    // SYSTEM, Administrators, OWNER RIGHTS; P: nothing inherited from the folder
+    let sddl = wide("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)".as_ref());
+    let path = wide(path.as_os_str());
+    let mut sd = std::ptr::null_mut();
+    // SAFETY: both strings end in NUL and outlive the calls; `sd` is freed once, after its use;
+    // the handle is checked and owned by the returned File alone
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        let h = CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            &attrs,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        let r = if h == INVALID_HANDLE_VALUE {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(std::fs::File::from_raw_handle(h))
+        };
+        LocalFree(sd);
+        r
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    std::fs::write(path, text)
 }
 
 /// Windows: the file for SYSTEM, Administrators and its owner only, not inherited from its
@@ -1696,5 +1767,37 @@ mod tests {
         let err = Config::load_with_env_key(&dir, None).err().unwrap().to_string();
         assert!(err.contains("[identity] private_key"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Nothing inherited, and only SYSTEM, Administrators and the owner, also in a folder that
+    /// lets everybody read.
+    #[cfg(windows)]
+    #[test]
+    fn private_file_is_private_from_the_start() {
+        let tag = crate::crypto::encode_b64(&crate::crypto::random_bytes::<9>());
+        let dir = std::env::temp_dir().join(format!("dvpn-config-test-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let icacls = |p: &Path, args: &[&str]| {
+            let o = std::process::Command::new("icacls").arg(p).args(args).output().unwrap();
+            assert!(o.status.success());
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        icacls(&dir, &["/grant", "*S-1-1-0:(OI)(CI)R"]);
+        let file = dir.join("config.toml");
+        // before anything is written
+        drop(create_private(&file).unwrap());
+        let check = || {
+            let acl = icacls(&file, &[]);
+            assert!(!acl.contains("(I)"), "inherited: {acl}");
+            assert_eq!(acl.matches("(F)").count(), 3, "{acl}");
+        };
+        check();
+        for text in ["one", "two"] {
+            write_private(&file, text).unwrap();
+            check();
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file left");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

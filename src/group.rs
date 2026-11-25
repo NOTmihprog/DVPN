@@ -33,6 +33,8 @@ pub type GroupId = NodeId;
 
 /// Default certificate lifetime; members renew well before it ends (PLAN §5.2).
 pub const CERT_TTL_SECS: u64 = 30 * 24 * 3600;
+/// Names of members are at most this long (characters); checked where they are given.
+pub const MAX_NAME_LEN: usize = 64;
 /// Default time to use an invite.
 pub const JOIN_TTL_SECS: u64 = 24 * 3600;
 
@@ -168,6 +170,12 @@ impl CertBody {
             not_after: now_unix() + CERT_TTL_SECS,
             serial: u64::from_le_bytes(random_bytes()),
         }
+    }
+
+    /// Whether a regular certificate with this body fits a group record (around it: the entry,
+    /// its id and the signature).
+    pub fn fits_record(&self) -> bool {
+        postcard::to_stdvec(self).expect("body serializes").len() + 200 <= crate::state::MAX_RECORD_LEN
     }
 
     /// The node's IPv4 address in the group: the first IPv4 host prefix (/32). Wider prefixes
@@ -362,6 +370,8 @@ pub enum CertError {
     DelegateRole,
     /// A delegate's cert for prefixes outside its scope.
     OutOfScope,
+    /// An invite's cert an admin could not put into a group record.
+    TooLarge,
     Expired,
 }
 
@@ -374,6 +384,7 @@ impl fmt::Display for CertError {
             CertError::DelegatedAdmin => "delegated certificate with the admin role",
             CertError::DelegateRole => "delegate's certificate with a role",
             CertError::OutOfScope => "delegate's certificate outside its scope",
+            CertError::TooLarge => "certificate too large",
             CertError::Expired => "certificate expired",
         })
     }
@@ -391,6 +402,9 @@ impl Cert {
         }
         if self.grant != Grant::None && b.roles.has(Roles::ADMIN) {
             return Err(CertError::DelegatedAdmin);
+        }
+        if self.grant != Grant::None && !b.fits_record() {
+            return Err(CertError::TooLarge);
         }
         let check_grant = |g: &JoinGrant, by: &NodeId| {
             let template = CertBody { node: g.key, ..b.clone() };
@@ -428,12 +442,17 @@ impl Cert {
         Ok(())
     }
 
-    /// The join key a delegated cert was enrolled with.
-    pub fn join_key(&self) -> Option<NodeId> {
+    /// The grant of the invite this cert comes from.
+    pub fn join_grant(&self) -> Option<&JoinGrant> {
         match &self.grant {
             Grant::None => None,
-            Grant::Join(g) | Grant::Delegated(g, _) => Some(g.key),
+            Grant::Join(g) | Grant::Delegated(g, _) => Some(g),
         }
+    }
+
+    /// The join key a delegated cert was enrolled with.
+    pub fn join_key(&self) -> Option<NodeId> {
+        self.join_grant().map(|g| g.key)
     }
 
     /// The key of the delegate that invited this node, while this is its invite cert.

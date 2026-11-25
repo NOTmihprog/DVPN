@@ -1178,8 +1178,9 @@ async fn run_server(conf: &mut Config, addr: std::net::IpAddr, port: u16) {
         conf.save();
     }
     log::info!("Public key: {}", encode_b64(&public));
+    let joins = conf.path().with_file_name("joins.bin");
     tokio::select! {
-        r = tracker_server::run(addr, port, Identity::from_seed(&key.to_bytes())) => {
+        r = tracker_server::run(addr, port, Identity::from_seed(&key.to_bytes()), Some(joins)) => {
             if let Err(e) = r {
                 die(format!("Socket bind error: {e}"));
             }
