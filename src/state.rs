@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use blake2::{Blake2s256, Digest};
 use ed25519_dalek::Signature;
@@ -354,6 +354,8 @@ struct Stored {
 struct Inner {
     groups: HashMap<GroupId, HashMap<RecordKey, Stored>>,
     file_mtime: Option<SystemTime>,
+    /// Records of other processes that `save` merged in, for the next `reload` to report.
+    merged: Vec<Entry>,
 }
 
 impl Inner {
@@ -401,6 +403,25 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// The modification time to remember for "nothing new in the file". Not while it is fresh: another
+/// write may come in the same tick of the file system's clock and look the same.
+fn settled(m: Option<SystemTime>) -> Option<SystemTime> {
+    m.filter(|t| t.elapsed().is_ok_and(|e| e >= Duration::from_secs(1)))
+}
+
+/// Held while the file is read, merged and replaced, by the daemon and by CLI commands: else one
+/// would replace what another has just written. Where files cannot be locked, goes on without.
+fn lock_file(path: &Path) -> Option<std::fs::File> {
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("lock"));
+    match f.and_then(|f| f.lock().map(|()| f)) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            log::debug!("State | cannot lock {}: {e}", path.display());
+            None
+        }
+    }
+}
+
 impl StateStore {
     /// In memory only (trackers, tests).
     pub fn memory() -> Self {
@@ -434,24 +455,31 @@ impl StateStore {
     pub fn reload(&self) -> Vec<Entry> {
         let Some(path) = &self.path else { return Vec::new() };
         let m = mtime(path);
-        if m.is_none() || m == self.inner.lock().file_mtime {
-            return Vec::new();
+        let (mut changed, seen) = {
+            let mut inner = self.inner.lock();
+            (std::mem::take(&mut inner.merged), inner.file_mtime)
+        };
+        if m.is_none() || m == seen {
+            return changed;
         }
-        let changed = self.insert(read_file(path));
-        self.inner.lock().file_mtime = m;
+        changed.extend(self.insert(read_file(path)));
+        self.inner.lock().file_mtime = settled(m);
         changed
     }
 
     /// Writes all records, merged with what the file holds now (another process may have added some).
     pub fn save(&self) {
         let Some(path) = &self.path else { return };
-        self.insert(read_file(path));
+        let _lock = lock_file(path);
+        let merged = self.insert(read_file(path));
         let mut inner = self.inner.lock();
+        inner.merged.extend(merged);
         let all: Vec<&Record> = inner.groups.values().flat_map(|r| r.values()).map(|s| &s.record).collect();
         let data = postcard::to_stdvec(&all).expect("records serialize");
         let tmp = path.with_extension("tmp");
         match std::fs::write(&tmp, data).and_then(|_| std::fs::rename(&tmp, path)) {
-            Ok(()) => inner.file_mtime = mtime(path),
+            // read again by the next `reload`
+            Ok(()) => inner.file_mtime = None,
             Err(e) => log::warn!("State | write {} error: {e}", path.display()),
         }
     }
@@ -868,6 +896,63 @@ mod tests {
         let got = Admitted::open(path).get(&g.id(), &join.grant.key);
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(got, Some(cert.body.node));
+    }
+
+    /// CLI commands and the daemon write the file at the same time: no record is lost, and the
+    /// daemon notices every one.
+    #[test]
+    fn concurrent_saves_lose_nothing() {
+        let tag = crate::crypto::encode_b64(&crate::crypto::random_bytes::<9>());
+        let dir = std::env::temp_dir().join(format!("dvpn-state-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.bin");
+        let g = GroupSecret::generate();
+        let daemon = StateStore::open(path.clone());
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let cli = || {
+            for _ in 0..15 {
+                let s = StateStore::open(path.clone());
+                s.add(&g, Body::Revoke { key: Identity::generate().id() }, false).unwrap();
+                s.save();
+            }
+        };
+        std::thread::scope(|t| {
+            let d = t.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !daemon.reload().is_empty() {
+                        daemon.save();
+                    }
+                }
+            });
+            let clis: Vec<_> = (0..3).map(|_| t.spawn(cli)).collect();
+            clis.into_iter().for_each(|c| c.join().unwrap());
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            d.join().unwrap();
+        });
+        daemon.reload();
+        let got = (StateStore::open(path).revoked(&g.id()).len(), daemon.revoked(&g.id()).len());
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(got, (45, 45), "(in the file, seen by the daemon)");
+    }
+
+    /// A record the daemon first meets while saving is reported by the next `reload`: it must be
+    /// applied and spread like any other.
+    #[test]
+    fn records_merged_by_save_are_reported() {
+        let tag = crate::crypto::encode_b64(&crate::crypto::random_bytes::<9>());
+        let dir = std::env::temp_dir().join(format!("dvpn-state-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.bin");
+        let g = GroupSecret::generate();
+        let daemon = StateStore::open(path.clone());
+        let cli = StateStore::open(path);
+        let e = cli.add(&g, Body::Revoke { key: Identity::generate().id() }, false).unwrap();
+        cli.save();
+        daemon.save();
+        let (first, second) = (daemon.reload(), daemon.reload());
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(first, vec![e]);
+        assert!(second.is_empty(), "once");
     }
 
     #[test]
