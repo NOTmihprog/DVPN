@@ -508,6 +508,72 @@ pub fn revoke(
     Ok(changed)
 }
 
+/// Replaces member `key`, whose node is lost for good: an invite for a new node with its name,
+/// address, subnets and relay role; the old key is revoked and its certificate gives the name and
+/// the address up. `certs`: every member's newest certificate. The psk stays: the invite carries
+/// it. Returns the invite and the records; on an error there are none.
+pub fn replace(
+    conf: &Config,
+    g: &GroupConfig,
+    store: &StateStore,
+    certs: &[Cert],
+    key: NodeId,
+    ttl_hours: u64,
+    statics: Vec<String>,
+) -> Result<(InviteMade, Vec<Entry>), OpError> {
+    let secret = admin_secret(g)?;
+    check_clock()?;
+    if key == conf.identity.id() {
+        return Err(OpError::new("revoke_self", "this is the node you are on: it cannot replace itself"));
+    }
+    let old = certs
+        .iter()
+        .filter(|c| c.body.node == key)
+        .max_by_key(|c| c.body.not_after)
+        .ok_or_else(|| OpError::new("member_not_seen", format!("{key}: no certificate of it here")))?;
+    let b = &old.body;
+    if b.roles.has(Roles::ADMIN) {
+        return Err(OpError::new("bad_param", format!("{} is an admin: use dvpn group restore", b.name)));
+    }
+    let addr = b.ipv4().ok_or_else(|| {
+        OpError::new("no_address", format!("{} has no address (replaced already?): make a new invite", b.name))
+    })?;
+    let others: Vec<Cert> = certs.iter().filter(|c| c.body.node != key).cloned().collect();
+    let m = Membership::of(store, &g.id);
+    if others.iter().any(|c| c.body.name == b.name && c.body.not_after > now_unix() && m.admits(c)) {
+        return Err(OpError::new("bad_param", format!("another member has the name {}", b.name)));
+    }
+    let own = IpNet::V4(Ipv4Net::new(addr, 32).expect("/32"));
+    let req = InviteRequest {
+        name: b.name.clone(),
+        addr: Some(addr),
+        ttl_hours,
+        statics,
+        routes: b.prefixes.iter().filter(|p| **p != own).copied().collect(),
+        relay: b.roles.has(Roles::RELAY),
+    };
+    let mut made = invite(conf, g, &others, &m.revoked, &req)?;
+    // both name the member by its key, and the new one is not known before it joins
+    if store.acl(&g.id).is_some_and(|a| a.names(&key)) {
+        made.warnings.push("the access rules (ACL) name the old key: set them again when the new node is in".into());
+    }
+    if store.forwards_name(&g.id, &key) {
+        made.warnings.push("forwarded ports name the old key: set them again when the new node is in".into());
+    }
+    let mut body = b.clone();
+    let name: String = b.name.chars().take(crate::group::MAX_NAME_LEN - 11).collect();
+    body.name = format!("{name}-old-{}", key.to_string().chars().take(6).collect::<String>());
+    body.prefixes.clear();
+    body.roles = Roles(0);
+    // newer than any copy of the old one, which nodes may have from its handshakes
+    body.not_after = (now_unix() + CERT_TTL_SECS).max(b.not_after);
+    body.serial = u64::from_le_bytes(random_bytes());
+    let mut bodies = vec![(Body::Revoke { key }, false), (Body::Cert(Box::new(secret.issue(body))), false)];
+    bodies.extend(old.join_key().map(|key| (Body::Revoke { key }, false)));
+    let changed = store.add_all(secret, bodies)?;
+    Ok((made, changed))
+}
+
 /// Makes `text` (TOML, `doc/acl.md`) the group's access rules. Members are named by key or by
 /// the name of exactly one of `certs`.
 pub fn set_acl(
@@ -724,6 +790,65 @@ mod tests {
         let m = Membership::of(&store, &secret.id());
         assert!(m.admits(&member), "has a regular certificate, not picked up yet");
         assert!(!m.admits(&pending));
+    }
+
+    #[test]
+    fn replaced_member_gives_its_place_up() {
+        let secret = GroupSecret::generate();
+        let (conf, g) = group_conf(&secret, true);
+        let store = StateStore::memory();
+        let issue = |name: &str, prefixes: &[&str], roles: u32| {
+            let id = Identity::generate().id();
+            let mut b = CertBody::new(id, name, prefixes.iter().map(|p| net(p)).collect());
+            b.roles.0 = roles as _;
+            store.add(&secret, Body::Cert(Box::new(secret.issue(b))), false).unwrap();
+            id
+        };
+        let srv = issue("srv", &["10.10.0.5/32", "192.168.7.0/24", "2a01:db8::7/128"], Roles::RELAY as u32);
+        let boss = issue("boss", &["10.10.0.6/32"], Roles::ADMIN as u32);
+        let replace = |key| super::replace(&conf, &g, &store, &store.certs(&g.id), key, 24, Vec::new());
+
+        assert_eq!(replace(boss).unwrap_err().code, "bad_param");
+        assert_eq!(replace(conf.identity.id()).unwrap_err().code, "revoke_self");
+        assert_eq!(replace(Identity::generate().id()).unwrap_err().code, "member_not_seen");
+        assert!(store.revoked(&g.id).is_empty(), "nothing done on an error");
+
+        let rules = "default = \"deny\"\n[[rule]]\nfrom = [\"*\"]\nto = [\"srv\"]\naction = \"allow\"\n";
+        set_acl(&secret, &store, &store.certs(&g.id), rules).unwrap();
+        let rule = crate::forward::Forward {
+            proto: crate::forward::Proto::Tcp,
+            port: 80,
+            to: "srv".into(),
+            to_port: 80,
+            keep_ip: false,
+        };
+        set_forwards(&secret, &store, &store.certs(&g.id), boss, vec![rule]).unwrap();
+
+        let (made, changed) = replace(srv).unwrap();
+        assert_eq!((made.name.as_str(), made.addr.to_string()), ("srv", "10.10.0.5".to_owned()));
+        assert_eq!(made.warnings.iter().filter(|w| w.contains("old key")).count(), 2, "{:?}", made.warnings);
+        assert_eq!(epoch_of(&changed), None, "the psk in the invite stays good");
+        let new = Invite::decode(&made.invite, Some(now_unix())).unwrap().join.enroll(Identity::generate().id());
+        assert_eq!(new.body.prefixes, [net("10.10.0.5/32"), net("192.168.7.0/24"), net("2a01:db8::7/128")]);
+        assert!(new.body.roles.has(Roles::RELAY));
+
+        // the old key is out, and neither its name nor its address is in the way
+        let certs = store.certs(&g.id);
+        let m = Membership::of(&store, &g.id);
+        assert!(m.revoked.contains(&srv) && m.admits(&new));
+        assert_eq!(invite_conflict(&new, &certs, &m), None);
+        assert_eq!(find_member(&certs, "srv").unwrap_err().code, "member_unknown");
+        let old = certs.iter().find(|c| c.body.node == srv).unwrap();
+        assert!(old.body.name.starts_with("srv-old-") && old.body.prefixes.is_empty() && old.body.roles.0 == 0);
+        assert_eq!(replace(srv).unwrap_err().code, "no_address", "once");
+
+        // one revoked before can be replaced too; not while its name is another member's
+        let gone = issue("gone", &["10.10.0.7/32"], 0);
+        revoke(&secret, &store, conf.identity.id(), gone, 0, None).unwrap();
+        let other = issue("gone", &["10.10.0.8/32"], 0);
+        assert_eq!(replace(gone).unwrap_err().code, "bad_param");
+        revoke(&secret, &store, conf.identity.id(), other, 0, None).unwrap();
+        assert_eq!(replace(gone).unwrap().0.addr.to_string(), "10.10.0.7");
     }
 
     #[test]

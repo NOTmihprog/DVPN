@@ -258,6 +258,22 @@ enum NodeCommand {
         #[arg(long)]
         no_relay: bool,
     },
+    /// Replace a member whose node is lost for good (admins only): revokes its key and prints an
+    /// invite for a new node with its name, address, subnets and relay role
+    Replace {
+        /// Node key, a unique key prefix, or a member name
+        #[arg(allow_hyphen_values = true)]
+        node: String,
+        /// Group name or id (default: the only group)
+        #[arg(short = 'g', long)]
+        group: Option<String>,
+        /// Hours the invite can be used
+        #[arg(long, default_value_t = 24)]
+        ttl: u64,
+        /// This node's fixed address (host:port, repeatable), as in `group invite`
+        #[arg(long = "static", value_name = "HOST:PORT")]
+        statics: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -779,6 +795,19 @@ fn cmd_node(conf: &mut Config, dir: &Path, cmd: NodeCommand) {
                 b.prefixes.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
             );
             println!("A running node of this admin spreads it within seconds; the member picks it up.");
+        }
+        NodeCommand::Replace { node, group, ttl, statics } => {
+            let g = pick_group(conf, &group);
+            let certs = member_certs(conf, g, &store);
+            let key = ops::find_member(&certs, &node).unwrap_or_else(|e| die(e));
+            let (made, _) = ops::replace(conf, g, &store, &certs, key, ttl, statics).unwrap_or_else(|e| die(e));
+            store.save();
+            for w in &made.warnings {
+                log::warn!("{w}");
+            }
+            eprintln!("Revoked {key} ({}) in group {}; a running node of this admin spreads it.", made.name, g.name);
+            eprintln!("Invite for a new {} ({}), valid {ttl} h, for one node:", made.name, made.addr);
+            println!("{}", made.invite);
         }
     }
 }

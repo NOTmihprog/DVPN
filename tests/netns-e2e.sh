@@ -841,6 +841,7 @@ delegate_join() { # delegate_join NODE NAME ADDR: an invite from MC, used by NOD
 }
 delegate_join me me 10.10.77.130
 bg node-me me "$D" --dir "$W/me" -a 127.0.0.1:9902
+ME=$!
 reach me ma 10.10.77.1
 reach ma me 10.10.77.130
 wait_for 30 renewed me || fail "me still has its invite certificate"
@@ -866,6 +867,29 @@ wait_for 30 grep -q 'revoked in group' tracker6.log || fail "the tracker takes a
 kill "$MF"
 reach me ma 10.10.77.1
 ok "a removed delegate: unused invites stop working, its members stay"
+
+# A lost node: ME dies with its key; a new node takes its name and address, with no revoked
+# key in the way, and the old key does not get back in.
+kill "$ME"
+OLD=$("$D" --dir "$W/me" show-key 2>/dev/null)
+"$D" --dir "$W/ma" node replace me > replace-inv 2>/dev/null || fail "ma: node replace"
+! "$D" --dir "$W/ma" node replace me >/dev/null 2>&1 || fail "ma: me replaced twice"
+mkdir mr
+"$D" --dir "$W/mr" group join "$(cat replace-inv)" >/dev/null 2>&1 || fail "mr: join"
+bg node-mr mg "$D" --dir "$W/mr" -a 127.0.0.1:9902
+reach mg ma 10.10.77.1
+reach ma mr 10.10.77.130
+reach mb mr 10.10.77.130
+wait_for 30 renewed mr || fail "mr still has its invite certificate"
+nsx mg ip -4 addr show dnet | grep -q '10.10.77.130/' || fail "mr: not the address of me"
+bg node-me2 me "$D" --dir "$W/me" -a 127.0.0.1:9902
+ME=$!
+wait_for 30 sh -c "sed 's/\x1b\[[0-9;]*m//g' tracker6.log | grep -qF \"$OLD: revoked in group\"" \
+    || fail "the tracker takes the replaced node"
+! nsx me ping -c2 -W1 10.10.77.1 >/dev/null 2>&1 || fail "the replaced node is still in"
+nsx ma ping -c2 -W1 10.10.77.130 >/dev/null || fail "ma -> mr broken by the old node"
+kill "$ME"
+ok "a lost node replaced: a new one has its name and address, the old key is out"
 
 # Without a tracker: it goes away, the admin changes a member, the record still reaches
 # everybody through the neighbours (STATE between link sessions)

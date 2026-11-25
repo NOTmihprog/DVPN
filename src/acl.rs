@@ -60,6 +60,14 @@ pub struct Acl {
     pub rules: Vec<Rule>,
 }
 
+impl Acl {
+    /// Whether a rule or a tag names `node`.
+    pub fn names(&self, node: &NodeId) -> bool {
+        let mut who = self.rules.iter().flat_map(|r| r.from.iter().chain(&r.to));
+        self.tags.values().flatten().any(|n| n == node) || who.any(|w| matches!(w, Who::Node(n) if n == node))
+    }
+}
+
 fn who_text(w: &Who, name: &dyn Fn(&NodeId) -> String) -> String {
     match w {
         Who::Anybody => "*".into(),

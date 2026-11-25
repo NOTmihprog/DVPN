@@ -873,6 +873,24 @@ fn bool_arg(p: &Value, key: &str) -> Result<Option<bool>, ApiError> {
 }
 
 /// `lead_secs`: seconds until a new psk is used (default 120, as `dvpn group rotate --in`).
+fn ttl_arg(p: &Value) -> Result<u64, ApiError> {
+    match field(p, "ttl_hours") {
+        None => Ok(crate::group::JOIN_TTL_SECS / 3600),
+        Some(v) => v.as_u64().filter(|h| (1..=24 * 365).contains(h)).ok_or_else(|| bad_param("ttl_hours", "1..8760")),
+    }
+}
+
+/// A made invite, as `set invite` and `set replace` answer.
+fn invite_fields(made: crate::ops::InviteMade) -> Vec<(&'static str, Value)> {
+    vec![
+        ("invite", made.invite.into()),
+        ("name", made.name.into()),
+        ("addr", made.addr.to_string().into()),
+        ("until", made.until.into()),
+        ("warnings", Value::Array(made.warnings.into_iter().map(Value::from).collect())),
+    ]
+}
+
 fn lead_arg(p: &Value) -> Result<u64, ApiError> {
     match field(p, "lead_secs") {
         None => Ok(120),
@@ -1811,12 +1829,7 @@ impl Api {
                     .ok_or_else(|| ApiError::new("addr_invalid", "addr: expected an IPv4 address"))?,
             ),
         };
-        let ttl_hours = match field(p, "ttl_hours") {
-            None => crate::group::JOIN_TTL_SECS / 3600,
-            Some(v) => {
-                v.as_u64().filter(|h| (1..=24 * 365).contains(h)).ok_or_else(|| bad_param("ttl_hours", "1..8760"))?
-            }
-        };
+        let ttl_hours = ttl_arg(p)?;
         let relay = bool_arg(p, "relay")?.unwrap_or(false);
         let req = crate::ops::InviteRequest {
             name: name.to_owned(),
@@ -1826,25 +1839,46 @@ impl Api {
             routes: nets(p, "routes")?,
             relay,
         };
-        // the invite carries the trackers and the masking profile from the config
-        let dir = self.node.config_path().parent().unwrap_or(std::path::Path::new(".")).to_owned();
-        let conf = tokio::task::block_in_place(|| crate::config::Config::load(&dir))
-            .map_err(|e| ApiError::new("config_read", format!("{e:#}")))?;
-        let g = conf
-            .groups
-            .iter()
-            .find(|g| g.id == self.node.group_id())
-            .ok_or_else(|| ApiError::new("config_read", "the group is not in config.toml"))?;
+        let conf = self.load_config()?;
+        let g = self.config_group(&conf)?;
         let revoked = self.node.group_store().revoked(&g.id);
         let made = crate::ops::invite(&conf, g, &self.node.member_certs(), &revoked, &req).map_err(op_error)?;
         log::info!("API | invite for {} ({}) made", made.name, made.addr);
-        Ok(map(vec![
-            ("invite", made.invite.into()),
-            ("name", made.name.into()),
-            ("addr", made.addr.to_string().into()),
-            ("until", made.until.into()),
-            ("warnings", Value::Array(made.warnings.into_iter().map(Value::from).collect())),
-        ]))
+        Ok(map(invite_fields(made)))
+    }
+
+    /// `config.toml` as it is now: invites carry the trackers and the masking profile from it.
+    fn load_config(&self) -> Result<crate::config::Config, ApiError> {
+        let dir = self.node.config_path().parent().unwrap_or(std::path::Path::new(".")).to_owned();
+        tokio::task::block_in_place(|| crate::config::Config::load(&dir))
+            .map_err(|e| ApiError::new("config_read", format!("{e:#}")))
+    }
+
+    /// The node's group in `conf`.
+    fn config_group<'a>(&self, conf: &'a crate::config::Config) -> Result<&'a crate::config::GroupConfig, ApiError> {
+        conf.groups
+            .iter()
+            .find(|g| g.id == self.node.group_id())
+            .ok_or_else(|| ApiError::new("config_read", "the group is not in config.toml"))
+    }
+
+    /// `set replace`: an invite for a new node in the place of a lost member, which is revoked.
+    async fn set_replace(&self, p: &Value) -> Reply {
+        self.secret()?;
+        let certs = self.node.member_certs();
+        let key = self.member_arg(p, &certs)?;
+        let ttl_hours = ttl_arg(p)?;
+        let statics = str_list(p, "statics")?.unwrap_or_default();
+        let (made, changed) = {
+            let conf = self.load_config()?;
+            let g = self.config_group(&conf)?;
+            crate::ops::replace(&conf, g, self.node.group_store(), &certs, key, ttl_hours, statics).map_err(op_error)?
+        };
+        self.node.publish(&changed).await;
+        log::info!("API | {} ({}) revoked, invite for a new node in its place made", made.name, key.short());
+        let mut out = invite_fields(made);
+        out.push(("key", key.to_string().into()));
+        Ok(map(out))
     }
 
     /// `set node`: a member's new certificate (name, address, subnets, relay).
@@ -2134,6 +2168,7 @@ impl Api {
             Some("invite") => self.set_invite(p),
             Some("node") => self.set_node(p).await,
             Some("revoke") => self.set_revoke(p).await,
+            Some("replace") => self.set_replace(p).await,
             Some("rotate") => self.set_rotate(p).await,
             Some("acl") => self.set_acl(p).await,
             Some(other) => Err(ApiError::new("unknown_request", format!("set {other:?}: no such request"))),

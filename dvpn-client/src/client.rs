@@ -599,6 +599,15 @@ impl Client {
         from_value(self.raw("set", "revoke", f).await?)
     }
 
+    /// Replaces member `node`, which is lost for good: revokes it and makes an invite for a new
+    /// node with its name, address, subnets and relay role. `ttl_hours`, `statics`: as in
+    /// [`InviteRequest`]. Older nodes answer `ErrorCode::UnknownRequest`.
+    pub async fn replace(&self, node: &str, ttl_hours: Option<u64>, statics: &[String]) -> Result<InviteMade, Error> {
+        let mut f = vec![("key", Value::from(node)), ("statics", strings(statics))];
+        f.extend(ttl_hours.map(|h| ("ttl_hours", h.into())));
+        from_value(self.raw("set", "replace", f).await?)
+    }
+
     /// A new group psk in `lead_secs` seconds.
     pub async fn rotate(&self, lead_secs: u64) -> Result<Rotated, Error> {
         from_value(self.raw("set", "rotate", vec![("lead_secs", lead_secs.into())]).await?)

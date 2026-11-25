@@ -106,7 +106,7 @@ UDP `127.0.0.1:9902`.
 | `not_admin`, `clock_untrusted` | операции админа: у узла нет секрета группы; часы раньше сборки (нужен NTP) |
 | `member_unknown`, `member_ambiguous`, `member_not_seen` | участник не найден, имя подходит нескольким, сертификата ещё нет |
 | `addr_taken`, `addr_invalid`, `route_invalid`, `endpoint_invalid`, `no_address`, `config_read` | `set invite`, `set node` |
-| `revoke_self`, `acl_parse` | `set revoke`, `set acl` |
+| `revoke_self`, `acl_parse` | `set revoke` и `set replace`, `set acl` |
 | `no_gateway`, `forward_invalid` | `set forward`: у узла нет `[gateway]`; правила противоречат друг другу или их слишком много |
 | `delegate_ended`, `delegate_limit`, `no_free_addr` | `set invite`: право приглашать забрали или оно истекло; relay или подсеть вне прав делегата; нет свободных адресов |
 
@@ -324,7 +324,7 @@ print(msgpack.loads(s.recv(65535)))   # {'type': 'res', 'id': 1, 'res': {'key': 
 ### Операции админа
 
 Только на узле с секретом группы (иначе `not_admin`) — то же, что `dvpn group invite/revoke/rotate`, `dvpn node
-set`, `dvpn acl set/clear`. Узел сразу применяет новые записи группы и рассылает их серверам обнаружения и
+set/replace`, `dvpn acl set/clear`. Узел сразу применяет новые записи группы и рассылает их серверам обнаружения и
 соседям. Участник в `key` — ключ, начало ключа или имя. `set invite` работает и на узле делегата, в пределах его
 подсети ([groups.md](groups.md#делегаты-приглашения-в-часть-сети)).
 
@@ -342,6 +342,9 @@ set`, `dvpn acl set/clear`. Узел сразу применяет новые з
 
 {"type": "set", "req": "revoke", "key": "bob", "rotate": true, "lead_secs": 120}
 → {"key", "name", "epoch", "at"}                             # epoch/at — смена psk (nil с "rotate": false)
+
+{"type": "set", "req": "replace", "key": "vps", "ttl_hours": 24, "statics": [...]}
+→ как set invite, и "key" — отозванный ключ                  # invite на место потерянного узла
 
 {"type": "set", "req": "rotate", "lead_secs": 120}   → {"epoch", "at", "sealed_to"}
 {"type": "set", "req": "acl", "toml": "default = \"deny\"\n..."}   → как get acl

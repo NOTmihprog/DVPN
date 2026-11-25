@@ -593,6 +593,15 @@ impl StateStore {
         })
     }
 
+    /// Whether an admin forwards ports on `node` or to it.
+    pub fn forwards_name(&self, group: &GroupId, node: &NodeId) -> bool {
+        let to = node.to_string();
+        self.inner.lock().live(group).any(|e| match &e.body {
+            Body::Forward { node: n, rules } => !rules.is_empty() && (n == node || rules.iter().any(|r| r.to == to)),
+            _ => false,
+        })
+    }
+
     /// The ports an admin forwards on gateway `node`.
     pub fn forwards(&self, group: &GroupId, node: &NodeId) -> Vec<crate::forward::Forward> {
         let inner = self.inner.lock();
